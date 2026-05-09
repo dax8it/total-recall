@@ -35,4 +35,8 @@ export TOTAL_RECALL_HOME="$WORKDIR/store"
 "$WORKDIR/venv/bin/total-recall" checkpoint --session-id install-smoke >/dev/null
 "$WORKDIR/venv/bin/total-recall" verify --session-id install-smoke >/dev/null
 "$WORKDIR/venv/bin/total-recall" rehydrate --session-id install-smoke --query "smoke continuity" >/dev/null
+"$WORKDIR/venv/bin/total-recall" doctor >/dev/null
+"$WORKDIR/venv/bin/total-recall" export --out "$WORKDIR/recall.tar.gz" >/dev/null
+TOTAL_RECALL_HOME="$WORKDIR/imported" "$WORKDIR/venv/bin/total-recall" import "$WORKDIR/recall.tar.gz" >/dev/null
+TOTAL_RECALL_HOME="$WORKDIR/imported" "$WORKDIR/venv/bin/total-recall" verify --session-id install-smoke >/dev/null
 echo "Install smoke passed."

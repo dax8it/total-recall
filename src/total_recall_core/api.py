@@ -9,6 +9,8 @@ import secrets
 import shutil
 import sqlite3
 import subprocess
+import tarfile
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -16,8 +18,9 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 
-VERSION = "1.2.0"
-SIGNING_ALGORITHM = "hmac-sha256-local-v1"
+VERSION = "1.3.0"
+SIGNING_ALGORITHM = "ed25519-local-v1"
+LEGACY_SIGNING_ALGORITHM = "hmac-sha256-local-v1"
 INDEX_SCHEMA_VERSION = "total-recall-sqlite-fts-v1"
 LANCEDB_INDEX_SCHEMA_VERSION = "total-recall-lancedb-derived-v1"
 QMD_INDEX_SCHEMA_VERSION = "total-recall-qmd-derived-v1"
@@ -92,6 +95,14 @@ class TotalRecallCore:
     @property
     def key_file(self) -> Path:
         return self.home / "keys" / "anchor.key"
+
+    @property
+    def ed25519_private_key_file(self) -> Path:
+        return self.home / "keys" / "anchor.ed25519"
+
+    @property
+    def ed25519_public_key_file(self) -> Path:
+        return self.home / "keys" / "anchor.ed25519.pub"
 
     @property
     def lock_file(self) -> Path:
@@ -333,8 +344,7 @@ class TotalRecallCore:
                 details["anchor"] = anchor
                 if anchor.get("checkpoint_hash") != expected_hash:
                     failures.append("anchor_checkpoint_hash_mismatch")
-                expected_sig = self._signature(anchor.get("checkpoint_hash", ""))
-                if not hmac.compare_digest(anchor.get("signature", ""), expected_sig):
+                if not self._verify_anchor_signature(anchor):
                     failures.append("anchor_signature_mismatch")
             except Exception as exc:
                 failures.append(f"anchor_unreadable:{exc}")
@@ -817,6 +827,169 @@ class TotalRecallCore:
         self._write_json(dest, item)
         source.unlink(missing_ok=True)
         return {"ok": True, "external": item, "externalFile": str(dest)}
+
+    def export_bundle(self, out: str, *, include_index: bool = False) -> Dict[str, Any]:
+        out_path = Path(out).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        include_dirs = [
+            "ledger",
+            "state",
+            "checkpoints",
+            "anchors",
+            "reports",
+            "incidents",
+            "external-memory",
+            "keys",
+        ]
+        if include_index:
+            include_dirs.append("index")
+
+        files: List[Path] = []
+        for rel_dir in include_dirs:
+            directory = self.home / rel_dir
+            if directory.exists():
+                files.extend(path for path in directory.rglob("*") if path.is_file())
+
+        manifest = {
+            "schema": "total-recall-export-v1",
+            "version": VERSION,
+            "created_at": utc_now(),
+            "include_index": include_index,
+            "files": [],
+        }
+        for path in sorted(files):
+            rel = path.relative_to(self.home).as_posix()
+            manifest["files"].append({
+                "path": rel,
+                "sha256": self._file_sha256(path),
+                "bytes": path.stat().st_size,
+            })
+
+        with tempfile.TemporaryDirectory(prefix="total-recall-export.") as tmpdir:
+            manifest_path = Path(tmpdir) / "MANIFEST.json"
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            with tarfile.open(out_path, "w:gz") as tar:
+                tar.add(manifest_path, arcname="MANIFEST.json")
+                for path in sorted(files):
+                    tar.add(path, arcname=path.relative_to(self.home).as_posix())
+
+        return {
+            "ok": True,
+            "bundle": str(out_path),
+            "fileCount": len(files),
+            "includeIndex": include_index,
+            "manifestHash": hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest(),
+        }
+
+    def import_bundle(self, bundle: str, *, replace: bool = False) -> Dict[str, Any]:
+        bundle_path = Path(bundle).expanduser()
+        if not bundle_path.exists():
+            return {"ok": False, "error": "bundle_not_found", "bundle": str(bundle_path)}
+        if self.ledger_file.exists() and self.ledger_file.stat().st_size > 0 and not replace:
+            return {"ok": False, "error": "target_not_empty", "home": str(self.home), "hint": "pass replace=True to overwrite"}
+
+        with tempfile.TemporaryDirectory(prefix="total-recall-import.") as tmpdir:
+            tmp_home = Path(tmpdir) / "store"
+            tmp_home.mkdir(parents=True, exist_ok=True)
+            tmp_root = tmp_home.resolve()
+            with tarfile.open(bundle_path, "r:gz") as tar:
+                members = tar.getmembers()
+                for member in members:
+                    if member.issym() or member.islnk():
+                        return {"ok": False, "error": "unsafe_bundle_link", "path": member.name}
+                    rel = Path(member.name)
+                    target = (tmp_home / rel).resolve()
+                    try:
+                        target.relative_to(tmp_root)
+                    except ValueError:
+                        return {"ok": False, "error": "unsafe_bundle_path", "path": member.name}
+                    if member.isdir():
+                        target.mkdir(parents=True, exist_ok=True)
+                    elif member.isfile():
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        source = tar.extractfile(member)
+                        if source is None:
+                            return {"ok": False, "error": "unsafe_bundle_file", "path": member.name}
+                        with target.open("wb") as dest:
+                            shutil.copyfileobj(source, dest)
+                    else:
+                        return {"ok": False, "error": "unsafe_bundle_member", "path": member.name}
+
+            manifest_path = tmp_home / "MANIFEST.json"
+            if not manifest_path.exists():
+                return {"ok": False, "error": "manifest_not_found"}
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for item in manifest.get("files", []):
+                rel = Path(str(item.get("path") or ""))
+                if rel.is_absolute() or ".." in rel.parts:
+                    return {"ok": False, "error": "unsafe_manifest_path", "path": str(rel)}
+                path = tmp_home / rel
+                if not path.exists():
+                    return {"ok": False, "error": "manifest_file_missing", "path": str(rel)}
+                if self._file_sha256(path) != item.get("sha256"):
+                    return {"ok": False, "error": "manifest_hash_mismatch", "path": str(rel)}
+
+            if replace:
+                for rel_dir in ("ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "keys", "index"):
+                    shutil.rmtree(self.home / rel_dir, ignore_errors=True)
+            self._ensure_layout()
+            for item in manifest.get("files", []):
+                rel = Path(str(item.get("path") or ""))
+                src = tmp_home / rel
+                dest = self.home / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dest)
+
+        verification = self.verify()
+        return {
+            "ok": bool(verification.get("ok")),
+            "bundle": str(bundle_path),
+            "home": str(self.home),
+            "fileCount": len(manifest.get("files", [])),
+            "verification": verification,
+        }
+
+    def doctor(self) -> Dict[str, Any]:
+        checks: List[Dict[str, Any]] = []
+
+        def add(name: str, ok: bool, **details: Any) -> None:
+            checks.append({"name": name, "ok": ok, **details})
+
+        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys"]
+        for rel_dir in required_dirs:
+            add(f"dir:{rel_dir}", (self.home / rel_dir).is_dir(), path=str(self.home / rel_dir))
+
+        try:
+            state = self.reduce_state(write=True)
+            add("ledger_hash_chain", True, eventCount=state.get("event_count"), lastEventHash=state.get("last_event_hash"))
+        except Exception as exc:
+            add("ledger_hash_chain", False, error=str(exc))
+            state = None
+
+        latest_checkpoint = self._latest_file(self.home / "checkpoints", "*.json")
+        add("checkpoint_present", latest_checkpoint is not None, checkpointFile=str(latest_checkpoint) if latest_checkpoint else None)
+        if latest_checkpoint:
+            verification = self.verify(checkpoint_file=str(latest_checkpoint))
+            add("verify_latest_checkpoint", bool(verification.get("ok")), status=verification.get("status"), failures=verification.get("failures", []))
+        else:
+            verification = {"ok": False, "status": "NO_CHECKPOINT"}
+
+        try:
+            index_status = self.index_status(state=state)
+            add("derived_index_status", bool(index_status.get("fresh")), fresh=index_status.get("fresh"), backends=index_status.get("backends"))
+        except Exception as exc:
+            add("derived_index_status", False, error=str(exc))
+
+        try:
+            public_key = self._ed25519_public_key_hex()
+            add("ed25519_public_key", bool(public_key), keyId=self._key_id())
+        except Exception as exc:
+            add("ed25519_public_key", False, error=str(exc))
+
+        ok = all(check.get("ok") for check in checks if check["name"] != "checkpoint_present") and latest_checkpoint is not None
+        payload = {"ok": ok, "status": "PASS" if ok else "DEGRADED", "home": str(self.home), "checks": checks}
+        payload["report"] = self._write_report("doctor", "latest", payload)
+        return payload
 
     def rehydrate_status(self, *, session_key: Optional[str] = None, agent: Optional[str] = None) -> Dict[str, Any]:
         session_id = session_key or (f"agent:{agent}:main" if agent else "default")
@@ -1493,6 +1666,7 @@ class TotalRecallCore:
             "checkpoint_hash": checkpoint_hash,
             "algorithm": SIGNING_ALGORITHM,
             "key_id": self._key_id(),
+            "public_key": self._ed25519_public_key_hex(),
             "signature": self._signature(checkpoint_hash),
             "created_at": utc_now(),
         }
@@ -1511,10 +1685,79 @@ class TotalRecallCore:
         return self.key_file.read_text(encoding="utf-8").strip().encode("utf-8")
 
     def _key_id(self) -> str:
-        return hashlib.sha256(self._secret_key()).hexdigest()[:16]
+        return hashlib.sha256(bytes.fromhex(self._ed25519_public_key_hex())).hexdigest()[:16]
 
     def _signature(self, checkpoint_hash: str) -> str:
-        return hmac.new(self._secret_key(), checkpoint_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(self._ed25519_private_key_hex()))
+        signature = private_key.sign(checkpoint_hash.encode("utf-8"))
+        return signature.hex()
+
+    def _verify_anchor_signature(self, anchor: Dict[str, Any]) -> bool:
+        algorithm = anchor.get("algorithm") or LEGACY_SIGNING_ALGORITHM
+        checkpoint_hash = str(anchor.get("checkpoint_hash") or "")
+        signature = str(anchor.get("signature") or "")
+        if algorithm == SIGNING_ALGORITHM:
+            try:
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+                public_key_hex = str(anchor.get("public_key") or self._ed25519_public_key_hex())
+                public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+                public_key.verify(bytes.fromhex(signature), checkpoint_hash.encode("utf-8"))
+                return True
+            except Exception:
+                return False
+        if algorithm == LEGACY_SIGNING_ALGORITHM:
+            expected_sig = hmac.new(self._secret_key(), checkpoint_hash.encode("utf-8"), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(signature, expected_sig)
+        return False
+
+    def _ed25519_private_key_hex(self) -> str:
+        if not self.ed25519_private_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            private_key = Ed25519PrivateKey.generate()
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.ed25519_private_key_file.parent.mkdir(parents=True, exist_ok=True)
+            self.ed25519_private_key_file.write_text(private_bytes.hex() + "\n", encoding="utf-8")
+            self.ed25519_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+            try:
+                self.ed25519_private_key_file.chmod(0o600)
+                self.ed25519_public_key_file.chmod(0o644)
+            except Exception:
+                pass
+        return self.ed25519_private_key_file.read_text(encoding="utf-8").strip()
+
+    def _ed25519_public_key_hex(self) -> str:
+        if not self.ed25519_public_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(self._ed25519_private_key_hex()))
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.ed25519_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+        return self.ed25519_public_key_file.read_text(encoding="utf-8").strip()
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _select_checkpoint(self, session_id: Optional[str]) -> Optional[Path]:
         if session_id:

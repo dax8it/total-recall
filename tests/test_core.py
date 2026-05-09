@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import tarfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from total_recall_core import TotalRecallConfig, TotalRecallCore
 
@@ -28,7 +30,14 @@ def test_ingest_search_checkpoint_verify_rehydrate(tmp_path):
     checkpoint = core.checkpoint(session_id="smoke-session")
     assert checkpoint["ok"] is True
     assert checkpoint["checkpoint"]["state_hash"]
+    assert checkpoint["anchor"]["algorithm"] == "ed25519-local-v1"
+    assert checkpoint["anchor"]["public_key"]
     assert checkpoint["anchor"]["signature"]
+    public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(checkpoint["anchor"]["public_key"]))
+    public_key.verify(
+        bytes.fromhex(checkpoint["anchor"]["signature"]),
+        checkpoint["checkpoint"]["checkpoint_hash"].encode("utf-8"),
+    )
 
     verified = core.verify(session_id="smoke-session")
     assert verified["ok"] is True
@@ -59,6 +68,89 @@ def test_verify_fails_closed_when_anchor_is_tampered(tmp_path):
     assert incidents["incidents"][0]["severity"] == "FAIL_CLOSED"
 
 
+def test_verify_fails_closed_when_ledger_text_is_tampered(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Original continuity fact.", session_id="s1")
+    core.checkpoint(session_id="s1")
+    lines = (tmp_path / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    event = json.loads(lines[0])
+    event["text"] = "Tampered continuity fact."
+    lines[0] = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    (tmp_path / "ledger" / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert verified["status"] == "FAIL_CLOSED"
+    assert any("ledger_or_state_invalid" in failure for failure in verified["failures"])
+
+
+def test_verify_fails_closed_when_ledger_event_is_deleted(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="First event.", session_id="s1")
+    core.ingest(kind="note", text="Second event.", session_id="s1")
+    core.checkpoint(session_id="s1")
+    lines = (tmp_path / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    (tmp_path / "ledger" / "events.jsonl").write_text(lines[1] + "\n", encoding="utf-8")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert any("ledger_or_state_invalid" in failure for failure in verified["failures"])
+
+
+def test_verify_fails_closed_when_ledger_events_are_reordered(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="First event.", session_id="s1")
+    core.ingest(kind="note", text="Second event.", session_id="s1")
+    core.checkpoint(session_id="s1")
+    lines = (tmp_path / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    (tmp_path / "ledger" / "events.jsonl").write_text("\n".join(reversed(lines)) + "\n", encoding="utf-8")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert any("ledger_or_state_invalid" in failure for failure in verified["failures"])
+
+
+def test_verify_fails_closed_when_checkpoint_is_modified(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Checkpoint protected memory.", session_id="s1")
+    checkpoint = core.checkpoint(session_id="s1")
+    checkpoint_path = Path(checkpoint["checkpointFile"])
+    payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    payload["state_hash"] = "bad"
+    checkpoint_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert "checkpoint_hash_mismatch" in verified["failures"]
+
+
+def test_verify_fails_closed_when_anchor_is_missing(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Missing anchor memory.", session_id="s1")
+    checkpoint = core.checkpoint(session_id="s1")
+    anchor_path = tmp_path / "anchors" / f"{checkpoint['checkpoint']['checkpoint_id']}.json"
+    anchor_path.unlink()
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert "anchor_not_found" in verified["failures"]
+
+
+def test_verify_fails_closed_when_anchor_checkpoint_hash_is_modified(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Anchor hash memory.", session_id="s1")
+    checkpoint = core.checkpoint(session_id="s1")
+    anchor_path = tmp_path / "anchors" / f"{checkpoint['checkpoint']['checkpoint_id']}.json"
+    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+    anchor["checkpoint_hash"] = "bad"
+    anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is False
+    assert "anchor_checkpoint_hash_mismatch" in verified["failures"]
+    assert "anchor_signature_mismatch" in verified["failures"]
+
+
 def test_external_memory_quarantine_promote_reject(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     ext = core.external_ingest(text="External approved project context.", source="handoff.md")
@@ -75,6 +167,55 @@ def test_external_memory_quarantine_promote_reject(tmp_path):
     rejected = core.external_reject(ext2["external"]["external_id"], reason="untrusted")
     assert rejected["ok"] is True
     assert core.external_list(queue="rejected")["count"] == 1
+
+
+def test_promoted_external_file_is_not_authority_without_ledger_event(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    promoted = tmp_path / "external-memory" / "promoted" / "fake.json"
+    promoted.parent.mkdir(parents=True, exist_ok=True)
+    promoted.write_text(json.dumps({"external_id": "fake", "text": "Unledgered promoted memory."}), encoding="utf-8")
+    core.ingest(kind="note", text="Authoritative memory.", session_id="s1")
+    core.checkpoint(session_id="s1")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is True
+    search = core.search("Unledgered promoted memory")
+    assert all("Unledgered promoted memory" not in result["text"] for result in search["results"])
+    assert all(result["source_ref"] != str(promoted) for result in search["results"])
+
+
+def test_export_import_doctor_round_trip(tmp_path):
+    source_home = tmp_path / "source"
+    imported_home = tmp_path / "imported"
+    bundle = tmp_path / "recall.tar.gz"
+    core = TotalRecallCore(TotalRecallConfig(home=source_home, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Exported continuity memory.", session_id="s1")
+    core.checkpoint(session_id="s1")
+
+    doctor = core.doctor()
+    assert doctor["ok"] is True
+    exported = core.export_bundle(str(bundle))
+    assert exported["ok"] is True
+    assert bundle.exists()
+
+    imported = TotalRecallCore(TotalRecallConfig(home=imported_home, enable_lancedb=False, enable_qmd=False))
+    result = imported.import_bundle(str(bundle))
+    assert result["ok"] is True
+    assert imported.verify(session_id="s1")["ok"] is True
+    assert imported.search("Exported continuity memory")["results"]
+
+
+def test_import_rejects_unsafe_tar_paths(tmp_path):
+    bundle = tmp_path / "unsafe.tar.gz"
+    with tarfile.open(bundle, "w:gz") as tar:
+        evil = tmp_path / "evil.txt"
+        evil.write_text("bad", encoding="utf-8")
+        tar.add(evil, arcname="../evil.txt")
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "target", enable_lancedb=False, enable_qmd=False))
+
+    result = core.import_bundle(str(bundle))
+    assert result["ok"] is False
+    assert result["error"] == "unsafe_bundle_path"
 
 
 def test_context_plan_has_citations(tmp_path):

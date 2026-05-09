@@ -20,6 +20,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("health")
     sub.add_parser("status")
+    sub.add_parser("doctor")
 
     ingest = sub.add_parser("ingest")
     ingest.add_argument("--kind", default="note")
@@ -105,6 +106,14 @@ def build_parser() -> argparse.ArgumentParser:
     ext_reject.add_argument("external_id")
     ext_reject.add_argument("--reason", default="")
 
+    export = sub.add_parser("export")
+    export.add_argument("--out", required=True)
+    export.add_argument("--include-index", action="store_true")
+
+    import_cmd = sub.add_parser("import")
+    import_cmd.add_argument("bundle")
+    import_cmd.add_argument("--replace", action="store_true")
+
     return parser
 
 
@@ -133,6 +142,8 @@ def main() -> int:
         return _print(core.health())
     if command == "status":
         return _print(core.health())
+    if command == "doctor":
+        return _print(core.doctor())
     if command == "ingest":
         return _print(core.ingest(kind=args.kind, text=args.text, session_id=args.session_id, scope=args.scope, source=args.source))
     if command in {"search", "grep"}:
@@ -177,6 +188,10 @@ def main() -> int:
             return _print(core.external_promote(args.external_id, session_id=args.session_id))
         if sub == "reject":
             return _print(core.external_reject(args.external_id, reason=args.reason))
+    if command == "export":
+        return _print(core.export_bundle(args.out, include_index=args.include_index))
+    if command == "import":
+        return _print(core.import_bundle(args.bundle, replace=args.replace))
 
     return _print({"ok": False, "error": f"command not implemented: {command}"})
 

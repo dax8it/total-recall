@@ -70,6 +70,8 @@ index/lancedb-meta.json
 index/qmd-docs/
 index/qmd-meta.json
 keys/anchor.key
+keys/anchor.ed25519
+keys/anchor.ed25519.pub
 ```
 
 All files under `index/` are derived retrieval caches. They are rebuilt from
@@ -108,6 +110,9 @@ total-recall index rebuild --backend qmd
 total-recall checkpoint --session-id main
 total-recall verify --session-id main
 total-recall rehydrate --session-id main --query "Remember"
+total-recall doctor
+total-recall export --out total-recall-backup.tar.gz
+total-recall import total-recall-backup.tar.gz
 total-recall incidents list
 total-recall external ingest --source handoff.md --text "Imported context"
 ```
@@ -115,8 +120,10 @@ total-recall external ingest --source handoff.md --text "Imported context"
 ## Trust Model
 
 The ledger is append-only JSONL with a hash chain. Checkpoints pin the reduced
-state hash, event count, and last event hash. Anchors sign checkpoint hashes
-using a local HMAC-SHA256 key stored at `keys/anchor.key`.
+state hash, event count, and last event hash. Anchors sign checkpoint hashes with
+a local Ed25519 keypair stored at `keys/anchor.ed25519` and
+`keys/anchor.ed25519.pub`. Legacy HMAC-SHA256 anchors remain verifiable for
+older local stores, but new checkpoints use Ed25519.
 
 Verification fails closed when:
 
@@ -134,24 +141,8 @@ trusted ledger state rather than trusted directly.
 
 ## Hermes Setup
 
-The Hermes provider lives at:
-
-```text
-hermes-plugin/total-recall
-```
-
-For a profile-scoped Hermes home, expose the plugin under the documented memory
-provider path, then select it:
-
-```bash
-mkdir -p "$HERMES_HOME/plugins/memory"
-ln -s /path/to/total-recall/hermes-plugin/total-recall "$HERMES_HOME/plugins/memory/total-recall"
-hermes -p total-recall-smoke config set memory.provider total-recall
-hermes -p total-recall-smoke memory status
-```
-
-Only switch a live profile after `health`, `search`, `checkpoint`, `verify`, and
-`rehydrate` pass.
+See [docs/hermes.md](docs/hermes.md) for install, profile selection,
+smoke-test, recovery, and troubleshooting commands.
 
 Each Hermes profile gets its own store and derived indexes at
 `$HERMES_HOME/total-recall`. Multiple agents can share the same core/plugin code

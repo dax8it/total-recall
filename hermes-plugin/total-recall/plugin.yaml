@@ -1,3 +1,3 @@
 name: total-recall
-version: 1.2.0
+version: 1.3.0
 description: "Total Recall — local deterministic continuity engine with ledger, checkpoints, signed anchors, verify, rehydrate, and derived LanceDB/QMD/SQLite retrieval."
