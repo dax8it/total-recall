@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     dashboard = sub.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
-    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--port", type=int, default=8899)
     dashboard.add_argument("--backup-dir", default="~/total-recall-backups")
     dashboard.add_argument("--keep", type=int, default=14)
 

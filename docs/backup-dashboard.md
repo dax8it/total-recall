@@ -17,13 +17,13 @@ total-recall dashboard \
   --backup-dir ~/total-recall-backups \
   --keep 14 \
   --host 127.0.0.1 \
-  --port 8765
+  --port 8899
 ```
 
 Open:
 
 ```text
-http://127.0.0.1:8765
+http://127.0.0.1:8899
 ```
 
 Use `--home` or `TOTAL_RECALL_HOME` to point the dashboard at a specific Hermes
@@ -57,14 +57,14 @@ retention count.
 The dashboard exposes a launchd plist template at:
 
 ```text
-http://127.0.0.1:8765/api/launchd.plist
+http://127.0.0.1:8899/api/launchd.plist
 ```
 
 Install it manually:
 
 ```bash
 mkdir -p ~/Library/LaunchAgents
-curl -s http://127.0.0.1:8765/api/launchd.plist \
+curl -s http://127.0.0.1:8899/api/launchd.plist \
   > ~/Library/LaunchAgents/com.total-recall.backup.plist
 launchctl unload ~/Library/LaunchAgents/com.total-recall.backup.plist 2>/dev/null || true
 launchctl load ~/Library/LaunchAgents/com.total-recall.backup.plist

@@ -14,7 +14,7 @@ def run_dashboard(
     *,
     home: Path,
     host: str = "127.0.0.1",
-    port: int = 8765,
+    port: int = 8899,
     backup_dir: Path,
     keep: int = 14,
 ) -> None:
