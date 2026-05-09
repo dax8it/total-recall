@@ -1,14 +1,18 @@
-# total-recall-core
+# Total Recall
 
-Framework-agnostic Total Recall continuity engine.
+Standalone, local-first continuity memory for agent runtimes.
 
-This repository is standalone. It does not depend on OpenClaw/OpenBrain and is
-intended to be consumed directly by Hermes Agent or any other local agent
-runtime.
+Total Recall is a framework-agnostic continuity engine. It keeps an append-only
+ledger as the source of truth, reduces that ledger into deterministic state,
+creates signed checkpoints, verifies integrity before rehydration, and builds
+rebuildable local retrieval indexes for recall.
 
-This package is the local authority for:
+It does not depend on OpenClaw, OpenBrain, or Hermes. Hermes Agent can use it
+through the optional provider plugin in `hermes-plugin/total-recall`.
 
-- append-only ledger ingestion
+## What It Provides
+
+- append-only ledger ingestion with hash chaining
 - deterministic state reduction
 - checkpoint creation
 - signed anchor verification
@@ -17,12 +21,33 @@ This package is the local authority for:
 - external-memory quarantine, promote, and reject flow
 - derived LanceDB, QMD, and SQLite/FTS retrieval indexes with lexical fallback
 - source-cited context planning
+- optional Hermes Agent memory provider plugin
 
-It does not call OpenClaw/OpenBrain and does not import Hermes. Hermes consumes it through the `total-recall` memory provider plugin.
+## Install For Local Development
+
+```bash
+git clone git@github.com:dax8it/total-recall.git
+cd total-recall
+python3 -m venv .venv
+. .venv/bin/activate
+pip install -e '.[semantic]'
+python -m pytest -q
+```
+
+The `semantic` extra installs LanceDB. It is optional; SQLite/FTS and lexical
+fallback work without it.
+
+You can also run directly from the checkout:
+
+```bash
+PYTHONPATH=src python -m total_recall_core.cli health
+./bin/total-recall health
+```
 
 ## Storage
 
-Set `TOTAL_RECALL_HOME` to choose the store. In Hermes, the provider defaults to:
+Set `TOTAL_RECALL_HOME` to choose the local store. If unset, the core uses a
+profile-appropriate default supplied by the caller. In Hermes, the provider uses:
 
 ```text
 $HERMES_HOME/total-recall
@@ -60,16 +85,15 @@ SQLite/FTS deterministic index
 lexical authority-artifact scan
 ```
 
-LanceDB is optional and can be installed with:
+QMD is optional and is discovered from `TOTAL_RECALL_QMD_BIN` or `PATH`.
+
+Useful environment flags:
 
 ```bash
-pip install 'total-recall-core[semantic]'
+TOTAL_RECALL_ENABLE_LANCEDB=0
+TOTAL_RECALL_ENABLE_QMD=0
+TOTAL_RECALL_QMD_EMBED=1
 ```
-
-QMD is optional and is discovered from `TOTAL_RECALL_QMD_BIN` or `PATH`.
-Set `TOTAL_RECALL_ENABLE_LANCEDB=0` or `TOTAL_RECALL_ENABLE_QMD=0` to disable
-those adapters. Set `TOTAL_RECALL_QMD_EMBED=1` to ask QMD to build vector
-embeddings after collection rebuilds.
 
 ## CLI
 
@@ -90,7 +114,9 @@ total-recall external ingest --source handoff.md --text "Imported context"
 
 ## Trust Model
 
-The ledger is append-only JSONL with a hash chain. Checkpoints pin the reduced state hash, event count, and last event hash. Anchors sign checkpoint hashes using a local HMAC-SHA256 key stored at `keys/anchor.key`.
+The ledger is append-only JSONL with a hash chain. Checkpoints pin the reduced
+state hash, event count, and last event hash. Anchors sign checkpoint hashes
+using a local HMAC-SHA256 key stored at `keys/anchor.key`.
 
 Verification fails closed when:
 
@@ -114,35 +140,27 @@ The Hermes provider lives at:
 hermes-plugin/total-recall
 ```
 
-For a profile-scoped Hermes home, make that plugin available under the profile's
-documented memory-provider path, then select:
+For a profile-scoped Hermes home, expose the plugin under the documented memory
+provider path, then select it:
 
 ```bash
-ln -s /Users/Shared/GITHUB/total-recall/hermes-plugin/total-recall "$HERMES_HOME/plugins/memory/total-recall"
+mkdir -p "$HERMES_HOME/plugins/memory"
+ln -s /path/to/total-recall/hermes-plugin/total-recall "$HERMES_HOME/plugins/memory/total-recall"
 hermes -p total-recall-smoke config set memory.provider total-recall
 hermes -p total-recall-smoke memory status
 ```
 
-Only switch a live profile after `health`, `search`, `checkpoint`, `verify`, and `rehydrate` pass.
+Only switch a live profile after `health`, `search`, `checkpoint`, `verify`, and
+`rehydrate` pass.
 
 Each Hermes profile gets its own store and derived indexes at
-`$HERMES_HOME/total-recall`. Filippo, Sparky, and Smarty can share the same
-core/plugin code while keeping profile-local ledgers and indexes isolated.
+`$HERMES_HOME/total-recall`. Multiple agents can share the same core/plugin code
+while keeping profile-local ledgers and indexes isolated.
 
 ## Hermes Compaction And Rehydration
 
-Hermes Agent owns context compaction thresholds. Total Recall does not currently
-decide when compaction happens.
-
-Hermes defaults:
-
-```yaml
-compression:
-  enabled: true
-  threshold: 0.50
-  target_ratio: 0.20
-  protect_last_n: 20
-```
+Hermes Agent owns context compaction thresholds. Total Recall does not decide
+when compaction happens.
 
 When Hermes approaches the threshold, it calls the active memory provider's
 `on_pre_compress(messages)` hook before summarizing and discarding older context.
@@ -237,6 +255,5 @@ produce cited candidates and receipts.
 ## Test
 
 ```bash
-cd /Users/fattyclaw/.openclaw/workspace/packages/total-recall-core
-PYTHONPATH=src /Users/fattyclaw/.hermes/hermes-agent/.venv/bin/python -m pytest -q
+python -m pytest -q
 ```

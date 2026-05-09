@@ -24,7 +24,6 @@ def _candidate_core_src_paths() -> List[Path]:
         candidate = parent / "src"
         if (candidate / "total_recall_core").is_dir():
             paths.append(candidate)
-    paths.append(Path("/Users/Shared/GITHUB/total-recall/src"))
     return paths
 
 
