@@ -1,0 +1,23 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Local runtime stores are not source.
+/.total-recall/
+/total-recall/
+/ledger/
+/state/
+/checkpoints/
+/anchors/
+/reports/
+/incidents/
+/external-memory/
+/index/
+/keys/

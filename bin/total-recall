@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ "$SOURCE" != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+PYTHON="${TOTAL_RECALL_PYTHON:-}"
+if [[ -z "$PYTHON" && -x "/Users/fattyclaw/.hermes/hermes-agent/.venv/bin/python" ]]; then
+  PYTHON="/Users/fattyclaw/.hermes/hermes-agent/.venv/bin/python"
+fi
+PYTHON="${PYTHON:-python3}"
+PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON" -m total_recall_core.cli "$@"
