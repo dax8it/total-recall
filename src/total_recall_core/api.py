@@ -1034,6 +1034,52 @@ class TotalRecallCore:
             ],
         }
 
+    def sync_status(self, out_dir: str) -> Dict[str, Any]:
+        directory = Path(out_dir).expanduser()
+        state = self.reduce_state(write=False)
+        local_checkpoint = self._latest_checkpoint_summary()
+        latest_bundle = self.backup_status(str(directory)).get("latest")
+        archive = self._backup_bundle_summary(Path(str(latest_bundle))) if latest_bundle else None
+        archive_checkpoint = (archive or {}).get("latestCheckpoint") or {}
+
+        if not archive:
+            relation = "local_ahead"
+            message = "No backup archive found. Upload a backup before switching machines."
+        elif not archive_checkpoint:
+            relation = "diverged"
+            message = "Latest archive has no checkpoint summary. Inspect the archive before trusting it."
+        else:
+            local_count = int(state.get("event_count") or 0)
+            archive_count = int(archive_checkpoint.get("event_count") or 0)
+            local_hash = state.get("last_event_hash")
+            archive_hash = archive_checkpoint.get("last_event_hash")
+            if local_count == archive_count and local_hash == archive_hash:
+                relation = "in_sync"
+                message = "Local store and latest archive pin the same ledger point."
+            elif local_count > archive_count:
+                relation = "local_ahead"
+                message = f"Local store is ahead by {local_count - archive_count} event(s). Upload a new backup."
+            elif archive_count > local_count:
+                relation = "archive_ahead"
+                message = f"Latest archive is ahead by {archive_count - local_count} event(s). Download/import before working."
+            else:
+                relation = "diverged"
+                message = "Local and archive event counts match but ledger hashes differ. Do not auto-merge."
+
+        return {
+            "ok": True,
+            "relation": relation,
+            "message": message,
+            "local": {
+                "stateHash": state.get("state_hash"),
+                "eventCount": state.get("event_count"),
+                "lastEventHash": state.get("last_event_hash"),
+                "latestCheckpoint": local_checkpoint,
+            },
+            "archive": archive,
+            "backupDir": str(directory),
+        }
+
     def backup_run(
         self,
         out_dir: str,
@@ -1866,6 +1912,64 @@ class TotalRecallCore:
             key=lambda path: (path.stat().st_mtime, path.name),
             reverse=True,
         )
+
+    def _latest_checkpoint_summary(self) -> Optional[Dict[str, Any]]:
+        latest = self._latest_file(self.home / "checkpoints", "*.json")
+        if not latest:
+            return None
+        payload = self._read_json(latest)
+        return {
+            "path": str(latest),
+            "checkpoint_id": payload.get("checkpoint_id"),
+            "created_at": payload.get("created_at"),
+            "event_count": payload.get("event_count"),
+            "last_event_hash": payload.get("last_event_hash"),
+            "state_hash": payload.get("state_hash"),
+            "checkpoint_hash": payload.get("checkpoint_hash"),
+        }
+
+    def _backup_bundle_summary(self, bundle: Path) -> Dict[str, Any]:
+        if not bundle.exists():
+            return {"ok": False, "error": "bundle_not_found", "bundle": str(bundle)}
+        checkpoints: List[Dict[str, Any]] = []
+        manifest: Dict[str, Any] = {}
+        with tarfile.open(bundle, "r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name == "MANIFEST.json":
+                    source = tar.extractfile(member)
+                    if source:
+                        manifest = json.loads(source.read().decode("utf-8"))
+                if member.isfile() and member.name.startswith("checkpoints/") and member.name.endswith(".json"):
+                    source = tar.extractfile(member)
+                    if not source:
+                        continue
+                    payload = json.loads(source.read().decode("utf-8"))
+                    checkpoints.append({
+                        "path": member.name,
+                        "checkpoint_id": payload.get("checkpoint_id"),
+                        "created_at": payload.get("created_at"),
+                        "event_count": payload.get("event_count"),
+                        "last_event_hash": payload.get("last_event_hash"),
+                        "state_hash": payload.get("state_hash"),
+                        "checkpoint_hash": payload.get("checkpoint_hash"),
+                    })
+        latest_checkpoint = max(checkpoints, key=lambda item: str(item.get("created_at") or "")) if checkpoints else None
+        return {
+            "ok": True,
+            "bundle": str(bundle),
+            "bytes": bundle.stat().st_size,
+            "modified": datetime.fromtimestamp(bundle.stat().st_mtime, tz=timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z"),
+            "manifest": {
+                "schema": manifest.get("schema"),
+                "version": manifest.get("version"),
+                "created_at": manifest.get("created_at"),
+                "fileCount": len(manifest.get("files") or []),
+            },
+            "latestCheckpoint": latest_checkpoint,
+        }
 
     def _write_report(self, kind: str, subject: str, payload: Dict[str, Any]) -> Dict[str, str]:
         report_id = f"{kind}_{_safe_id(subject)}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"

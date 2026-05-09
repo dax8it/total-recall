@@ -258,6 +258,23 @@ def test_backup_run_exports_verifies_and_prunes_old_backups(tmp_path):
     assert not (backup_dir / "total-recall-backup-20000101-000000.tar.gz").exists()
 
 
+def test_sync_status_compares_current_local_state_to_latest_archive(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    backup_dir = tmp_path / "backups"
+    core.ingest(kind="note", text="Synced memory.", session_id="s1")
+
+    backup = core.backup_run(str(backup_dir), keep=10)
+    assert backup["ok"] is True
+    synced = core.sync_status(str(backup_dir))
+    assert synced["relation"] == "in_sync"
+    assert synced["local"]["eventCount"] == synced["archive"]["latestCheckpoint"]["event_count"]
+
+    core.ingest(kind="note", text="Local-only memory after latest archive.", session_id="s1")
+    ahead = core.sync_status(str(backup_dir))
+    assert ahead["relation"] == "local_ahead"
+    assert "ahead by 1 event" in ahead["message"]
+
+
 def test_context_plan_has_citations(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     core.ingest(kind="note", text="A cited recall block should mention StoryForge.", session_id="s1")

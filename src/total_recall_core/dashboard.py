@@ -4,7 +4,7 @@ import json
 import shlex
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
 from .api import TotalRecallConfig, TotalRecallCore
@@ -80,6 +80,16 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
             if parsed.path == "/api/backup/run":
                 self._send_json(core.backup_run(str(backup_dir), keep=keep, keep_days=keep_days))
                 return
+            if parsed.path == "/api/remote/sync":
+                payload = self._read_body_json()
+                self._send_json(_remote_sync(core, backup_dir=backup_dir, selected=payload.get("providers") or []))
+                return
+            if parsed.path == "/api/remote/upload":
+                payload = self._read_body_json()
+                selected = payload.get("providers") or []
+                backup = core.backup_run(str(backup_dir), keep=keep, keep_days=keep_days)
+                self._send_json(_remote_upload_result(core, backup_dir=backup_dir, selected=selected, backup=backup))
+                return
             if parsed.path == "/api/checkpoint":
                 self._send_json(core.checkpoint(session_id="dashboard", label="manual_dashboard_checkpoint"))
                 return
@@ -93,6 +103,15 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
 
         def _send_json(self, payload: Dict[str, Any], *, status: int = 200) -> None:
             self._send("application/json", json.dumps(payload, indent=2, ensure_ascii=False), status=status)
+
+        def _read_body_json(self) -> Dict[str, Any]:
+            length = int(self.headers.get("Content-Length") or "0")
+            if length <= 0:
+                return {}
+            try:
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+            except Exception:
+                return {}
 
         def _send_html(self, html: str) -> None:
             self._send("text/html; charset=utf-8", html)
@@ -147,16 +166,58 @@ def _safe_backup_path(path: Path, backup_dir: Path) -> bool:
     return resolved.is_file() and resolved.name.startswith("total-recall-backup-") and resolved.name.endswith(".tar.gz")
 
 
-def _providers() -> list[Dict[str, str]]:
+def _providers() -> list[Dict[str, Any]]:
     return [
-        {"name": "Local folder", "status": "available", "note": "Works now. Point backup-dir at any local or synced folder."},
-        {"name": "iCloud Drive", "status": "available via folder", "note": "Works if backup-dir is inside your iCloud Drive folder."},
-        {"name": "Google Drive", "status": "planned", "note": "Use OAuth/connector or local Drive folder; do not store tokens in Total Recall."},
-        {"name": "Dropbox", "status": "planned", "note": "Use OAuth or local Dropbox folder; encrypted upload adapter should store secrets in Keychain."},
-        {"name": "Pinata/IPFS", "status": "planned encrypted", "note": "Upload encrypted bundles only; IPFS is not private by default."},
-        {"name": "S3-compatible", "status": "planned encrypted", "note": "Good for Backblaze/R2/S3 with Keychain-held credentials."},
-        {"name": "Arweave", "status": "planned encrypted", "note": "Durable archive candidate; upload encrypted bundles only."},
+        {"id": "local_folder", "name": "Local folder", "status": "available", "default": True, "note": "Works now. Point backup-dir at any local or synced folder."},
+        {"id": "icloud_drive", "name": "iCloud Drive", "status": "available via folder", "default": True, "note": "Works now if backup-dir is inside your iCloud Drive folder."},
+        {"id": "google_drive", "name": "Google Drive", "status": "planned", "default": True, "note": "First direct cloud adapter candidate: OAuth + resumable upload + encrypted bundles."},
+        {"id": "arweave", "name": "Arweave", "status": "planned encrypted", "default": True, "note": "Durable archive layer: encrypted bundles, permanent receipts, manual approval for upload costs."},
+        {"id": "github", "name": "GitHub", "status": "planned encrypted", "default": False, "note": "Good metadata/receipt mirror or private release assets; not primary memory authority."},
+        {"id": "dropbox", "name": "Dropbox", "status": "planned", "default": False, "note": "OAuth or local Dropbox folder; encrypted upload adapter should store secrets in Keychain."},
+        {"id": "s3", "name": "S3-compatible", "status": "planned encrypted", "default": False, "note": "Good for Backblaze/R2/S3 with Keychain-held credentials."},
+        {"id": "pinata_ipfs", "name": "Pinata/IPFS", "status": "planned encrypted", "default": False, "note": "Upload encrypted bundles only; IPFS is not private by default."},
     ]
+
+
+def _remote_sync(core: TotalRecallCore, *, backup_dir: Path, selected: List[str]) -> Dict[str, Any]:
+    selected = selected or [provider["id"] for provider in _providers() if provider.get("default")]
+    local_sync = core.sync_status(str(backup_dir))
+    results = []
+    for provider in _providers():
+        if provider["id"] not in selected:
+            continue
+        if provider["id"] in {"local_folder", "icloud_drive"}:
+            results.append({"provider": provider, "ok": local_sync.get("relation") == "in_sync", "sync": local_sync})
+        else:
+            results.append({
+                "provider": provider,
+                "ok": False,
+                "relation": "not_configured",
+                "message": "Adapter not implemented yet. Use encrypted local/synced-folder backup for now.",
+            })
+    return {"ok": True, "selected": selected, "localSync": local_sync, "results": results}
+
+
+def _remote_upload_result(core: TotalRecallCore, *, backup_dir: Path, selected: List[str], backup: Dict[str, Any]) -> Dict[str, Any]:
+    selected = selected or [provider["id"] for provider in _providers() if provider.get("default")]
+    results = []
+    for provider in _providers():
+        if provider["id"] not in selected:
+            continue
+        if provider["id"] in {"local_folder", "icloud_drive"}:
+            results.append({
+                "provider": provider,
+                "ok": bool(backup.get("ok")),
+                "message": "Backup bundle written locally. Cloud sync depends on the selected folder's sync client.",
+                "bundle": (backup.get("backup") or {}).get("bundle"),
+            })
+        else:
+            results.append({
+                "provider": provider,
+                "ok": False,
+                "message": "Direct encrypted upload adapter not implemented yet.",
+            })
+    return {"ok": bool(backup.get("ok")), "backup": backup, "selected": selected, "results": results, "sync": core.sync_status(str(backup_dir))}
 
 
 def _launchd_plist(*, home: Path, backup_dir: Path, keep: int, keep_days: int | None, hour: int, minute: int) -> str:
@@ -259,7 +320,11 @@ _HTML = r"""<!doctype html>
     .path { overflow-wrap: anywhere; color: var(--muted); font-size: 13px; }
     .hidden { display: none; }
     .providers { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
-    .provider { border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+    .provider { border: 1px solid var(--line); border-radius: 8px; padding: 10px; cursor: pointer; }
+    .provider-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .provider-title { display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .provider input { width: 16px; height: 16px; flex: 0 0 auto; accent-color: var(--accent); }
+    .remote-actions { margin-top: 12px; }
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; padding: 16px; }
       header { padding: 20px 16px 14px; }
@@ -314,12 +379,20 @@ _HTML = r"""<!doctype html>
     </section>
     <section class="span">
       <h2>Remote Backup Providers</h2>
-      <p>Remote backup should upload encrypted bundles only. Provider receipts are useful, but they are never continuity authority.</p>
+      <p>Choose one or more targets. Local folders and synced folders work now; direct cloud adapters will require encrypted bundles and Keychain-held credentials.</p>
       <div class="providers" id="providers"></div>
+      <div class="row remote-actions">
+        <button onclick="runRemoteSync()">Sync Check</button>
+        <button class="primary" onclick="runRemoteUpload()">Upload Selected</button>
+      </div>
+      <div class="gate-list" id="remote-progress"></div>
+      <button id="toggle-remote-raw" class="hidden" onclick="toggleRemoteRaw()">Show remote raw output</button>
+      <pre id="remote-result" class="hidden">Ready.</pre>
     </section>
   </main>
   <script>
     let rawVisible = false;
+    let remoteRawVisible = false;
     async function getJson(url, options) {
       const response = await fetch(url, options);
       return response.json();
@@ -366,9 +439,59 @@ _HTML = r"""<!doctype html>
       document.getElementById('backups').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="4">No backups yet.</td></tr>';
     }
     function renderProviders(providers) {
-      document.getElementById('providers').innerHTML = providers.map(provider => (
-        '<div class="provider"><div class="row"><strong>' + escapeHtml(provider.name) + '</strong><span class="chip ' + providerClass(provider.status) + '">' + escapeHtml(provider.status) + '</span></div><p>' + escapeHtml(provider.note) + '</p></div>'
-      )).join('');
+      document.getElementById('providers').innerHTML = providers.map(provider => `
+        <label class="provider">
+          <div class="provider-header">
+            <span class="provider-title">
+              <input type="checkbox" name="remote-provider" value="${escapeHtml(provider.id)}" ${provider.default ? 'checked' : ''}>
+              <strong>${escapeHtml(provider.name)}</strong>
+            </span>
+            <span class="chip ${providerClass(provider.status)}">${escapeHtml(provider.status)}</span>
+          </div>
+          <p>${escapeHtml(provider.note)}</p>
+        </label>
+      `).join('');
+    }
+    function selectedProviderIds() {
+      return Array.from(document.querySelectorAll('input[name="remote-provider"]:checked')).map(input => input.value);
+    }
+    async function postJson(url, payload) {
+      return getJson(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+    }
+    async function runRemoteSync() {
+      setBusy(true);
+      document.getElementById('remote-progress').innerHTML = gate('Sync check', null, 'comparing local checkpoint with latest archive...');
+      const data = await postJson('/api/remote/sync', {providers: selectedProviderIds()});
+      renderRemoteResult(data);
+      setBusy(false);
+      await refresh();
+    }
+    async function runRemoteUpload() {
+      setBusy(true);
+      document.getElementById('remote-progress').innerHTML = gate('Upload selected', null, 'creating local backup and checking selected providers...');
+      const data = await postJson('/api/remote/upload', {providers: selectedProviderIds()});
+      renderRemoteResult(data);
+      setBusy(false);
+      await refresh();
+    }
+    function renderRemoteResult(data) {
+      const steps = [];
+      const sync = data.localSync || data.sync;
+      if (sync) {
+        steps.push(gate('Local vs latest archive', sync.relation === 'in_sync', sync.message || sync.relation));
+      }
+      for (const item of (data.results || [])) {
+        const provider = item.provider || {};
+        const detail = item.message || (item.sync ? item.sync.message : item.relation) || 'checked';
+        steps.push(gate(provider.name || 'Provider', !!item.ok, detail));
+      }
+      document.getElementById('remote-progress').innerHTML = steps.length ? steps.join('') : gate('Remote sync', false, 'No provider selected.');
+      document.getElementById('remote-result').textContent = JSON.stringify(data, null, 2);
+      document.getElementById('toggle-remote-raw').classList.remove('hidden');
     }
     async function runAction(url) {
       setBusy(true);
@@ -413,6 +536,11 @@ _HTML = r"""<!doctype html>
       rawVisible = !rawVisible;
       document.getElementById('result').classList.toggle('hidden', !rawVisible);
       document.getElementById('toggle-raw').textContent = rawVisible ? 'Hide raw output' : 'Show raw output';
+    }
+    function toggleRemoteRaw() {
+      remoteRawVisible = !remoteRawVisible;
+      document.getElementById('remote-result').classList.toggle('hidden', !remoteRawVisible);
+      document.getElementById('toggle-remote-raw').textContent = remoteRawVisible ? 'Hide remote raw output' : 'Show remote raw output';
     }
     function setMetric(id, value, klass) {
       const el = document.getElementById(id);

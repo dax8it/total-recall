@@ -124,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     backup_run.add_argument("--no-checkpoint", action="store_true")
     backup_status = backup_sub.add_parser("status")
     backup_status.add_argument("--out-dir", default="~/total-recall-backups")
+    backup_sync = backup_sub.add_parser("sync-status")
+    backup_sync.add_argument("--out-dir", default="~/total-recall-backups")
 
     dashboard = sub.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
@@ -224,6 +226,8 @@ def main() -> int:
             )
         if sub == "status":
             return _print(core.backup_status(args.out_dir))
+        if sub == "sync-status":
+            return _print(core.sync_status(args.out_dir))
     if command == "dashboard":
         if __package__ in {None, ""}:
             from total_recall_core.dashboard import run_dashboard

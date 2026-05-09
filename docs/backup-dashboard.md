@@ -49,6 +49,12 @@ Inspect existing backups:
 total-recall backup status --out-dir ~/total-recall-backups
 ```
 
+Compare the current local store to the newest archive:
+
+```bash
+total-recall backup sync-status --out-dir ~/total-recall-backups
+```
+
 The backup cycle creates a fresh checkpoint, writes a timestamped bundle, runs
 `doctor`, runs `verify`, and then deletes older
 `total-recall-backup-*.tar.gz` bundles beyond the configured retention policy.
@@ -89,6 +95,16 @@ directory, or retention flags.
 
 Remote backups are feasible, but they should be encrypted before upload.
 
+The dashboard has a provider selector and two remote controls:
+
+- `Sync Check` compares the current local ledger state with the latest archive
+  in the backup directory and reports `in_sync`, `local_ahead`,
+  `archive_ahead`, or `diverged`.
+- `Upload Selected` creates a fresh local backup and reports the selected
+  provider status. Local folder and synced-folder providers work now; direct
+  cloud adapters are intentionally blocked until encryption and credential
+  storage are wired.
+
 IPFS-style services such as Pinata are good for durable content-addressed
 storage, but public IPFS content is not private by default. Even if a provider
 offers private gateways or access controls, Total Recall bundles contain agent
@@ -125,3 +141,6 @@ ledger.
 
 Remote receipts should never become continuity authority. The ledger,
 checkpoints, anchors, and local verification remain the trust boundary.
+
+See `docs/remote-backup-design.md` for the provider roadmap, encryption model,
+approved-device model, and travel-machine restore flow.
