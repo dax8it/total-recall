@@ -361,7 +361,7 @@ _HTML = r"""<!doctype html>
     function renderBackups(backups) {
       const rows = backups.map(item => {
         const encoded = encodeURIComponent(item.path);
-        return '<tr><td class="path">' + escapeHtml(item.path) + '</td><td>' + formatBytes(item.bytes) + '</td><td>' + item.modified + '</td><td class="row"><a class="button" href="/api/backups/download?path=' + encoded + '">Download</a><button onclick="copyText(\\'' + escapeJs(item.path) + '\\')">Copy path</button></td></tr>';
+        return '<tr><td class="path">' + escapeHtml(item.path) + '</td><td>' + formatBytes(item.bytes) + '</td><td>' + item.modified + '</td><td class="row"><a class="button" href="/api/backups/download?path=' + encoded + '">Download</a><button data-copy-path="' + escapeHtml(item.path) + '" onclick="copyText(this.dataset.copyPath)">Copy path</button></td></tr>';
       });
       document.getElementById('backups').innerHTML = rows.length ? rows.join('') : '<tr><td colspan="4">No backups yet.</td></tr>';
     }
@@ -442,9 +442,6 @@ _HTML = r"""<!doctype html>
     }
     function escapeHtml(value) {
       return String(value).replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
-    }
-    function escapeJs(value) {
-      return String(value).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
     }
     refresh();
   </script>
