@@ -113,6 +113,9 @@ total-recall rehydrate --session-id main --query "Remember"
 total-recall doctor
 total-recall export --out total-recall-backup.tar.gz
 total-recall import total-recall-backup.tar.gz
+total-recall backup run --out-dir ~/total-recall-backups --keep 14
+total-recall backup status --out-dir ~/total-recall-backups
+total-recall dashboard --backup-dir ~/total-recall-backups --keep 14
 total-recall incidents list
 total-recall external ingest --source handoff.md --text "Imported context"
 ```
@@ -143,6 +146,8 @@ trusted ledger state rather than trusted directly.
 
 See [docs/hermes.md](docs/hermes.md) for install, profile selection,
 smoke-test, recovery, and troubleshooting commands.
+
+For local backup management, see [docs/backup-dashboard.md](docs/backup-dashboard.md).
 
 Each Hermes profile gets its own store and derived indexes at
 `$HERMES_HOME/total-recall`. Multiple agents can share the same core/plugin code

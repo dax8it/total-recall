@@ -114,6 +114,21 @@ def build_parser() -> argparse.ArgumentParser:
     import_cmd.add_argument("bundle")
     import_cmd.add_argument("--replace", action="store_true")
 
+    backup = sub.add_parser("backup")
+    backup_sub = backup.add_subparsers(dest="backup_command")
+    backup_run = backup_sub.add_parser("run")
+    backup_run.add_argument("--out-dir", default="~/total-recall-backups")
+    backup_run.add_argument("--keep", type=int, default=14)
+    backup_run.add_argument("--include-index", action="store_true")
+    backup_status = backup_sub.add_parser("status")
+    backup_status.add_argument("--out-dir", default="~/total-recall-backups")
+
+    dashboard = sub.add_parser("dashboard")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", type=int, default=8765)
+    dashboard.add_argument("--backup-dir", default="~/total-recall-backups")
+    dashboard.add_argument("--keep", type=int, default=14)
+
     return parser
 
 
@@ -192,6 +207,26 @@ def main() -> int:
         return _print(core.export_bundle(args.out, include_index=args.include_index))
     if command == "import":
         return _print(core.import_bundle(args.bundle, replace=args.replace))
+    if command == "backup":
+        sub = args.backup_command or "status"
+        if sub == "run":
+            return _print(core.backup_run(args.out_dir, keep=args.keep, include_index=args.include_index))
+        if sub == "status":
+            return _print(core.backup_status(args.out_dir))
+    if command == "dashboard":
+        if __package__ in {None, ""}:
+            from total_recall_core.dashboard import run_dashboard
+        else:
+            from .dashboard import run_dashboard
+
+        run_dashboard(
+            home=core.home,
+            host=args.host,
+            port=args.port,
+            backup_dir=Path(args.backup_dir),
+            keep=args.keep,
+        )
+        return 0
 
     return _print({"ok": False, "error": f"command not implemented: {command}"})
 

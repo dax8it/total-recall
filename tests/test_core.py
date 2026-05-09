@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import tarfile
 from concurrent.futures import ThreadPoolExecutor
@@ -216,6 +217,29 @@ def test_import_rejects_unsafe_tar_paths(tmp_path):
     result = core.import_bundle(str(bundle))
     assert result["ok"] is False
     assert result["error"] == "unsafe_bundle_path"
+
+
+def test_backup_run_exports_verifies_and_prunes_old_backups(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    backup_dir = tmp_path / "backups"
+    core.ingest(kind="note", text="Retained backup memory.", session_id="s1")
+    core.checkpoint(session_id="s1")
+
+    first = core.backup_run(str(backup_dir), keep=1)
+    assert first["ok"] is True
+    assert first["backupStatus"]["count"] == 1
+    assert Path(first["backup"]["bundle"]).exists()
+
+    # Ensure the second backup receives a distinct timestamp.
+    old_path = Path(first["backup"]["bundle"])
+    old_path.rename(backup_dir / "total-recall-backup-20000101-000000.tar.gz")
+    os.utime(backup_dir / "total-recall-backup-20000101-000000.tar.gz", (946684800, 946684800))
+
+    second = core.backup_run(str(backup_dir), keep=1)
+    assert second["ok"] is True
+    assert second["backupStatus"]["count"] == 1
+    assert len(second["retention"]["pruned"]) == 1
+    assert not (backup_dir / "total-recall-backup-20000101-000000.tar.gz").exists()
 
 
 def test_context_plan_has_citations(tmp_path):

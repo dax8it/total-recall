@@ -7,9 +7,9 @@ Date: 2026-05-09
 | Area | Status | Evidence |
 |---|---:|---|
 | Standalone repo | PASS | Core, CLI, tests, docs, and Hermes plugin live in this repo. |
-| Core unit tests | PASS | `python -m pytest -q` -> 22 passed. |
+| Core unit tests | PASS | `python -m pytest -q` -> 23 passed. |
 | Hermes plugin lifecycle tests | PASS | Tests cover initialize, sync, search, checkpoint, verify, rehydrate, pre-compress, session switch, context-threshold auto-rehydrate, and fail-closed tamper behavior. |
-| Fresh install smoke | PASS | `scripts/install_smoke.sh` installs package in a fresh virtualenv and runs health, ingest, search, checkpoint, verify, rehydrate, doctor, export, import, and restored verify. |
+| Fresh install smoke | PASS | `scripts/install_smoke.sh` installs package in a fresh virtualenv and runs health, ingest, search, checkpoint, verify, rehydrate, doctor, export, import, restored verify, backup run, and backup status. |
 | Privacy scan | PASS | `python scripts/privacy_scan.py` reports no local paths or sensitive configuration strings. |
 | CI fortification | PASS | GitHub Actions runs privacy scan, package install, pytest, and install smoke. |
 | Verified rehydration | PASS | Rehydrate calls verify first; auto-rehydrate injects FAIL_CLOSED warning instead of memory on tamper-like verification failure. |
@@ -18,6 +18,7 @@ Date: 2026-05-09
 | Export/import/doctor | PASS | CLI covers portable bundles, manifest verification, unsafe tar rejection, restore verify, and doctor reports. |
 | Broader tamper matrix | PASS | Tests cover anchor tamper, ledger text changes, deleted/reordered ledger events, checkpoint mutation, missing anchors, and anchor hash mutation. |
 | Hermes install docs | PASS | Dedicated setup, smoke, provider, rehydrate, backup, and troubleshooting guide lives in `docs/hermes.md`. |
+| Backup dashboard | PASS | `total-recall dashboard` serves a local management UI; `backup run/status` covers export, doctor, verify, and retention. |
 
 ## Remaining Hardening
 
@@ -38,6 +39,6 @@ Expected local result:
 
 ```text
 Privacy scan passed.
-22 passed
+23 passed
 Install smoke passed.
 ```

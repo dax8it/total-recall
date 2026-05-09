@@ -127,6 +127,16 @@ TOTAL_RECALL_HOME=/path/to/store total-recall import total-recall-backup.tar.gz 
 copying files. `verify` rebuilds derived indexes from the ledger after
 authoritative checks pass.
 
+For a managed local dashboard and retention policy:
+
+```bash
+TOTAL_RECALL_HOME=/path/to/profile/total-recall \
+  total-recall dashboard --backup-dir ~/total-recall-backups --keep 14
+```
+
+See `docs/backup-dashboard.md` for launchd automation and private remote-backup
+notes.
+
 ## Troubleshooting
 
 Run:

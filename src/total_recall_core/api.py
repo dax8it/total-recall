@@ -991,6 +991,57 @@ class TotalRecallCore:
         payload["report"] = self._write_report("doctor", "latest", payload)
         return payload
 
+    def backup_status(self, out_dir: str) -> Dict[str, Any]:
+        directory = Path(out_dir).expanduser()
+        backups = self._list_backup_files(directory)
+        return {
+            "ok": True,
+            "backupDir": str(directory),
+            "count": len(backups),
+            "totalBytes": sum(path.stat().st_size for path in backups),
+            "latest": str(backups[0]) if backups else None,
+            "backups": [
+                {
+                    "path": str(path),
+                    "bytes": path.stat().st_size,
+                    "modified": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                    .replace(microsecond=0)
+                    .isoformat()
+                    .replace("+00:00", "Z"),
+                }
+                for path in backups
+            ],
+        }
+
+    def backup_run(self, out_dir: str, *, keep: int = 14, include_index: bool = False) -> Dict[str, Any]:
+        directory = Path(out_dir).expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        bundle = directory / f"total-recall-backup-{stamp}-{secrets.token_hex(3)}.tar.gz"
+
+        exported = self.export_bundle(str(bundle), include_index=include_index)
+        doctor = self.doctor()
+        verification = self.verify()
+        pruned: List[str] = []
+        if keep > 0:
+            backups = self._list_backup_files(directory)
+            for path in backups[max(0, keep) :]:
+                path.unlink(missing_ok=True)
+                pruned.append(str(path))
+
+        ok = bool(exported.get("ok")) and bool(doctor.get("ok")) and bool(verification.get("ok"))
+        payload = {
+            "ok": ok,
+            "status": "PASS" if ok else "FAIL_CLOSED",
+            "backup": exported,
+            "doctor": doctor,
+            "verification": verification,
+            "retention": {"keep": keep, "pruned": pruned},
+            "backupStatus": self.backup_status(str(directory)),
+        }
+        payload["report"] = self._write_report("backup", "latest", payload)
+        return payload
+
     def rehydrate_status(self, *, session_key: Optional[str] = None, agent: Optional[str] = None) -> Dict[str, Any]:
         session_id = session_key or (f"agent:{agent}:main" if agent else "default")
         latest = self._latest_file(self.home / "reports", f"rehydrate_{_safe_id(session_id)}*.json")
@@ -1769,6 +1820,15 @@ class TotalRecallCore:
     def _latest_file(self, directory: Path, pattern: str) -> Optional[Path]:
         files = [p for p in directory.glob(pattern) if p.is_file()]
         return max(files, key=lambda p: p.stat().st_mtime) if files else None
+
+    def _list_backup_files(self, directory: Path) -> List[Path]:
+        if not directory.exists():
+            return []
+        return sorted(
+            [path for path in directory.glob("total-recall-backup-*.tar.gz") if path.is_file()],
+            key=lambda path: (path.stat().st_mtime, path.name),
+            reverse=True,
+        )
 
     def _write_report(self, kind: str, subject: str, payload: Dict[str, Any]) -> Dict[str, str]:
         report_id = f"{kind}_{_safe_id(subject)}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
