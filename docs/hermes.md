@@ -131,7 +131,7 @@ For a managed local dashboard and retention policy:
 
 ```bash
 TOTAL_RECALL_HOME=/path/to/profile/total-recall \
-  total-recall dashboard --backup-dir ~/total-recall-backups --keep 14
+  total-recall dashboard --backup-dir ~/total-recall-backups --keep 14 --keep-days 90
 ```
 
 See `docs/backup-dashboard.md` for launchd automation and private remote-backup

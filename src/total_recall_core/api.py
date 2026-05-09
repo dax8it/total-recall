@@ -214,6 +214,12 @@ class TotalRecallCore:
 
     def reduce_state(self, *, write: bool = False) -> Dict[str, Any]:
         events = self._read_events(verify_chain=True)
+        state = self._state_from_events(events)
+        if write:
+            self._write_json(self.state_file, state)
+        return state
+
+    def _state_from_events(self, events: List[Dict[str, Any]]) -> Dict[str, Any]:
         sessions: Dict[str, Dict[str, Any]] = {}
         memories: List[Dict[str, Any]] = []
         promoted_external: List[Dict[str, Any]] = []
@@ -249,8 +255,6 @@ class TotalRecallCore:
             "promoted_external": promoted_external,
         }
         state["state_hash"] = sha256_json({k: v for k, v in state.items() if k not in {"generated_at", "state_hash"}})
-        if write:
-            self._write_json(self.state_file, state)
         return state
 
     def checkpoint(self, *, session_id: str = "default", label: str = "") -> Dict[str, Any]:
@@ -322,9 +326,26 @@ class TotalRecallCore:
         if actual_hash != expected_hash:
             failures.append("checkpoint_hash_mismatch")
 
+        state: Dict[str, Any] = {}
+        current_state: Dict[str, Any] = {}
         try:
-            state = self.reduce_state(write=True)
-            details["stateHash"] = state.get("state_hash")
+            events = self._read_events(verify_chain=True)
+            current_state = self._state_from_events(events)
+            checkpoint_event_count = int(checkpoint.get("event_count") or -1)
+            details["stateHash"] = current_state.get("state_hash")
+            details["currentStateHash"] = current_state.get("state_hash")
+            details["currentEventCount"] = current_state.get("event_count")
+            details["currentLastEventHash"] = current_state.get("last_event_hash")
+            details["checkpointEventCount"] = checkpoint_event_count
+            if checkpoint_event_count < 0 or checkpoint_event_count > len(events):
+                failures.append("checkpoint_event_count_invalid")
+                state = current_state
+            else:
+                state = self._state_from_events(events[:checkpoint_event_count])
+            details["checkpointStateHash"] = state.get("state_hash")
+            if current_state.get("event_count") != checkpoint_event_count:
+                details.setdefault("warnings", []).append("checkpoint_stale")
+                details["checkpointLagEvents"] = current_state.get("event_count", 0) - checkpoint_event_count
             if state.get("state_hash") != checkpoint.get("state_hash"):
                 failures.append("state_hash_mismatch")
             if state.get("event_count") != checkpoint.get("event_count"):
@@ -351,7 +372,7 @@ class TotalRecallCore:
 
         if "ledger_or_state_invalid" not in ",".join(failures):
             try:
-                details["indexRebuild"] = self._rebuild_index_locked(state=state)
+                details["indexRebuild"] = self._rebuild_index_locked(state=current_state or state)
             except Exception as exc:
                 details.setdefault("warnings", []).append(f"index_rebuild_failed:{exc}")
 
@@ -1013,19 +1034,34 @@ class TotalRecallCore:
             ],
         }
 
-    def backup_run(self, out_dir: str, *, keep: int = 14, include_index: bool = False) -> Dict[str, Any]:
+    def backup_run(
+        self,
+        out_dir: str,
+        *,
+        keep: int = 14,
+        keep_days: Optional[int] = None,
+        include_index: bool = False,
+        checkpoint: bool = True,
+    ) -> Dict[str, Any]:
         directory = Path(out_dir).expanduser()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         bundle = directory / f"total-recall-backup-{stamp}-{secrets.token_hex(3)}.tar.gz"
 
+        checkpoint_result = self.checkpoint(session_id="backup", label="automatic_backup") if checkpoint else None
         exported = self.export_bundle(str(bundle), include_index=include_index)
         doctor = self.doctor()
         verification = self.verify()
         pruned: List[str] = []
-        if keep > 0:
-            backups = self._list_backup_files(directory)
-            for path in backups[max(0, keep) :]:
+        backups = self._list_backup_files(directory)
+        keep_set = set(backups[: max(0, keep)]) if keep > 0 else set(backups)
+        cutoff = None
+        if keep_days is not None and keep_days >= 0:
+            cutoff = datetime.now(timezone.utc).timestamp() - (keep_days * 86400)
+        for path in backups:
+            too_many = keep > 0 and path not in keep_set
+            too_old = cutoff is not None and path.stat().st_mtime < cutoff
+            if too_many or too_old:
                 path.unlink(missing_ok=True)
                 pruned.append(str(path))
 
@@ -1033,10 +1069,11 @@ class TotalRecallCore:
         payload = {
             "ok": ok,
             "status": "PASS" if ok else "FAIL_CLOSED",
+            "checkpoint": checkpoint_result,
             "backup": exported,
             "doctor": doctor,
             "verification": verification,
-            "retention": {"keep": keep, "pruned": pruned},
+            "retention": {"keep": keep, "keepDays": keep_days, "pruned": pruned},
             "backupStatus": self.backup_status(str(directory)),
         }
         payload["report"] = self._write_report("backup", "latest", payload)

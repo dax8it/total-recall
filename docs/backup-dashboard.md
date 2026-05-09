@@ -16,6 +16,7 @@ talks directly to `total-recall-core`; no external service is required.
 total-recall dashboard \
   --backup-dir ~/total-recall-backups \
   --keep 14 \
+  --keep-days 90 \
   --host 127.0.0.1 \
   --port 8899
 ```
@@ -39,7 +40,7 @@ TOTAL_RECALL_HOME=/path/to/profile/total-recall \
 Run one backup cycle:
 
 ```bash
-total-recall backup run --out-dir ~/total-recall-backups --keep 14
+total-recall backup run --out-dir ~/total-recall-backups --keep 14 --keep-days 90
 ```
 
 Inspect existing backups:
@@ -48,9 +49,17 @@ Inspect existing backups:
 total-recall backup status --out-dir ~/total-recall-backups
 ```
 
-The backup cycle creates a timestamped bundle, runs `doctor`, runs `verify`, and
-then deletes older `total-recall-backup-*.tar.gz` bundles beyond the configured
-retention count.
+The backup cycle creates a fresh checkpoint, writes a timestamped bundle, runs
+`doctor`, runs `verify`, and then deletes older
+`total-recall-backup-*.tar.gz` bundles beyond the configured retention policy.
+
+Retention options:
+
+- `--keep 14` keeps the latest 14 backup files.
+- `--keep-days 90` also deletes backups older than 90 days.
+- omit `--keep-days` to keep by file count only.
+- use a very large `--keep` and omit `--keep-days` for practical indefinite
+  retention, limited by disk space.
 
 ## macOS Launchd
 
@@ -73,6 +82,9 @@ launchctl load ~/Library/LaunchAgents/com.total-recall.backup.plist
 The generated job runs daily and uses the dashboard's selected home, backup
 directory, and retention count.
 
+You can edit the plist before loading it to change the hour, minute, backup
+directory, or retention flags.
+
 ## Private Remote Backups
 
 Remote backups are feasible, but they should be encrypted before upload.
@@ -94,7 +106,22 @@ Good future adapters:
 - encrypted Pinata/IPFS uploader
 - encrypted Arweave uploader
 - encrypted S3-compatible uploader
+- encrypted Google Drive uploader
+- encrypted Dropbox uploader
 - encrypted local removable-drive mirror
+
+For travel or a second machine, the safest portable flow is:
+
+```text
+Machine A: backup run -> encrypt -> upload/sync
+Machine B: download -> decrypt -> total-recall import
+```
+
+If the backup directory is inside iCloud Drive, Google Drive Desktop, Dropbox,
+or another synced folder, Total Recall can already write local encrypted or
+unencrypted bundles there. Direct API upload/download adapters should use OAuth
+or provider API keys stored in the macOS Keychain, never in the repo or memory
+ledger.
 
 Remote receipts should never become continuity authority. The ledger,
 checkpoints, anchors, and local verification remain the trust boundary.

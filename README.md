@@ -113,9 +113,9 @@ total-recall rehydrate --session-id main --query "Remember"
 total-recall doctor
 total-recall export --out total-recall-backup.tar.gz
 total-recall import total-recall-backup.tar.gz
-total-recall backup run --out-dir ~/total-recall-backups --keep 14
+total-recall backup run --out-dir ~/total-recall-backups --keep 14 --keep-days 90
 total-recall backup status --out-dir ~/total-recall-backups
-total-recall dashboard --backup-dir ~/total-recall-backups --keep 14
+total-recall dashboard --backup-dir ~/total-recall-backups --keep 14 --keep-days 90
 total-recall incidents list
 total-recall external ingest --source handoff.md --text "Imported context"
 ```

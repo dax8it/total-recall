@@ -152,6 +152,18 @@ def test_verify_fails_closed_when_anchor_checkpoint_hash_is_modified(tmp_path):
     assert "anchor_signature_mismatch" in verified["failures"]
 
 
+def test_verify_allows_stale_checkpoint_against_signed_ledger_prefix(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Checkpointed memory.", session_id="s1")
+    core.checkpoint(session_id="s1")
+    core.ingest(kind="note", text="Newer uncheckpointed memory.", session_id="s1")
+
+    verified = core.verify(session_id="s1")
+    assert verified["ok"] is True
+    assert "checkpoint_stale" in verified["warnings"]
+    assert verified["checkpointLagEvents"] == 1
+
+
 def test_external_memory_quarantine_promote_reject(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     ext = core.external_ingest(text="External approved project context.", source="handoff.md")
@@ -224,9 +236,13 @@ def test_backup_run_exports_verifies_and_prunes_old_backups(tmp_path):
     backup_dir = tmp_path / "backups"
     core.ingest(kind="note", text="Retained backup memory.", session_id="s1")
     core.checkpoint(session_id="s1")
+    core.ingest(kind="note", text="New memory before backup.", session_id="s1")
 
     first = core.backup_run(str(backup_dir), keep=1)
     assert first["ok"] is True
+    assert first["checkpoint"]["ok"] is True
+    assert first["doctor"]["ok"] is True
+    assert first["verification"]["ok"] is True
     assert first["backupStatus"]["count"] == 1
     assert Path(first["backup"]["bundle"]).exists()
 

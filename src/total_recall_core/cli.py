@@ -119,7 +119,9 @@ def build_parser() -> argparse.ArgumentParser:
     backup_run = backup_sub.add_parser("run")
     backup_run.add_argument("--out-dir", default="~/total-recall-backups")
     backup_run.add_argument("--keep", type=int, default=14)
+    backup_run.add_argument("--keep-days", type=int)
     backup_run.add_argument("--include-index", action="store_true")
+    backup_run.add_argument("--no-checkpoint", action="store_true")
     backup_status = backup_sub.add_parser("status")
     backup_status.add_argument("--out-dir", default="~/total-recall-backups")
 
@@ -128,6 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     dashboard.add_argument("--port", type=int, default=8899)
     dashboard.add_argument("--backup-dir", default="~/total-recall-backups")
     dashboard.add_argument("--keep", type=int, default=14)
+    dashboard.add_argument("--keep-days", type=int)
 
     return parser
 
@@ -210,7 +213,15 @@ def main() -> int:
     if command == "backup":
         sub = args.backup_command or "status"
         if sub == "run":
-            return _print(core.backup_run(args.out_dir, keep=args.keep, include_index=args.include_index))
+            return _print(
+                core.backup_run(
+                    args.out_dir,
+                    keep=args.keep,
+                    keep_days=args.keep_days,
+                    include_index=args.include_index,
+                    checkpoint=not args.no_checkpoint,
+                )
+            )
         if sub == "status":
             return _print(core.backup_status(args.out_dir))
     if command == "dashboard":
@@ -225,6 +236,7 @@ def main() -> int:
             port=args.port,
             backup_dir=Path(args.backup_dir),
             keep=args.keep,
+            keep_days=args.keep_days,
         )
         return 0
 

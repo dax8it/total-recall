@@ -39,6 +39,6 @@ export TOTAL_RECALL_HOME="$WORKDIR/store"
 "$WORKDIR/venv/bin/total-recall" export --out "$WORKDIR/recall.tar.gz" >/dev/null
 TOTAL_RECALL_HOME="$WORKDIR/imported" "$WORKDIR/venv/bin/total-recall" import "$WORKDIR/recall.tar.gz" >/dev/null
 TOTAL_RECALL_HOME="$WORKDIR/imported" "$WORKDIR/venv/bin/total-recall" verify --session-id install-smoke >/dev/null
-"$WORKDIR/venv/bin/total-recall" backup run --out-dir "$WORKDIR/backups" --keep 1 >/dev/null
+"$WORKDIR/venv/bin/total-recall" backup run --out-dir "$WORKDIR/backups" --keep 1 --keep-days 365 >/dev/null
 "$WORKDIR/venv/bin/total-recall" backup status --out-dir "$WORKDIR/backups" >/dev/null
 echo "Install smoke passed."
