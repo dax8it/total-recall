@@ -2,7 +2,8 @@
 
 Before sharing a release outside the private repo:
 
-- run `rg -n "/Users|\.hermes|OPENAI_API_KEY|token|password|secret" .`
+- run the repository privacy scan for local absolute paths, profile-specific
+  runtime directories, and sensitive configuration strings
 - run `python -m pytest -q`
 - verify `README.md` install steps from a fresh checkout
 - verify the Hermes plugin loads from `hermes-plugin/total-recall`
