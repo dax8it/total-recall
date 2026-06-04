@@ -60,6 +60,7 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
         "total_recall_checkpoint",
         "total_recall_verify",
         "total_recall_trust_verify",
+        "total_recall_learning_review",
         "total_recall_rehydrate",
         "total_recall_incidents",
         "total_recall_source_ingest",
@@ -95,6 +96,10 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
 
     checkpoint = json.loads(provider.handle_tool_call("total_recall_checkpoint", {"session_id": "s1"}))
     assert checkpoint["ok"] is True
+    learning = json.loads(provider.handle_tool_call("total_recall_learning_review", {"session_id": "s1", "persist": False}))
+    assert learning["ok"] is True
+    assert learning["schema"] == "total-recall-learning-review-v1"
+    assert learning["reviewFile"] is None
     verified = json.loads(provider.handle_tool_call("total_recall_verify", {"session_id": "s1"}))
     assert verified["status"] == "PASS"
     rehydrated = json.loads(provider.handle_tool_call("total_recall_rehydrate", {"session_id": "s1", "query": "plugin lifecycle"}))

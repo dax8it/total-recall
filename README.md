@@ -39,6 +39,7 @@ Start here:
 - [Operational manual](docs/operational-manual.md) - what to run, what good looks like, and how to operate it
 - [Demo guide](docs/demo-guide.md) - dashboard/video/storyboard script and public demo flow
 - [Benchmarks](docs/benchmarks.md) - reproducible continuity benchmark and scorecard
+- [Nightly learning review](docs/nightly-learning.md) - candidate cards, layer routing, action boundaries, and wake-up diff
 - [Memory layer comparison](docs/total-recall-memory-layer-comparison-2026-06-03.md) - how Total Recall differs from GBrain, Zep/Graphiti, Hindsight, Mem0, Letta, and native Hermes memory
 - [Dashboard docs](docs/backup-dashboard.md) - Trust Spine, Knowledge Engine, Workbench, Vault, and backups
 
@@ -90,6 +91,7 @@ total-recall hermes bundle --out dist/total-recall-hermes-plugin.tar.gz
 - file/folder document ingest for basic local context without a separate brain layer
 - working-context source ingest for meetings, email, Slack, GitHub, CRM, tickets, calendars, and agent transcripts
 - Obsidian/vault export plus explicit edited-note preview/promote import
+- nightly learning review that emits candidate cards, layer-routing decisions, action boundaries, and a wake-up diff without mutating the ledger
 - freshness reporting for current/stale/superseded promises, decisions, customers, policies, project state, and tasks
 - temporal graph timeline views for "what did we know then?" versus "what changed later?"
 - named multi-agent/workspace federation with explicit authorization and workspace-separated results
@@ -138,8 +140,17 @@ total-recall knowledge freshness --category promise --entity "brand promise"
 total-recall knowledge graph timeline --entity "brand promise" --at-time 2026-01-20T00:00:00Z
 ```
 
-See [document ingest](docs/document-ingest.md) and
-[Obsidian vault export](docs/obsidian-vault-export.md).
+Preview overnight learning candidates without mutating authoritative memory:
+
+```bash
+total-recall learning review --session-id nightly-learning --format text
+```
+
+This emits candidate cards, promotion decisions, and a wake-up diff. Promote chosen items through ledgered workflows only after review.
+
+See [document ingest](docs/document-ingest.md),
+[Obsidian vault export](docs/obsidian-vault-export.md), and
+[nightly learning review](docs/nightly-learning.md).
 
 ## Install For Local Development
 
@@ -182,6 +193,7 @@ reports/*.json
 reports/*.md
 incidents/*.json
 external-memory/{inbox,quarantine,promoted,rejected}/
+reviews/learning/
 reviews/obsidian/
 federation/targets.json
 knowledge/{index,graph,synthesis,compiled,quarantine,reports,eval,providers}/
@@ -238,6 +250,7 @@ total-recall index rebuild --backend qmd
 total-recall checkpoint --session-id main
 total-recall verify --session-id main
 total-recall trust verify
+total-recall learning review --session-id nightly-learning --format text
 total-recall rehydrate --session-id main --query "Remember"
 total-recall doctor
 total-recall export --out total-recall-backup.tar.gz
@@ -327,7 +340,19 @@ total-recall rehydrate --session-id main --query "active continuity"
 anchor fails validation, Total Recall refuses to produce a context block.
 `trust verify` is stricter: it requires the latest checkpoint to pin the current
 ledger, proves export/import persistence, runs isolated source/freshness/timeline
-vault/federation fixtures, and verifies the Hermes plugin bundle surface.
+vault/learning-review/federation fixtures, and verifies the Hermes plugin bundle surface.
+
+## Nightly Learning Review
+
+Total Recall can preview what today's events should change tomorrow without letting an unattended job silently rewrite durable truth:
+
+```bash
+total-recall learning review --session-id nightly-learning --format text
+```
+
+The review emits candidate cards, layer routing (`gbrain_page`, `runtime_startup_rule`, `open_loop`, `archive`), action boundaries, promotion decisions, and a compact wake-up diff. Persisted reviews live under `reviews/learning/`; they are generated review artifacts, not authoritative memory. Promote chosen items through ledgered ingest/source/vault workflows, put precise reminders in a scheduler, and checkpoint after real promotions.
+
+See [docs/nightly-learning.md](docs/nightly-learning.md).
 
 ## Automatic Rehydration
 

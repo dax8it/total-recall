@@ -98,6 +98,21 @@ TRUST_VERIFY_SCHEMA = {
     },
 }
 
+LEARNING_REVIEW_SCHEMA = {
+    "name": "total_recall_learning_review",
+    "description": "Preview overnight learning candidates: layer routing, gbrain/current-state targets, action boundaries, and wake-up diff. Writes review artifacts only when persist=true; it does not mutate the ledger.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session id for the review artifact. Defaults to the active Hermes session."},
+            "since": {"type": "string", "description": "Only review events after this ISO timestamp."},
+            "limit": {"type": "integer", "description": "Default 80, max 200."},
+            "persist": {"type": "boolean", "description": "Default true. If false, return preview without writing reviews/learning artifacts."},
+        },
+        "required": [],
+    },
+}
+
 REHYDRATE_SCHEMA = {
     "name": "total_recall_rehydrate",
     "description": "Return a verified rehydrate context block with checkpoint and anchor citations.",
@@ -253,6 +268,7 @@ ALL_SCHEMAS = [
     CHECKPOINT_SCHEMA,
     VERIFY_SCHEMA,
     TRUST_VERIFY_SCHEMA,
+    LEARNING_REVIEW_SCHEMA,
     REHYDRATE_SCHEMA,
     INCIDENTS_SCHEMA,
     SOURCE_INGEST_SCHEMA,
@@ -531,6 +547,13 @@ class TotalRecallMemoryProvider(MemoryProvider):
             return core.verify(session_id=str(args.get("session_id") or "").strip() or self._session_id)
         if tool_name == "total_recall_trust_verify":
             return core.trust_gate_run(persist=bool(args.get("persist", True)))
+        if tool_name == "total_recall_learning_review":
+            return core.learning_review(
+                session_id=str(args.get("session_id") or "").strip() or self._session_id,
+                since=str(args.get("since") or ""),
+                limit=min(max(int(args.get("limit") or 80), 1), 200),
+                persist=bool(args.get("persist", True)),
+            )
         if tool_name == "total_recall_rehydrate":
             return core.rehydrate(
                 session_id=str(args.get("session_id") or "").strip() or self._session_id,

@@ -7,11 +7,13 @@ explicit federation, and an evidence-locked Knowledge Engine.
 
 ## Tools
 
-The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/rehydrate,
+The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/learning-review/rehydrate,
 working-context source ingest, cited Knowledge Engine query, freshness,
 compiled truth, graph inspect/timeline, and explicit federation query tools.
 Federation requires explicit authorization and returns workspace-separated
-results rather than silently merging another agent's memory.
+results rather than silently merging another agent's memory. Learning review
+returns candidate cards, layer-routing decisions, action boundaries, and a
+wake-up diff without mutating the ledger.
 
 ## Install
 

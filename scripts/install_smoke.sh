@@ -44,6 +44,7 @@ printf 'Install smoke document context for onboarding.' > "$WORKDIR/docs/context
 printf '%s\n' '---' 'type: "edited_note"' '---' '# Install Smoke Edited' '' 'Decision: Install smoke edited note import is owner reviewed.' > "$WORKDIR/obsidian-vault/Install Smoke Edited.md"
 PREVIEW_ID="$("$WORKDIR/venv/bin/total-recall" vault import-preview --vault "$WORKDIR/obsidian-vault" --note "Install Smoke Edited.md" --format json | "$WORKDIR/venv/bin/python" -c 'import json,sys; print(json.load(sys.stdin)["preview_id"])')"
 "$WORKDIR/venv/bin/total-recall" vault import-promote "$PREVIEW_ID" >/dev/null
+"$WORKDIR/venv/bin/total-recall" learning review --session-id install-learning --format text >/dev/null
 TOTAL_RECALL_HOME="$WORKDIR/federated" "$WORKDIR/venv/bin/total-recall" ingest --kind note --text "Federated install smoke promise is workspace-separated." --session-id fed --scope public >/dev/null
 TOTAL_RECALL_HOME="$WORKDIR/federated" "$WORKDIR/venv/bin/total-recall" knowledge index rebuild >/dev/null
 "$WORKDIR/venv/bin/total-recall" federation register smoke-agent "$WORKDIR/federated" --scope public >/dev/null

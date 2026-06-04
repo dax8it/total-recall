@@ -50,6 +50,7 @@ from total_recall_core.hermes_provider import (  # noqa: E402,F401
     KNOWLEDGE_QUERY_SCHEMA,
     KNOWLEDGE_STATUS_SCHEMA,
     KNOWLEDGE_SYNTHESIS_STATUS_SCHEMA,
+    LEARNING_REVIEW_SCHEMA,
     REHYDRATE_SCHEMA,
     SEARCH_SCHEMA,
     SOURCE_INGEST_SCHEMA,
@@ -70,11 +71,13 @@ explicit federation, and an evidence-locked Knowledge Engine.
 
 ## Tools
 
-The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/rehydrate,
+The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/learning-review/rehydrate,
 working-context source ingest, cited Knowledge Engine query, freshness,
 compiled truth, graph inspect/timeline, and explicit federation query tools.
 Federation requires explicit authorization and returns workspace-separated
-results rather than silently merging another agent's memory.
+results rather than silently merging another agent's memory. Learning review
+returns candidate cards, layer-routing decisions, action boundaries, and a
+wake-up diff without mutating the ledger.
 
 ## Install
 
@@ -116,13 +119,14 @@ def plugin_yaml() -> str:
         'requires_python: ">=3.11"\n'
         "python_dependencies:\n"
         f"  - total-recall-core=={__version__}\n"
-        'description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, compiled truth, and explicit federation."\n'
+        'description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, learning review, compiled truth, and explicit federation."\n'
         "tools:\n"
         "  - total_recall_search\n"
         "  - total_recall_status\n"
         "  - total_recall_checkpoint\n"
         "  - total_recall_verify\n"
         "  - total_recall_trust_verify\n"
+        "  - total_recall_learning_review\n"
         "  - total_recall_rehydrate\n"
         "  - total_recall_incidents\n"
         "  - total_recall_source_ingest\n"

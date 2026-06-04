@@ -154,6 +154,7 @@ total-recall ingest --kind note --text "Total Recall Hermes smoke memory." --ses
 total-recall search "Hermes smoke memory"
 total-recall checkpoint --session-id smoke
 total-recall verify --session-id smoke
+total-recall learning review --session-id smoke --no-persist --format text
 total-recall rehydrate --session-id smoke --query "Hermes smoke memory"
 total-recall doctor
 ```
@@ -198,6 +199,7 @@ Provider tools:
 - `total_recall_checkpoint`
 - `total_recall_verify`
 - `total_recall_trust_verify`
+- `total_recall_learning_review`
 - `total_recall_rehydrate`
 - `total_recall_incidents`
 - `total_recall_source_ingest`
@@ -209,6 +211,10 @@ Provider tools:
 - `total_recall_knowledge_graph_inspect`
 - `total_recall_knowledge_graph_timeline`
 - `total_recall_federation_query`
+
+`total_recall_learning_review` produces the overnight candidate-card preview. It
+returns layer routing, action boundaries, promotion decisions, and a wake-up diff
+without mutating the ledger.
 
 `total_recall_federation_query` requires explicit `authorize=true` and returns
 workspace-separated results. It does not silently merge another agent's memory

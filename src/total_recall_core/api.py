@@ -30,6 +30,7 @@ DOCUMENT_INGEST_SCHEMA_VERSION = "total-recall-document-ingest-v1"
 OBSIDIAN_VAULT_SCHEMA_VERSION = "total-recall-obsidian-vault-v1"
 WORKING_CONTEXT_SCHEMA_VERSION = "total-recall-working-context-source-v1"
 OBSIDIAN_IMPORT_SCHEMA_VERSION = "total-recall-obsidian-import-review-v1"
+LEARNING_REVIEW_SCHEMA_VERSION = "total-recall-learning-review-v1"
 FEDERATION_SCHEMA_VERSION = "total-recall-federation-registry-v1"
 TRUST_GATE_SCHEMA_VERSION = "total-recall-trust-gate-v1"
 TRUST_GATE_REQUIRED_HERMES_TOOLS = {
@@ -38,6 +39,7 @@ TRUST_GATE_REQUIRED_HERMES_TOOLS = {
     "total_recall_checkpoint",
     "total_recall_verify",
     "total_recall_trust_verify",
+    "total_recall_learning_review",
     "total_recall_rehydrate",
     "total_recall_incidents",
     "total_recall_source_ingest",
@@ -797,6 +799,243 @@ class TotalRecallCore:
             "event": ingested.get("event"),
             "stateHash": ingested.get("stateHash"),
         }
+
+    def learning_review(
+        self,
+        *,
+        session_id: str = "nightly-learning",
+        since: str = "",
+        limit: int = 80,
+        allowed_scopes: Optional[Iterable[str]] = None,
+        persist: bool = True,
+    ) -> Dict[str, Any]:
+        """Produce owner-reviewable memory candidate cards without mutating the ledger.
+
+        This is the Total Recall equivalent of the article's gbrain nightly loop:
+        candidate list, promotion decision, and wake-up diff. It deliberately
+        writes only a review artifact under reviews/learning; durable memory
+        still requires explicit ingest/promotion through ledgered APIs.
+        """
+        events = self._read_events(verify_chain=True)
+        scopes = set(str(scope) for scope in (allowed_scopes or self.config.allowed_scopes))
+        selected = []
+        for event in events:
+            if str(event.get("scope") or "") not in scopes:
+                continue
+            if since and str(event.get("timestamp") or "") <= since:
+                continue
+            kind = str(event.get("kind") or "")
+            if kind in {"checkpoint", "trust_gate_report"}:
+                continue
+            selected.append(event)
+        selected = selected[-max(1, int(limit or 80)) :]
+        review_id = self._new_id("learning_review")
+        candidates = [self._learning_candidate_card(event, review_id=review_id) for event in selected]
+        layer_counts: Dict[str, int] = {}
+        for candidate in candidates:
+            layer_counts[candidate["layer"]] = layer_counts.get(candidate["layer"], 0) + 1
+        wake_up_diff = [
+            {
+                "candidateId": candidate["candidate_id"],
+                "layer": candidate["layer"],
+                "targetPage": candidate["targetPage"],
+                "whatChanged": candidate["whatChanged"],
+                "compiledTruthAction": candidate["decision"]["compiledTruthAction"],
+                "actionBoundary": candidate["actionBoundary"],
+                "source": candidate["source"],
+            }
+            for candidate in candidates
+            if candidate["layer"] in {"gbrain_page", "runtime_startup_rule", "open_loop"}
+        ]
+        payload: Dict[str, Any] = {
+            "ok": True,
+            "status": "PREVIEW",
+            "schema": LEARNING_REVIEW_SCHEMA_VERSION,
+            "review_id": review_id,
+            "created_at": utc_now(),
+            "session_id": session_id or "nightly-learning",
+            "authority": "review-artifact-only-ledger-remains-authority",
+            "sourceEventCount": len(selected),
+            "candidateCount": len(candidates),
+            "layerCounts": layer_counts,
+            "candidates": candidates,
+            "promotionDecisions": [candidate["decision"] for candidate in candidates],
+            "wakeUpDiff": wake_up_diff,
+            "reviewFile": None,
+            "nextSteps": [
+                "Review candidates before promotion; this command does not mutate the ledger.",
+                "Promote runtime-only behavior rules to the runtime's own MEMORY/USER layer when appropriate.",
+                "Promote cross-runtime object state with explicit ledger ingest, document ingest, source ingest, or vault import-promote.",
+                "Put precise reminders in the scheduler/open-loop system rather than compiled truth.",
+            ],
+        }
+        if persist:
+            review_path = self.home / "reviews" / "learning" / f"{review_id}.json"
+            self._write_json(review_path, payload)
+            self._write_json(self.home / "reviews" / "learning" / "latest.json", payload)
+            payload["reviewFile"] = str(review_path)
+            self._write_json(review_path, payload)
+            self._write_json(self.home / "reviews" / "learning" / "latest.json", payload)
+        return payload
+
+    def _learning_candidate_card(self, event: Dict[str, Any], *, review_id: str) -> Dict[str, Any]:
+        text = str(event.get("text") or "")
+        lower = text.lower()
+        target_page, target_kind, target_name = self._learning_resolve_target(text, event)
+        layer = self._learning_layer(text, target_kind=target_kind)
+        if layer == "gbrain_page" and target_kind == "inbox":
+            target_page = "inbox/needs-triage.md"
+        elif layer == "runtime_startup_rule":
+            target_page = f"runtime/{_vault_slug(str(event.get('session_id') or 'default')).lower()}.md"
+        elif layer == "open_loop":
+            target_page = f"open-loops/{_vault_slug(self._learning_subject(text, fallback=target_name)).lower()}.md"
+        elif layer == "archive":
+            target_page = "archive/reviewed-no-reuse-case.md"
+
+        changes_top = any(marker in lower for marker in ("decision:", "now ", "current", "changed", "supersedes", "requires", "must "))
+        compiled_action = "rewrite_top_half" if layer == "gbrain_page" and changes_top else ("append_timeline" if layer == "gbrain_page" else "none")
+        decision = {
+            "candidate_id": f"learn_{_short_hash(review_id + ':' + str(event.get('event_id')) + ':' + str(event.get('hash')), 12)}",
+            "layer": layer,
+            "targetPage": target_page,
+            "promote": layer != "archive",
+            "compiledTruthAction": compiled_action,
+            "timelineAction": "append_evidence" if layer == "gbrain_page" else "none",
+            "reason": self._learning_reason(layer, target_kind=target_kind, changes_top=changes_top),
+        }
+        action_boundary = self._learning_action_boundary(text, event)
+        candidate = {
+            "candidate_id": decision["candidate_id"],
+            "source": {
+                "source_ref": _event_source_ref(event),
+                "event_id": event.get("event_id"),
+                "event_hash": event.get("hash"),
+                "timestamp": event.get("timestamp"),
+                "kind": event.get("kind"),
+                "scope": event.get("scope"),
+                "session_id": event.get("session_id"),
+                "source": event.get("source"),
+            },
+            "whatChanged": self._learning_change_summary(text),
+            "futureTaskAffected": self._learning_future_task(text, target_name=target_name),
+            "layer": layer,
+            "resolver": {"kind": target_kind, "name": target_name, "primaryHome": target_page},
+            "targetPage": target_page,
+            "confidence": self._learning_confidence(text, layer=layer, target_kind=target_kind),
+            "expiry": action_boundary["expiry"],
+            "actionBoundary": action_boundary,
+            "decision": decision,
+        }
+        return candidate
+
+    def _learning_layer(self, text: str, *, target_kind: str) -> str:
+        lower = text.lower()
+        if any(marker in lower for marker in ("reminder:", "remind ", "follow up", "follow-up", "next wednesday", "next monday")) and not any(marker in lower for marker in ("decision:", "action boundary", "current", "supersedes")):
+            return "open_loop"
+        if any(marker in lower for marker in ("operating note", "reply", "replies", "never ", "always ", "do not ", "don't ", "should be")) and target_kind == "inbox":
+            return "runtime_startup_rule"
+        if target_kind in {"people", "companies", "projects", "concepts", "writing", "sources"}:
+            return "gbrain_page"
+        if any(marker in lower for marker in ("decision:", "promise", "current", "supersedes", "owner", "customer", "project", "company")):
+            return "gbrain_page"
+        if any(marker in lower for marker in ("never ", "always ", "do not ", "don't ", "should ", "must ")):
+            return "runtime_startup_rule"
+        return "archive"
+
+    def _learning_resolve_target(self, text: str, event: Dict[str, Any]) -> Tuple[str, str, str]:
+        checks = [
+            ("projects", r"\bProject\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3})"),
+            ("companies", r"\bCompany\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3})"),
+            ("people", r"\b(?:Person|Developer|Customer)\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3})"),
+            ("concepts", r"\bConcept\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})"),
+            ("writing", r"\bWriting\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,4})"),
+        ]
+        for kind, pattern in checks:
+            match = re.search(pattern, text)
+            if match:
+                name = _one_line(match.group(1), limit=80).strip(" .:-")
+                return f"{kind}/{_vault_slug(name).lower()}.md", kind, name
+        metadata = event.get("metadata") or {}
+        title = str(metadata.get("title") or event.get("source") or "").strip()
+        if title:
+            return f"sources/{_vault_slug(title).lower()}.md", "sources", title
+        return "inbox/needs-triage.md", "inbox", self._learning_subject(text, fallback="Needs triage")
+
+    def _learning_subject(self, text: str, *, fallback: str = "memory") -> str:
+        match = re.search(r"\b(Project|Company|Customer|Developer|Concept|Writing)\s+([A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,3})", text)
+        if match:
+            return f"{match.group(1)} {match.group(2)}"
+        return _one_line(fallback or text, limit=60)
+
+    def _learning_change_summary(self, text: str) -> str:
+        for line in str(text or "").splitlines():
+            stripped = line.strip(" -\t")
+            if not stripped:
+                continue
+            if stripped.lower().startswith(("source type:", "title:", "occurred at:", "actor:", "participants:")):
+                continue
+            return _one_line(stripped, limit=220)
+        return _one_line(text, limit=220)
+
+    def _learning_future_task(self, text: str, *, target_name: str) -> str:
+        lower = text.lower()
+        if "billing" in lower:
+            return "Billing/support replies involving " + (target_name or "this object")
+        if "reply" in lower or "replies" in lower:
+            return "Future replies involving " + (target_name or "this object")
+        if "promise" in lower:
+            return "Future promise/commitment checks"
+        if "decision" in lower:
+            return "Future decision lookup and continuity handoff"
+        if "reminder" in lower or "follow" in lower or "check" in lower:
+            return "Scheduled follow-up or open-loop review"
+        return "Future task not obvious; review before promotion"
+
+    def _learning_action_boundary(self, text: str, event: Dict[str, Any]) -> Dict[str, Any]:
+        lower = text.lower()
+        permissions = "No special action boundary detected; review before acting."
+        if "cannot promise" in lower:
+            permissions = "Can draft or retrieve context, but cannot promise a fix time or outcome without owner approval."
+        elif "owner approval" in lower or "ask a human" in lower:
+            permissions = "Requires owner/human approval before external action."
+        elif "can draft" in lower:
+            permissions = "Can draft; sending/execution depends on runtime approval policy."
+        expiry = "review_on_new_evidence"
+        if "next wednesday" in lower:
+            expiry = "after_next_wednesday_follow_up"
+        elif "until" in lower:
+            expiry = "explicit_until_condition_in_source"
+        next_trigger = "before_related_task"
+        if "next trigger:" in lower:
+            next_trigger = _one_line(text.split("Next trigger:", 1)[1], limit=120) if "Next trigger:" in text else next_trigger
+        elif "billing" in lower:
+            next_trigger = "before_billing_related_reply"
+        return {
+            "scope": event.get("scope") or "private",
+            "permissions": permissions,
+            "expiry": expiry,
+            "nextTrigger": next_trigger,
+            "enforcement": "documented-boundary-only-runtime-tool-policy-enforces-actions",
+        }
+
+    def _learning_confidence(self, text: str, *, layer: str, target_kind: str) -> str:
+        lower = text.lower()
+        if layer == "archive":
+            return "low"
+        if target_kind != "inbox" and any(marker in lower for marker in ("decision:", "action boundary", "source type:")):
+            return "high"
+        if any(marker in lower for marker in ("maybe", "uncertain", "possibly")):
+            return "low"
+        return "medium"
+
+    def _learning_reason(self, layer: str, *, target_kind: str, changes_top: bool) -> str:
+        if layer == "gbrain_page":
+            return f"Cross-runtime current state for {target_kind}; {'rewrite compiled truth' if changes_top else 'append timeline evidence'} before future agents depend on it."
+        if layer == "runtime_startup_rule":
+            return "Behavior rule likely belongs in a runtime startup/user-memory layer, not an object state page."
+        if layer == "open_loop":
+            return "Time-sensitive follow-up belongs in scheduler/open-loop handling, not compiled truth."
+        return "No clear future reuse case; keep historical only unless an owner promotes it."
 
     def vault_import_preview(
         self,
@@ -2729,6 +2968,32 @@ class TotalRecallCore:
                     evidence={"eventCount": promoted.get("eventCount"), "eventKind": promoted_events[0].get("kind") if promoted_events else None},
                 )
 
+                learning_before_count = core.health()["eventCount"]
+                learning = core.learning_review(session_id="trust-gate-learning", persist=True)
+                learning_after_count = core.health()["eventCount"]
+                learning_path = Path(str(learning.get("reviewFile") or ""))
+                learning_candidates = learning.get("candidates") or []
+                learning_layers = {candidate.get("layer") for candidate in learning_candidates}
+                add(
+                    "fixture_learning_review_candidate_cards",
+                    bool(learning.get("ok"))
+                    and learning.get("status") == "PREVIEW"
+                    and learning_candidates
+                    and "gbrain_page" in learning_layers
+                    and any((candidate.get("decision") or {}).get("timelineAction") == "append_evidence" for candidate in learning_candidates)
+                    and learning_before_count == learning_after_count
+                    and learning_path.exists(),
+                    "Nightly learning produces candidate cards, promotion decisions, and a wake-up diff without mutating the ledger.",
+                    evidence={
+                        "candidateCount": learning.get("candidateCount"),
+                        "layerCounts": learning.get("layerCounts"),
+                        "wakeUpDiffCount": len(learning.get("wakeUpDiff") or []),
+                        "eventCountBefore": learning_before_count,
+                        "eventCountAfter": learning_after_count,
+                        "reviewFile": str(learning_path),
+                    },
+                )
+
                 federated = TotalRecallCore(TotalRecallConfig(home=fed_home, enable_lancedb=False, enable_qmd=False))
                 federated.ingest(kind="note", text="Federated workspace return policy is thirty-day returns.", session_id="fed", scope="public")
                 federated.knowledge_index_rebuild()
@@ -3617,6 +3882,7 @@ class TotalRecallCore:
             "knowledge/reports",
             "knowledge/eval",
             "knowledge/providers",
+            "reviews/learning",
             "reviews/obsidian/promoted",
             "federation",
         ):

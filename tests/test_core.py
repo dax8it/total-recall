@@ -738,6 +738,106 @@ def test_knowledge_engine_query_graph_synthesis_and_eval(tmp_path):
     assert scorecard["ok"] is True
 
 
+def test_learning_review_produces_candidate_cards_without_mutating_ledger(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    source = core.ingest_source(
+        source_type="slack",
+        title="Project Orion Billing Review",
+        text=(
+            "Decision: Project Orion billing replies now require owner approval before sending. "
+            "Action boundary: can draft a reply, but cannot promise a fix time. "
+            "Next trigger: check this before any billing-related reply."
+        ),
+        occurred_at="2026-06-03T10:00:00Z",
+        session_id="nightly-source",
+        scope="internal",
+        metadata={"freshness_category": "decision"},
+    )
+    core.ingest(
+        kind="note",
+        text="Reminder: Check Project Orion billing owner update next Wednesday.",
+        session_id="nightly-source",
+        scope="internal",
+    )
+    before_count = core.health()["eventCount"]
+
+    review = core.learning_review(session_id="nightly-review", persist=True)
+
+    assert review["ok"] is True
+    assert review["status"] == "PREVIEW"
+    assert review["schema"] == "total-recall-learning-review-v1"
+    assert review["candidateCount"] >= 2
+    assert core.health()["eventCount"] == before_count
+    assert Path(review["reviewFile"]).exists()
+
+    by_layer = {candidate["layer"]: candidate for candidate in review["candidates"]}
+    assert "gbrain_page" in by_layer
+    gbrain = by_layer["gbrain_page"]
+    assert gbrain["source"]["event_id"] == source["event"]["event_id"]
+    assert gbrain["targetPage"].startswith("projects/")
+    assert gbrain["targetPage"].endswith(".md")
+    assert gbrain["decision"]["compiledTruthAction"] == "rewrite_top_half"
+    assert "cannot promise a fix time" in gbrain["actionBoundary"]["permissions"]
+    assert any(diff["targetPage"] == gbrain["targetPage"] for diff in review["wakeUpDiff"])
+    assert any(candidate["layer"] == "open_loop" for candidate in review["candidates"])
+
+
+def test_learning_review_cli_json_output(tmp_path):
+    home = tmp_path / "cli-learning-store"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+    ingested = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(home),
+            "ingest",
+            "--kind",
+            "note",
+            "--text",
+            "Operating note: replies to Project Atlas developers should be shorter and casual.",
+            "--session-id",
+            "cli-learning",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+    assert ingested.returncode == 0
+
+    reviewed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(home),
+            "learning",
+            "review",
+            "--session-id",
+            "cli-learning-review",
+            "--format",
+            "json",
+            "--no-persist",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+    assert reviewed.returncode == 0, reviewed.stderr
+    payload = json.loads(reviewed.stdout)
+    assert payload["ok"] is True
+    assert payload["schema"] == "total-recall-learning-review-v1"
+    assert payload["candidateCount"] >= 1
+    assert payload["candidates"][0]["layer"] in {"runtime_startup_rule", "gbrain_page"}
+    assert payload["reviewFile"] is None
+
+
 def test_knowledge_engine_does_not_index_generated_reports(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     report = tmp_path / "reports" / "rehydrate_feedback.json"
@@ -870,6 +970,7 @@ def test_trust_gate_persists_hardcoded_execution_report(tmp_path):
         "fixture_temporal_graph_timeline",
         "fixture_obsidian_preview_no_ledger_write",
         "fixture_obsidian_promote_ledgered",
+        "fixture_learning_review_candidate_cards",
         "fixture_federation_authorization_required",
         "fixture_federation_workspace_separated",
         "fixture_persistence_checkpoint_export_import",

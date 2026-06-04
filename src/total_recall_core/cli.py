@@ -30,6 +30,16 @@ def build_parser() -> argparse.ArgumentParser:
     trust_status = trust_sub.add_parser("status")
     trust_status.add_argument("--format", choices=["json", "text"], default="text")
 
+    learning = sub.add_parser("learning", aliases=["nightly"])
+    learning_sub = learning.add_subparsers(dest="learning_command")
+    learning_review = learning_sub.add_parser("review")
+    learning_review.add_argument("--session-id", default="nightly-learning")
+    learning_review.add_argument("--since", default="", help="Only review events after this ISO timestamp.")
+    learning_review.add_argument("--limit", type=int, default=80)
+    learning_review.add_argument("--scope", action="append", help="Allowed scope. May be repeated. Defaults to configured scopes.")
+    learning_review.add_argument("--no-persist", action="store_true", help="Return a review without writing reviews/learning artifacts.")
+    learning_review.add_argument("--format", choices=["json", "text"], default="text")
+
     ingest = sub.add_parser("ingest")
     ingest.add_argument("--kind", default="note")
     ingest.add_argument("--text", required=True)
@@ -536,6 +546,35 @@ def _print_federation(payload: dict, *, fmt: str) -> int:
     return 0 if payload.get("ok", True) else 1
 
 
+def _print_learning_review(payload: dict, *, fmt: str) -> int:
+    if fmt == "json":
+        return _print(payload)
+    if not payload.get("ok"):
+        print("Total Recall learning review: needs attention")
+        print(payload.get("error") or payload.get("status") or "learning review failed")
+        return 1
+    print("Total Recall learning review: preview ready")
+    print(f"Candidates: {payload.get('candidateCount', 0)} | Source events: {payload.get('sourceEventCount', 0)}")
+    layer_counts = payload.get("layerCounts") or {}
+    if layer_counts:
+        print("Layers: " + ", ".join(f"{key}={value}" for key, value in sorted(layer_counts.items())))
+    if payload.get("reviewFile"):
+        print(f"Review file: {payload.get('reviewFile')}")
+    for candidate in (payload.get("candidates") or [])[:10]:
+        print(f"- {candidate.get('layer')} | {candidate.get('targetPage')} | {candidate.get('whatChanged')}")
+        boundary = candidate.get("actionBoundary") or {}
+        if boundary.get("permissions"):
+            print(f"  boundary: {boundary.get('permissions')}")
+    if payload.get("candidateCount", 0) > 10:
+        print(f"- ... {payload.get('candidateCount', 0) - 10} more")
+    next_steps = payload.get("nextSteps") or []
+    if next_steps:
+        print("\nNext steps:")
+        for step in next_steps:
+            print(f"- {step}")
+    return 0
+
+
 def _print_trust_gate(payload: dict, *, fmt: str) -> int:
     if fmt == "json":
         return _print(payload)
@@ -611,6 +650,19 @@ def main() -> int:
             return _print_trust_gate(core.trust_gate_run(persist=not args.no_persist), fmt=args.format)
         if sub == "status":
             return _print_trust_gate(core.trust_gate_status(), fmt=args.format)
+    if command in {"learning", "nightly"}:
+        sub = args.learning_command or "review"
+        if sub == "review":
+            return _print_learning_review(
+                core.learning_review(
+                    session_id=args.session_id,
+                    since=args.since,
+                    limit=args.limit,
+                    allowed_scopes=args.scope,
+                    persist=not args.no_persist,
+                ),
+                fmt=args.format,
+            )
     if command == "ingest":
         return _print(core.ingest(kind=args.kind, text=args.text, session_id=args.session_id, scope=args.scope, source=args.source))
     if command in {"documents", "docs"}:
