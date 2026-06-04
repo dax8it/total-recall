@@ -10,6 +10,41 @@ rebuildable local retrieval indexes for recall.
 It does not depend on OpenClaw, OpenBrain, or Hermes. Hermes Agent can use it
 through the optional provider plugin in `hermes-plugin/total-recall`.
 
+## Quick Install For Hermes
+
+From a published package or installed checkout:
+
+```bash
+pip install total-recall-core
+total-recall hermes install --profile <profile> --activate --format text
+hermes -p <profile> memory status
+```
+
+The installer detects the Python environment Hermes actually runs under,
+installs or upgrades `total-recall-core` there when needed, writes
+`~/.hermes/plugins/total-recall`, validates the bundle, enables the Hermes
+plugin, selects `memory.provider=total-recall` for the profile, and checks
+Hermes memory status.
+
+Check readiness at any time:
+
+```bash
+total-recall hermes doctor
+```
+
+From this repository checkout, the one-command installer installs the Python
+package and writes a clean Hermes memory-provider bundle:
+
+```bash
+./scripts/install_hermes_plugin.sh --profile <profile> --activate --format text
+```
+
+To create a distributable plugin archive:
+
+```bash
+total-recall hermes bundle --out dist/total-recall-hermes-plugin.tar.gz
+```
+
 ## What It Provides
 
 - append-only ledger ingestion with hash chaining
@@ -17,11 +52,62 @@ through the optional provider plugin in `hermes-plugin/total-recall`.
 - checkpoint creation
 - signed anchor verification
 - fail-closed verify and rehydrate
+- hard-coded trust gate for release/day-one execution verification
 - incident artifacts
 - external-memory quarantine, promote, and reject flow
+- file/folder document ingest for basic local context without a separate brain layer
+- working-context source ingest for meetings, email, Slack, GitHub, CRM, tickets, calendars, and agent transcripts
+- Obsidian/vault export plus explicit edited-note preview/promote import
+- freshness reporting for current/stale/superseded promises, decisions, customers, policies, project state, and tasks
+- temporal graph timeline views for "what did we know then?" versus "what changed later?"
+- named multi-agent/workspace federation with explicit authorization and workspace-separated results
 - derived LanceDB, QMD, and SQLite/FTS retrieval indexes with lexical fallback
 - source-cited context planning
+- product-facing Hermes plugin installer and distributable plugin bundle
 - optional Hermes Agent memory provider plugin
+
+## Company Context
+
+Import local files into the ledger:
+
+```bash
+total-recall documents ingest ./docs ./handoff.md
+```
+
+Ingest a working-context source with an effective timestamp:
+
+```bash
+total-recall sources ingest \
+  --type meeting \
+  --title "Renewal Review" \
+  --occurred-at 2026-01-05T12:00:00Z \
+  --text "Decision: Renewal policy is month-to-month."
+```
+
+Export an Obsidian-compatible reading vault:
+
+```bash
+total-recall vault export --out ~/TotalRecallVault
+```
+
+The vault is a derived projection. Total Recall's ledger, checkpoints, and
+anchors remain authoritative. Edited vault notes become memory only after an
+explicit preview and owner promotion:
+
+```bash
+total-recall vault import-preview --vault ~/TotalRecallVault --note "Edited Promise.md"
+total-recall vault import-promote <preview-id>
+```
+
+Check freshness and temporal context:
+
+```bash
+total-recall knowledge freshness --category promise --entity "brand promise"
+total-recall knowledge graph timeline --entity "brand promise" --at-time 2026-01-20T00:00:00Z
+```
+
+See [document ingest](docs/document-ingest.md) and
+[Obsidian vault export](docs/obsidian-vault-export.md).
 
 ## Install For Local Development
 
@@ -64,6 +150,9 @@ reports/*.json
 reports/*.md
 incidents/*.json
 external-memory/{inbox,quarantine,promoted,rejected}/
+reviews/obsidian/
+federation/targets.json
+knowledge/{index,graph,synthesis,compiled,quarantine,reports,eval,providers}/
 index/total_recall.sqlite
 index/lancedb/
 index/lancedb-meta.json
@@ -77,6 +166,11 @@ keys/anchor.ed25519.pub
 All files under `index/` are derived retrieval caches. They are rebuilt from
 `ledger/events.jsonl`; they are never the authority for continuity, checkpoint,
 or rehydrate decisions.
+
+Files under `reports/` are generated audit artifacts. They remain readable for
+explicit status, export, backup, and manual inspection workflows, but they are
+excluded from retrieval so rehydrate output cannot recursively become future
+memory input.
 
 Search uses this ladder:
 
@@ -102,6 +196,8 @@ TOTAL_RECALL_QMD_EMBED=1
 ```bash
 total-recall health
 total-recall ingest --kind note --text "Remember this." --session-id main
+total-recall documents ingest ./docs ./handoff.md
+total-recall sources ingest --type meeting --title "Renewal Review" --text "Decision: Renewal policy is month-to-month."
 total-recall search "Remember"
 total-recall index status
 total-recall index rebuild
@@ -109,6 +205,7 @@ total-recall index rebuild --backend lancedb
 total-recall index rebuild --backend qmd
 total-recall checkpoint --session-id main
 total-recall verify --session-id main
+total-recall trust verify
 total-recall rehydrate --session-id main --query "Remember"
 total-recall doctor
 total-recall export --out total-recall-backup.tar.gz
@@ -118,6 +215,18 @@ total-recall backup status --out-dir ~/total-recall-backups
 total-recall dashboard --backup-dir ~/total-recall-backups --keep 14 --keep-days 90
 total-recall incidents list
 total-recall external ingest --source handoff.md --text "Imported context"
+total-recall knowledge query --query "What do we know?" --mode normal --format json
+total-recall knowledge freshness --category promise --format text
+total-recall knowledge graph inspect --entity "project"
+total-recall knowledge graph traverse --entity "project" --depth 2
+total-recall knowledge graph timeline --entity "project" --at-time 2026-01-20T00:00:00Z
+total-recall knowledge truth show --format md
+total-recall knowledge synthesize run
+total-recall knowledge evaluate run
+total-recall vault import-preview --vault ~/TotalRecallVault --note "Edited Promise.md"
+total-recall vault import-promote <preview-id>
+total-recall federation register agent-beta /path/to/agent/total-recall --scope public
+total-recall federation query --query "support promise" --target agent-beta --authorize
 ```
 
 ## Trust Model
@@ -144,10 +253,13 @@ trusted ledger state rather than trusted directly.
 
 ## Hermes Setup
 
-See [docs/hermes.md](docs/hermes.md) for install, profile selection,
-smoke-test, recovery, and troubleshooting commands.
+See [docs/hermes.md](docs/hermes.md) for one-command plugin install, profile
+selection, smoke-test, recovery, and troubleshooting commands.
 
 For local backup management, see [docs/backup-dashboard.md](docs/backup-dashboard.md).
+
+For adding files and folders as basic document context, see
+[docs/document-ingest.md](docs/document-ingest.md).
 
 Each Hermes profile gets its own store and derived indexes at
 `$HERMES_HOME/total-recall`. Multiple agents can share the same core/plugin code
@@ -174,11 +286,15 @@ a `session_end` event and a checkpoint. Rehydration is explicit and fail-closed:
 
 ```bash
 total-recall verify --session-id main
+total-recall trust verify
 total-recall rehydrate --session-id main --query "active continuity"
 ```
 
 `rehydrate` first runs verification. If the ledger, reduced state, checkpoint, or
 anchor fails validation, Total Recall refuses to produce a context block.
+`trust verify` is stricter: it requires the latest checkpoint to pin the current
+ledger, proves export/import persistence, runs isolated source/freshness/timeline
+vault/federation fixtures, and verifies the Hermes plugin bundle surface.
 
 ## Automatic Rehydration
 
