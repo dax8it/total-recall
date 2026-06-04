@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="520" viewBox="0 0 1280 520" role="img" aria-labelledby="title desc">
+  <title id="title">Total Recall trust spine</title>
+  <desc id="desc">Total Recall flow from ingest to ledger, state, checkpoint, anchor, verify, rehydrate, reports, and incidents.</desc>
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#1e293b" stroke-width="0.6"/></pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="#22d3ee"/></marker>
+    <style>
+      .bg{fill:#020617}.title{font:700 28px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#f8fafc}.sub{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.node{fill:#0f172a;stroke:#22d3ee;stroke-width:2;rx:16}.authority{stroke:#fb7185}.ok{stroke:#34d399}.warn{stroke:#fbbf24}.label{font:700 16px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e2e8f0}.tiny{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.flow{fill:none;stroke:#22d3ee;stroke-width:2.5;marker-end:url(#arrow)}.fail{fill:none;stroke:#fb7185;stroke-width:2.5;stroke-dasharray:8 5;marker-end:url(#arrow)}.pill{fill:#020617;stroke:#334155;stroke-width:1}.num{font:700 13px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#020617}.circle{fill:#22d3ee}
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="520"/>
+  <rect width="1280" height="520" fill="url(#grid)" opacity="0.75"/>
+  <text x="52" y="60" class="title">Trust Spine: how memory becomes safe to use</text>
+  <text x="52" y="88" class="sub">The important product promise is not “remember more”; it is “prove before reuse.”</text>
+
+  <g transform="translate(60 150)">
+    <rect class="node" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">1</text>
+    <text class="label" x="42" y="38">Ingest</text>
+    <text class="tiny" x="24" y="64">notes, docs, sources</text>
+  </g>
+  <path class="flow" d="M210 193H275"/>
+
+  <g transform="translate(275 150)">
+    <rect class="node authority" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">2</text>
+    <text class="label" x="42" y="38">Ledger</text>
+    <text class="tiny" x="21" y="64">append-only hash chain</text>
+  </g>
+  <path class="flow" d="M425 193H490"/>
+
+  <g transform="translate(490 150)">
+    <rect class="node authority" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">3</text>
+    <text class="label" x="45" y="38">State</text>
+    <text class="tiny" x="22" y="64">deterministic reduce</text>
+  </g>
+  <path class="flow" d="M640 193H705"/>
+
+  <g transform="translate(705 150)">
+    <rect class="node authority" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">4</text>
+    <text class="label" x="36" y="38">Checkpoint</text>
+    <text class="tiny" x="18" y="64">pins count + hashes</text>
+  </g>
+  <path class="flow" d="M855 193H920"/>
+
+  <g transform="translate(920 150)">
+    <rect class="node authority" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">5</text>
+    <text class="label" x="46" y="38">Anchor</text>
+    <text class="tiny" x="35" y="64">Ed25519 signature</text>
+  </g>
+  <path class="flow" d="M1070 193H1135"/>
+
+  <g transform="translate(1135 150)">
+    <rect class="node ok" width="150" height="86"/>
+    <circle class="circle" cx="20" cy="20" r="13"/><text class="num" x="16" y="25">6</text>
+    <text class="label" x="47" y="38">Verify</text>
+    <text class="tiny" x="31" y="64">pass or fail closed</text>
+  </g>
+
+  <path class="flow" d="M1210 236C1210 330 700 330 700 380"/>
+  <g transform="translate(530 380)">
+    <rect class="node ok" width="185" height="70"/>
+    <text class="label" x="30" y="32">Rehydrate</text>
+    <text class="tiny" x="25" y="53">cited context after verify</text>
+  </g>
+
+  <path class="fail" d="M1210 236C1210 295 1020 295 1020 365"/>
+  <g transform="translate(890 365)">
+    <rect class="node authority" width="205" height="70"/>
+    <text class="label" x="36" y="32">Incident</text>
+    <text class="tiny" x="20" y="53">evidence instead of pretending</text>
+  </g>
+
+  <g transform="translate(70 325)">
+    <rect class="pill" width="350" height="80" rx="18"/>
+    <text class="label" x="22" y="34">What can fail closed?</text>
+    <text class="tiny" x="22" y="58">tampered ledger, reordered events, edited checkpoint, missing/bad anchor</text>
+  </g>
+</svg>

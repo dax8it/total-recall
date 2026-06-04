@@ -10,6 +10,38 @@ rebuildable local retrieval indexes for recall.
 It does not depend on OpenClaw, OpenBrain, or Hermes. Hermes Agent can use it
 through the optional provider plugin in `hermes-plugin/total-recall`.
 
+![Total Recall architecture](docs/assets/total-recall-architecture.svg)
+
+## Why You Need It
+
+Most agent memory systems optimize recall: find a relevant note, vector hit, or
+conversation snippet. That is useful, but it is not enough when memory affects
+real work.
+
+Total Recall is for the harder question:
+
+> Can this agent prove the memory it is about to use is still authoritative?
+
+It gives you a local trust spine for agent continuity:
+
+- append-only event ledger with hash chaining
+- deterministic state reduction
+- signed checkpoints and anchors
+- fail-closed verification and rehydrate
+- cited recall and Knowledge Engine answers
+- freshness checks for stale/superseded promises and decisions
+- temporal graph timelines for "what did we know then?"
+- explicit federation instead of silent cross-workspace memory soup
+- dashboard/operator console for trust, incidents, knowledge, vault, and backups
+
+Start here:
+
+- [Operational manual](docs/operational-manual.md) - what to run, what good looks like, and how to operate it
+- [Demo guide](docs/demo-guide.md) - dashboard/video/storyboard script and public demo flow
+- [Benchmarks](docs/benchmarks.md) - reproducible continuity benchmark and scorecard
+- [Memory layer comparison](docs/total-recall-memory-layer-comparison-2026-06-03.md) - how Total Recall differs from GBrain, Zep/Graphiti, Hindsight, Mem0, Letta, and native Hermes memory
+- [Dashboard docs](docs/backup-dashboard.md) - Trust Spine, Knowledge Engine, Workbench, Vault, and backups
+
 ## Quick Install For Hermes
 
 From a published package or installed checkout:
@@ -213,6 +245,7 @@ total-recall import total-recall-backup.tar.gz
 total-recall backup run --out-dir ~/total-recall-backups --keep 14 --keep-days 90
 total-recall backup status --out-dir ~/total-recall-backups
 total-recall dashboard --backup-dir ~/total-recall-backups --keep 14 --keep-days 90
+PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
 total-recall incidents list
 total-recall external ingest --source handoff.md --text "Imported context"
 total-recall knowledge query --query "What do we know?" --mode normal --format json
@@ -364,8 +397,13 @@ Adapters must never write directly to authoritative state. The ledger,
 checkpoints, and anchors remain the source of truth; external systems can only
 produce cited candidates and receipts.
 
-## Test
+## Test, Benchmark, And Release Smoke
 
 ```bash
-python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 python scripts/privacy_scan.py
+PYTHONDONTWRITEBYTECODE=1 ./scripts/install_smoke.sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
 ```
+
+For the full public-facing validation checklist, see [docs/release-checklist.md](docs/release-checklist.md). For benchmark interpretation, see [docs/benchmarks.md](docs/benchmarks.md).

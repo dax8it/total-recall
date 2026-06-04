@@ -1,0 +1,106 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="760" viewBox="0 0 1280 760" role="img" aria-labelledby="title desc">
+  <title id="title">Total Recall architecture</title>
+  <desc id="desc">Agent runtimes call Total Recall as a memory provider. The append-only ledger, deterministic state, signed checkpoints, and anchors are authority. Search indexes, knowledge graph, compiled truth, reports, dashboard, vault, and federation are derived operator surfaces.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1e293b" stroke-width="0.7"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#34d399"/>
+    </marker>
+    <filter id="glow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge><feMergeNode in="coloredBlur"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <style>
+      .bg{fill:#020617}.card{fill:#0f172a;stroke-width:2;rx:16}.title{font:700 28px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e2e8f0}.sub{font:14px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.label{font:700 17px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e2e8f0}.small{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#cbd5e1}.tiny{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.authority{fill:rgba(136,19,55,.28);stroke:#fb7185}.provider{fill:rgba(6,78,59,.36);stroke:#34d399}.runtime{fill:rgba(8,51,68,.38);stroke:#22d3ee}.derived{fill:rgba(76,29,149,.32);stroke:#a78bfa}.operator{fill:rgba(120,53,15,.28);stroke:#fbbf24}.external{fill:rgba(30,41,59,.55);stroke:#94a3b8}.flow{fill:none;stroke:#38bdf8;stroke-width:2.5;marker-end:url(#arrow)}.flow2{fill:none;stroke:#34d399;stroke-width:2.5;marker-end:url(#arrowGreen)}.dash{stroke-dasharray:8 5}.boundary{fill:none;stroke:#475569;stroke-width:1.5;stroke-dasharray:8 5;rx:22}.badge{fill:#020617;stroke:#334155;stroke-width:1}
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="760"/>
+  <rect width="1280" height="760" fill="url(#grid)" opacity="0.7"/>
+
+  <text x="48" y="58" class="title">Total Recall: local-first continuity authority</text>
+  <text x="48" y="86" class="sub">Memory that can prove what it knows before an agent is allowed to use it.</text>
+
+  <rect x="40" y="120" width="250" height="420" class="boundary"/>
+  <text x="60" y="148" class="small">Agent runtimes</text>
+
+  <rect x="70" y="180" width="190" height="72" class="card runtime"/>
+  <text x="95" y="211" class="label">Hermes Agent</text>
+  <text x="95" y="235" class="tiny">lifecycle hooks + tools</text>
+
+  <rect x="70" y="292" width="190" height="72" class="card runtime"/>
+  <text x="105" y="323" class="label">CLI / scripts</text>
+  <text x="100" y="347" class="tiny">operator automation</text>
+
+  <rect x="70" y="404" width="190" height="72" class="card runtime"/>
+  <text x="102" y="435" class="label">Other agents</text>
+  <text x="98" y="459" class="tiny">framework-agnostic core</text>
+
+  <rect x="380" y="168" width="240" height="250" class="card provider" filter="url(#glow)"/>
+  <text x="421" y="202" class="label">Total Recall Core</text>
+  <text x="415" y="230" class="small">MemoryProvider adapter</text>
+  <text x="415" y="255" class="small">CLI + dashboard API</text>
+  <text x="415" y="280" class="small">verify-before-rehydrate</text>
+  <text x="415" y="305" class="small">explicit federation auth</text>
+  <text x="415" y="330" class="small">trust gate runner</text>
+  <rect x="415" y="350" width="170" height="34" class="badge" rx="10"/>
+  <text x="439" y="372" class="tiny">no cloud dependency</text>
+
+  <path class="flow" d="M260 216H370"/>
+  <path class="flow" d="M260 328H370"/>
+  <path class="flow" d="M260 440C315 440 315 385 370 385"/>
+
+  <rect x="720" y="110" width="485" height="210" class="boundary"/>
+  <text x="740" y="138" class="small">Authority spine</text>
+  <rect x="750" y="170" width="140" height="72" class="card authority"/>
+  <text x="785" y="201" class="label">Ledger</text>
+  <text x="773" y="225" class="tiny">events.jsonl hash chain</text>
+  <rect x="930" y="170" width="140" height="72" class="card authority"/>
+  <text x="970" y="201" class="label">State</text>
+  <text x="956" y="225" class="tiny">deterministic reduce</text>
+  <rect x="750" y="252" width="140" height="50" class="card authority"/>
+  <text x="778" y="283" class="small">Checkpoints</text>
+  <rect x="930" y="252" width="140" height="50" class="card authority"/>
+  <text x="978" y="283" class="small">Anchors</text>
+  <rect x="1090" y="184" width="90" height="86" class="card authority"/>
+  <text x="1117" y="218" class="small">Verify</text>
+  <text x="1110" y="242" class="tiny">fail closed</text>
+  <path class="flow2" d="M620 250H740"/>
+  <path class="flow2" d="M890 206H920"/>
+  <path class="flow2" d="M1000 242V252"/>
+  <path class="flow2" d="M890 277H920"/>
+  <path class="flow2" d="M1070 224H1080"/>
+
+  <rect x="720" y="370" width="485" height="210" class="boundary"/>
+  <text x="740" y="398" class="small">Derived projections and operator surfaces</text>
+  <rect x="750" y="430" width="130" height="58" class="card derived"/>
+  <text x="776" y="455" class="small">Indexes</text>
+  <text x="766" y="475" class="tiny">SQLite / LanceDB / QMD</text>
+  <rect x="910" y="430" width="130" height="58" class="card derived"/>
+  <text x="948" y="455" class="small">Graph</text>
+  <text x="930" y="475" class="tiny">cited entities + edges</text>
+  <rect x="1070" y="430" width="110" height="58" class="card derived"/>
+  <text x="1093" y="455" class="small">Truth</text>
+  <text x="1086" y="475" class="tiny">compiled projection</text>
+  <rect x="750" y="506" width="130" height="52" class="card operator"/>
+  <text x="779" y="537" class="small">Dashboard</text>
+  <rect x="910" y="506" width="130" height="52" class="card operator"/>
+  <text x="944" y="537" class="small">Vault</text>
+  <rect x="1070" y="506" width="110" height="52" class="card operator"/>
+  <text x="1088" y="537" class="small">Reports</text>
+  <path class="flow dash" d="M620 335C670 335 670 460 740 460"/>
+  <path class="flow dash" d="M620 355C690 355 690 530 740 530"/>
+
+  <rect x="370" y="485" width="260" height="130" class="card external"/>
+  <text x="408" y="520" class="label">External boundaries</text>
+  <text x="405" y="550" class="small">• Obsidian export is derived</text>
+  <text x="405" y="575" class="small">• Federation requires authorize</text>
+  <text x="405" y="600" class="small">• Providers use redacted reports</text>
+
+  <text x="48" y="675" class="small">Key distinction: normal memory retrieves. Total Recall verifies authority, then retrieves with citations.</text>
+  <text x="48" y="708" class="tiny">Generated for Total Recall documentation. Derived indexes and dashboards are rebuildable; ledger/checkpoints/anchors are authority.</text>
+</svg>
