@@ -1,14 +1,17 @@
 # Backup Dashboard
 
-Total Recall includes a small local dashboard for running and monitoring the
-recommended protection cycle:
+Total Recall includes a local admin control center for running and monitoring
+the recommended protection cycle:
 
 ```text
 export -> doctor -> verify -> retention pruning
 ```
 
 The dashboard is portable. It uses Python's standard library HTTP server and
-talks directly to `total-recall-core`; no external service is required.
+talks directly to `total-recall-core`; no external service is required. It also
+surfaces the Trust Spine, Knowledge Engine status, query/graph/truth workbench,
+Obsidian vault export, remote MCP readiness, remote backup providers, and backup
+inventory from the same local-only control surface.
 
 ## Run The Dashboard
 
@@ -90,6 +93,27 @@ directory, and retention count.
 
 You can edit the plist before loading it to change the hour, minute, backup
 directory, or retention flags.
+
+## Admin Control Center
+
+The first screen is the operator surface for a Hermes/Total Recall memory stack:
+
+- status strip for authority, checkpoint, Knowledge Engine, scorecard, backups,
+  and remote MCP readiness
+- Trust Spine gates for ledger, checkpoint, incidents, retrieval, Knowledge
+  Engine authority, and backup inventory
+- Knowledge Engine controls for rebuild index, rebuild graph, build compiled
+  truth, run scorecard, run synthesis, and show compiled truth
+- Operator Workbench for cited queries, graph inspection, temporal timeline,
+  freshness review, working-context source ingest, and compiled-truth review
+- Obsidian Vault controls for choosing a local folder, generating wikilinked
+  source/entity/document/timeline/decision/promise/task notes, previewing edited
+  note imports, and promoting approved review proposals without using the CLI
+- Remote MCP readiness rows that distinguish implemented local-provider
+  behavior from planned OAuth, remote MCP HTTP serving, and live activity stream
+
+The dashboard is still local by default. Remote MCP serving should remain
+planned until OAuth/scoped clients and remote transport controls are wired.
 
 ## Private Remote Backups
 
