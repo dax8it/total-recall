@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import hmac
 import json
@@ -15,7 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 VERSION = "1.3.0"
@@ -25,6 +26,74 @@ INDEX_SCHEMA_VERSION = "total-recall-sqlite-fts-v1"
 LANCEDB_INDEX_SCHEMA_VERSION = "total-recall-lancedb-derived-v1"
 QMD_INDEX_SCHEMA_VERSION = "total-recall-qmd-derived-v1"
 EMBEDDING_DIMENSIONS = 128
+DOCUMENT_INGEST_SCHEMA_VERSION = "total-recall-document-ingest-v1"
+OBSIDIAN_VAULT_SCHEMA_VERSION = "total-recall-obsidian-vault-v1"
+WORKING_CONTEXT_SCHEMA_VERSION = "total-recall-working-context-source-v1"
+OBSIDIAN_IMPORT_SCHEMA_VERSION = "total-recall-obsidian-import-review-v1"
+FEDERATION_SCHEMA_VERSION = "total-recall-federation-registry-v1"
+TRUST_GATE_SCHEMA_VERSION = "total-recall-trust-gate-v1"
+TRUST_GATE_REQUIRED_HERMES_TOOLS = {
+    "total_recall_search",
+    "total_recall_status",
+    "total_recall_checkpoint",
+    "total_recall_verify",
+    "total_recall_trust_verify",
+    "total_recall_rehydrate",
+    "total_recall_incidents",
+    "total_recall_source_ingest",
+    "total_recall_knowledge_query",
+    "total_recall_knowledge_freshness",
+    "total_recall_knowledge_status",
+    "total_recall_knowledge_synthesis_status",
+    "total_recall_knowledge_compiled_truth",
+    "total_recall_knowledge_graph_inspect",
+    "total_recall_knowledge_graph_timeline",
+    "total_recall_federation_query",
+}
+DEFAULT_DOCUMENT_EXTENSIONS = {
+    ".adoc",
+    ".cfg",
+    ".conf",
+    ".csv",
+    ".htm",
+    ".html",
+    ".ini",
+    ".json",
+    ".jsonl",
+    ".md",
+    ".mdown",
+    ".markdown",
+    ".rst",
+    ".text",
+    ".toml",
+    ".tsv",
+    ".txt",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+DEFAULT_DOCUMENT_EXCLUDE_GLOBS = {
+    ".DS_Store",
+    "*.pyc",
+    "*.pyo",
+    "__pycache__",
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "dist",
+    "build",
+}
+WORKING_CONTEXT_SOURCE_TYPES = {
+    "agent_transcript",
+    "calendar",
+    "crm",
+    "email",
+    "github",
+    "meeting",
+    "slack",
+    "ticket",
+}
 
 
 def utc_now() -> str:
@@ -44,6 +113,239 @@ def _safe_id(value: str) -> str:
     return cleaned.strip("._") or "default"
 
 
+def _normalize_extensions(values: Iterable[str]) -> set[str]:
+    normalized = set()
+    for value in values:
+        item = str(value or "").strip().lower()
+        if not item:
+            continue
+        normalized.add(item if item.startswith(".") else f".{item}")
+    return normalized
+
+
+def _display_document_path(path: Path, *, root: Path) -> str:
+    resolved = path.expanduser()
+    try:
+        return str(resolved.resolve().relative_to(Path.cwd().resolve()))
+    except Exception:
+        pass
+    try:
+        rel = resolved.relative_to(root)
+        return str(Path(root.name) / rel) if root.name else str(rel)
+    except Exception:
+        return resolved.name
+
+
+def _is_ignored_document_path(path: Path, *, root: Path, exclude_globs: set[str]) -> bool:
+    try:
+        rel = path.relative_to(root)
+    except Exception:
+        rel = Path(path.name)
+    parts = rel.parts
+    if any(part.startswith(".") for part in parts):
+        return True
+    rel_text = str(rel)
+    for pattern in exclude_globs:
+        if any(fnmatch.fnmatch(part, pattern) for part in parts):
+            return True
+        if fnmatch.fnmatch(rel_text, pattern) or fnmatch.fnmatch(path.name, pattern):
+            return True
+    return False
+
+
+def _looks_binary(raw: bytes) -> bool:
+    if not raw:
+        return False
+    if b"\x00" in raw:
+        return True
+    sample = raw[:4096]
+    control = sum(1 for byte in sample if byte < 9 or (13 < byte < 32))
+    return control / max(1, len(sample)) > 0.08
+
+
+def _chunk_document_text(text: str, *, max_chars: int) -> List[str]:
+    max_chars = max(1000, int(max_chars or 6000))
+    if len(text) <= max_chars:
+        return [text]
+    chunks: List[str] = []
+    current: List[str] = []
+    current_len = 0
+    paragraphs = re.split(r"\n{2,}", text)
+    for paragraph in paragraphs:
+        paragraph = paragraph.strip()
+        if not paragraph:
+            continue
+        if len(paragraph) > max_chars:
+            if current:
+                chunks.append("\n\n".join(current).strip())
+                current = []
+                current_len = 0
+            for start in range(0, len(paragraph), max_chars):
+                chunks.append(paragraph[start : start + max_chars].strip())
+            continue
+        projected = current_len + len(paragraph) + (2 if current else 0)
+        if current and projected > max_chars:
+            chunks.append("\n\n".join(current).strip())
+            current = [paragraph]
+            current_len = len(paragraph)
+        else:
+            current.append(paragraph)
+            current_len = projected
+    if current:
+        chunks.append("\n\n".join(current).strip())
+    return [chunk for chunk in chunks if chunk]
+
+
+def _short_hash(value: str, length: int = 8) -> str:
+    return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()[: max(4, int(length or 8))]
+
+
+def _vault_slug(value: str) -> str:
+    raw = str(value or "").strip()
+    cleaned = re.sub(r"[/\\:|#^\[\]\r\n\t]+", "-", raw)
+    cleaned = re.sub(r"[^A-Za-z0-9._ @()+='!-]+", "-", cleaned)
+    cleaned = re.sub(r"\s+", "-", cleaned).strip(" .-_")
+    if not cleaned:
+        cleaned = "untitled"
+    if len(cleaned) > 90:
+        cleaned = f"{cleaned[:76].rstrip(' .-_')}-{_short_hash(raw)}"
+    return cleaned
+
+
+def _vault_frontmatter(payload: Dict[str, Any]) -> str:
+    lines = ["---"]
+    for key in sorted(payload):
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", str(key)):
+            continue
+        value = payload[key]
+        if value is None:
+            continue
+        lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+    lines.extend(["---", ""])
+    return "\n".join(lines)
+
+
+def _vault_link(page_no_ext: str, label: str = "") -> str:
+    target = str(page_no_ext or "").replace("[", "(").replace("]", ")")
+    safe_label = str(label or "").replace("|", "-").replace("[", "(").replace("]", ")")
+    if safe_label and safe_label != target:
+        return f"[[{target}|{safe_label}]]"
+    return f"[[{target}]]"
+
+
+def _fenced_text(text: str, *, language: str = "text") -> str:
+    safe = str(text or "").replace("```", "`` `")
+    return f"```{language}\n{safe}\n```"
+
+
+def _split_markdown_frontmatter(text: str) -> Tuple[Dict[str, Any], str]:
+    if not text.startswith("---\n"):
+        return {}, text
+    end = text.find("\n---", 4)
+    if end < 0:
+        return {}, text
+    raw = text[4:end].strip()
+    body = text[end + 4 :].lstrip("\n")
+    payload: Dict[str, Any] = {}
+    for line in raw.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        try:
+            payload[key] = json.loads(value)
+        except Exception:
+            payload[key] = value.strip("\"'")
+    return payload, body
+
+
+def _markdown_title(text: str) -> str:
+    for line in str(text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            return stripped.lstrip("#").strip()
+        if stripped:
+            return _one_line(stripped, limit=90)
+    return ""
+
+
+def _one_line(text: str, *, limit: int = 180) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(cleaned) > limit:
+        return cleaned[: max(1, limit - 3)].rstrip() + "..."
+    return cleaned
+
+
+def _event_source_ref(event: Dict[str, Any]) -> str:
+    return f"ledger:{event.get('event_id')}"
+
+
+def _event_title(event: Dict[str, Any]) -> str:
+    metadata = event.get("metadata") or {}
+    if metadata.get("document_path"):
+        chunk = metadata.get("chunk_index")
+        total = metadata.get("chunk_count")
+        suffix = f" chunk {chunk}/{total}" if chunk and total else ""
+        return f"{metadata.get('document_path')}{suffix}"
+    text = str(event.get("text") or "").strip()
+    first = next((line.strip("#:- ").strip() for line in text.splitlines() if line.strip()), "")
+    return _one_line(first or str(event.get("source") or event.get("event_id") or "Memory"), limit=90)
+
+
+def _event_summary(event: Dict[str, Any], *, limit: int = 240) -> str:
+    return _one_line(str(event.get("text") or ""), limit=limit)
+
+
+def _group_document_events(events: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        metadata = event.get("metadata") or {}
+        doc_path = str(metadata.get("document_path") or "")
+        if not doc_path:
+            source = str(event.get("source") or "")
+            doc_path = source.removeprefix("document:") if source.startswith("document:") else source
+        if not doc_path:
+            doc_path = "unknown-document"
+        grouped.setdefault(doc_path, []).append(event)
+    for items in grouped.values():
+        items.sort(key=lambda item: int((item.get("metadata") or {}).get("chunk_index") or 0))
+    return dict(sorted(grouped.items()))
+
+
+def _group_events_by_day(events: Iterable[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for event in events:
+        day = str(event.get("timestamp") or "undated")[:10] or "undated"
+        grouped.setdefault(day, []).append(event)
+    return grouped
+
+
+def _event_haystack(event: Dict[str, Any]) -> str:
+    return " ".join(str(event.get(key) or "") for key in ("kind", "source", "text")).lower()
+
+
+def _event_looks_decision(event: Dict[str, Any]) -> bool:
+    haystack = _event_haystack(event)
+    return str(event.get("kind") or "") == "decision" or any(
+        marker in haystack for marker in ("decision:", "decided ", "decision ", "supersedes", "must ")
+    )
+
+
+def _event_looks_promise(event: Dict[str, Any]) -> bool:
+    haystack = _event_haystack(event)
+    return str(event.get("kind") or "") == "promise" or "promise" in haystack
+
+
+def _event_looks_task(event: Dict[str, Any]) -> bool:
+    haystack = _event_haystack(event)
+    return str(event.get("kind") or "") in {"task", "todo"} or any(
+        marker in haystack for marker in ("todo", "next action", "action item", "follow up", "implement ", "fix ")
+    )
+
+
 def resolve_default_home() -> Path:
     if os.getenv("TOTAL_RECALL_HOME"):
         return Path(os.environ["TOTAL_RECALL_HOME"]).expanduser()
@@ -56,7 +358,7 @@ def resolve_default_home() -> Path:
 class TotalRecallConfig:
     home: Path = field(default_factory=resolve_default_home)
     allowed_scopes: tuple[str, ...] = field(
-        default_factory=lambda: ("private", "group_safe", "internal", "shared_team")
+        default_factory=lambda: ("private", "group_safe", "internal", "shared_team", "public")
     )
     workspace_root: Optional[Path] = None
     enable_lancedb: bool = field(
@@ -155,8 +457,115 @@ class TotalRecallCore:
                 "incidents": "implemented",
                 "externalMemory": "implemented",
                 "contextPlanning": "implemented",
+                "knowledgeEngine": "implemented-local-first-derived",
             },
         }
+
+    def knowledge_status(self) -> Dict[str, Any]:
+        return self._knowledge().status()
+
+    def knowledge_index_status(self) -> Dict[str, Any]:
+        return self._knowledge().index_status()
+
+    def knowledge_index_rebuild(self) -> Dict[str, Any]:
+        return self._knowledge().rebuild_index()
+
+    def knowledge_graph_status(self) -> Dict[str, Any]:
+        return self._knowledge().graph_status()
+
+    def knowledge_graph_rebuild(self) -> Dict[str, Any]:
+        return self._knowledge().rebuild_graph()
+
+    def knowledge_graph_inspect(
+        self,
+        *,
+        entity: str = "",
+        source_ref: str = "",
+        limit: int = 20,
+        allowed_scopes: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._knowledge().graph_inspect(entity=entity, source_ref=source_ref, limit=limit, allowed_scopes=allowed_scopes)
+
+    def knowledge_graph_traverse(
+        self,
+        entity: str,
+        *,
+        depth: int = 2,
+        limit: int = 40,
+        allowed_scopes: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._knowledge().graph_traverse(entity, depth=depth, limit=limit, allowed_scopes=allowed_scopes)
+
+    def knowledge_graph_timeline(
+        self,
+        entity: str,
+        *,
+        at_time: str = "",
+        limit: int = 40,
+        allowed_scopes: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._knowledge().graph_timeline(entity, at_time=at_time, limit=limit, allowed_scopes=allowed_scopes)
+
+    def knowledge_freshness_report(
+        self,
+        *,
+        entity: str = "",
+        category: str = "",
+        at_time: str = "",
+        allowed_scopes: Optional[Iterable[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._knowledge().freshness_report(entity=entity, category=category, at_time=at_time, allowed_scopes=allowed_scopes)
+
+    def knowledge_compiled_truth_status(self) -> Dict[str, Any]:
+        return self._knowledge().compiled_truth_status()
+
+    def knowledge_compiled_truth_build(self) -> Dict[str, Any]:
+        return self._knowledge().compiled_truth_build()
+
+    def knowledge_compiled_truth_show(self, *, format_: str = "json") -> Dict[str, Any]:
+        return self._knowledge().compiled_truth_show(format_=format_)
+
+    def knowledge_query(
+        self,
+        query: str,
+        *,
+        mode: str = "normal",
+        session_id: str = "",
+        max_results: int = 8,
+        at_time: str = "",
+        allowed_scopes: Optional[Iterable[str]] = None,
+        federate: Optional[Iterable[str]] = None,
+        federation_authorized: bool = False,
+        external_providers: Optional[Iterable[str]] = None,
+        external_provider_authorized: bool = False,
+    ) -> Dict[str, Any]:
+        return self._knowledge().query(
+            query,
+            mode=mode,
+            session_id=session_id,
+            max_results=max_results,
+            at_time=at_time,
+            allowed_scopes=allowed_scopes,
+            federate=federate,
+            federation_authorized=federation_authorized,
+            external_providers=external_providers,
+            external_provider_authorized=external_provider_authorized,
+        )
+
+    def knowledge_synthesize_status(self) -> Dict[str, Any]:
+        return self._knowledge().synthesis_status()
+
+    def knowledge_synthesize_run(self) -> Dict[str, Any]:
+        return self._knowledge().synthesize_run()
+
+    def knowledge_synthesize_promote(self, proposal_id: str, *, session_id: str = "default") -> Dict[str, Any]:
+        return self._knowledge().synthesize_promote(proposal_id, session_id=session_id)
+
+    def knowledge_evaluate_run(self) -> Dict[str, Any]:
+        return self._knowledge().evaluate_run()
+
+    def knowledge_evaluate_scorecard(self) -> Dict[str, Any]:
+        return self._knowledge().evaluate_scorecard()
 
     def ingest(
         self,
@@ -194,6 +603,1044 @@ class TotalRecallCore:
             state = self.reduce_state(write=True)
             self._rebuild_index_locked(state=state, backends=("sqlite-fts",))
         return {"ok": True, "event": event, "stateHash": state["state_hash"]}
+
+    def ingest_documents(
+        self,
+        paths: Sequence[str | Path],
+        *,
+        session_id: str = "documents",
+        scope: str = "private",
+        recursive: bool = True,
+        include_extensions: Optional[Iterable[str]] = None,
+        exclude_globs: Optional[Iterable[str]] = None,
+        max_file_bytes: int = 2_000_000,
+        chunk_chars: int = 6000,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        if scope not in self.config.allowed_scopes:
+            raise ValueError(f"scope '{scope}' is not allowed")
+        if not paths:
+            raise ValueError("at least one document path is required")
+
+        include = _normalize_extensions(include_extensions or DEFAULT_DOCUMENT_EXTENSIONS)
+        excludes = set(DEFAULT_DOCUMENT_EXCLUDE_GLOBS)
+        excludes.update(str(item) for item in exclude_globs or [])
+        ingest_id = self._new_id("docingest")
+        candidates = self._document_candidates(paths, recursive=recursive)
+        files: List[Dict[str, Any]] = []
+        events: List[Dict[str, Any]] = []
+
+        for path, root, explicit in candidates:
+            prepared = self._prepare_document_file(
+                path,
+                root=root,
+                explicit=explicit,
+                include_extensions=include,
+                exclude_globs=excludes,
+                max_file_bytes=max_file_bytes,
+                chunk_chars=chunk_chars,
+                ingest_id=ingest_id,
+                session_id=session_id,
+                scope=scope,
+            )
+            files.append(prepared["file"])
+            events.extend(prepared.get("events") or [])
+
+        if dry_run or not events:
+            return {
+                "ok": True,
+                "status": "DRY_RUN" if dry_run else "NO_DOCUMENTS",
+                "schema": DOCUMENT_INGEST_SCHEMA_VERSION,
+                "ingestId": ingest_id,
+                "dryRun": dry_run,
+                "paths": [str(Path(item).expanduser()) for item in paths],
+                "files": files,
+                "fileCount": len(files),
+                "ingestedFiles": sum(1 for item in files if item.get("status") == "planned"),
+                "skippedFiles": sum(1 for item in files if item.get("status") == "skipped"),
+                "chunkCount": len(events),
+                "events": [],
+            }
+
+        with self._locked():
+            previous_hash = self._last_event_hash()
+            written_events = []
+            for event_base in events:
+                base = {**event_base, "prev_hash": previous_hash}
+                event_hash = sha256_json(base)
+                event = {**base, "hash": event_hash}
+                with self.ledger_file.open("a", encoding="utf-8") as fh:
+                    fh.write(canonical_json(event) + "\n")
+                previous_hash = event_hash
+                written_events.append(event)
+            state = self.reduce_state(write=True)
+            self._rebuild_index_locked(state=state, backends=("sqlite-fts",))
+
+        by_source = {str(event.get("source")) for event in written_events}
+        for item in files:
+            if item.get("status") == "planned" and f"document:{item.get('documentPath')}" in by_source:
+                item["status"] = "ingested"
+        return {
+            "ok": True,
+            "status": "PASS",
+            "schema": DOCUMENT_INGEST_SCHEMA_VERSION,
+            "ingestId": ingest_id,
+            "dryRun": False,
+            "paths": [str(Path(item).expanduser()) for item in paths],
+            "files": files,
+            "fileCount": len(files),
+            "ingestedFiles": sum(1 for item in files if item.get("status") == "ingested"),
+            "skippedFiles": sum(1 for item in files if item.get("status") == "skipped"),
+            "chunkCount": len(written_events),
+            "events": written_events,
+            "stateHash": state["state_hash"],
+        }
+
+    def ingest_source(
+        self,
+        *,
+        source_type: str,
+        text: str = "",
+        file: str | Path | None = None,
+        title: str = "",
+        actor: str = "",
+        occurred_at: str = "",
+        participants: Optional[Iterable[str]] = None,
+        session_id: str = "working-context",
+        scope: str = "private",
+        metadata: Optional[Dict[str, Any]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        source_type = _safe_id(str(source_type or "").strip().lower().replace("-", "_"))
+        if source_type not in WORKING_CONTEXT_SOURCE_TYPES:
+            return {
+                "ok": False,
+                "status": "ERROR",
+                "error": "unsupported_source_type",
+                "sourceType": source_type,
+                "supported": sorted(WORKING_CONTEXT_SOURCE_TYPES),
+            }
+        if scope not in self.config.allowed_scopes:
+            raise ValueError(f"scope '{scope}' is not allowed")
+        source_path: Optional[Path] = Path(file).expanduser() if file else None
+        raw_bytes = b""
+        if source_path:
+            if not source_path.exists() or not source_path.is_file():
+                return {"ok": False, "status": "ERROR", "error": "source_file_not_found", "path": str(source_path)}
+            raw_bytes = source_path.read_bytes()
+            if _looks_binary(raw_bytes):
+                return {"ok": False, "status": "ERROR", "error": "binary_or_unsupported_text", "path": str(source_path)}
+            text = raw_bytes.decode("utf-8-sig", errors="replace")
+        text = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            return {"ok": False, "status": "ERROR", "error": "text_or_file_required"}
+        participants_list = [str(item).strip() for item in participants or [] if str(item).strip()]
+        source_id = self._new_id(f"source_{source_type}")
+        title = title.strip() or (source_path.name if source_path else f"{source_type} source")
+        payload_metadata = {
+            "schema": WORKING_CONTEXT_SCHEMA_VERSION,
+            "source_type": source_type,
+            "source_id": source_id,
+            "title": title,
+            "actor": actor,
+            "occurred_at": occurred_at,
+            "participants": participants_list,
+            **(metadata or {}),
+        }
+        if source_path:
+            payload_metadata.update(
+                {
+                    "source_file": str(source_path),
+                    "source_file_name": source_path.name,
+                    "source_file_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+                    "source_file_size_bytes": len(raw_bytes),
+                }
+            )
+        lines = [
+            f"Source type: {source_type}",
+            f"Title: {title}",
+        ]
+        if occurred_at:
+            lines.append(f"Occurred at: {occurred_at}")
+        if actor:
+            lines.append(f"Actor: {actor}")
+        if participants_list:
+            lines.append(f"Participants: {', '.join(participants_list)}")
+        lines.extend(["", text])
+        event_text = "\n".join(lines).strip()
+        if dry_run:
+            return {
+                "ok": True,
+                "status": "DRY_RUN",
+                "schema": WORKING_CONTEXT_SCHEMA_VERSION,
+                "sourceType": source_type,
+                "title": title,
+                "scope": scope,
+                "sessionId": session_id,
+                "textPreview": event_text[:1000],
+                "metadata": payload_metadata,
+            }
+        ingested = self.ingest(
+            kind=f"source_{source_type}",
+            text=event_text,
+            session_id=session_id or "working-context",
+            scope=scope,
+            source=f"{source_type}:{title}",
+            metadata=payload_metadata,
+        )
+        return {
+            "ok": True,
+            "status": "PASS",
+            "schema": WORKING_CONTEXT_SCHEMA_VERSION,
+            "sourceType": source_type,
+            "title": title,
+            "event": ingested.get("event"),
+            "stateHash": ingested.get("stateHash"),
+        }
+
+    def vault_import_preview(
+        self,
+        vault: str | Path,
+        *,
+        notes: Optional[Iterable[str | Path]] = None,
+        session_id: str = "obsidian-import",
+        scope: str = "private",
+    ) -> Dict[str, Any]:
+        vault_path = Path(vault).expanduser()
+        if scope not in self.config.allowed_scopes:
+            raise ValueError(f"scope '{scope}' is not allowed")
+        if not vault_path.exists() or not vault_path.is_dir():
+            return {"ok": False, "status": "ERROR", "error": "vault_not_found", "path": str(vault_path)}
+        manifest_path = vault_path / ".total-recall-vault.json"
+        manifest = self._read_json(manifest_path) if manifest_path.exists() else {}
+        selected: List[Path] = []
+        if notes:
+            for raw in notes:
+                note_path = Path(raw)
+                path = note_path if note_path.is_absolute() else vault_path / note_path
+                selected.append(path)
+        else:
+            selected = sorted(path for path in vault_path.rglob("*.md") if path.name not in {"README.md"})
+        proposals = []
+        for path in selected:
+            try:
+                resolved = path.resolve()
+                resolved.relative_to(vault_path.resolve())
+            except Exception:
+                return {"ok": False, "status": "ERROR", "error": "unsafe_note_path", "path": str(path)}
+            if not path.exists() or not path.is_file() or path.suffix.lower() != ".md":
+                continue
+            raw = path.read_text(encoding="utf-8")
+            frontmatter, body = _split_markdown_frontmatter(raw)
+            rel = path.relative_to(vault_path).as_posix()
+            if frontmatter.get("type") in {"index", "guide"}:
+                continue
+            text = body.strip()
+            if not text:
+                continue
+            proposal_id = f"obsimp_{_short_hash(rel + ':' + hashlib.sha256(raw.encode('utf-8')).hexdigest(), 12)}"
+            proposals.append(
+                {
+                    "proposal_id": proposal_id,
+                    "note": rel,
+                    "title": _markdown_title(text) or path.stem,
+                    "source_ref": frontmatter.get("source_ref"),
+                    "event_hash": frontmatter.get("event_hash"),
+                    "note_type": frontmatter.get("type") or "note",
+                    "sha256": hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                    "text": text[:8000],
+                    "metadata": {
+                        "schema": OBSIDIAN_IMPORT_SCHEMA_VERSION,
+                        "vault": str(vault_path),
+                        "note": rel,
+                        "frontmatter": frontmatter,
+                        "manifestStateHash": manifest.get("state_hash"),
+                        "manifestLastEventHash": manifest.get("last_event_hash"),
+                    },
+                }
+            )
+        preview_id = self._new_id("obsidian_preview")
+        preview = {
+            "ok": True,
+            "status": "PREVIEW",
+            "schema": OBSIDIAN_IMPORT_SCHEMA_VERSION,
+            "preview_id": preview_id,
+            "created_at": utc_now(),
+            "vault": str(vault_path),
+            "session_id": session_id,
+            "scope": scope,
+            "manifest": {
+                "path": str(manifest_path) if manifest_path.exists() else None,
+                "stateHash": manifest.get("state_hash"),
+                "lastEventHash": manifest.get("last_event_hash"),
+            },
+            "proposalCount": len(proposals),
+            "proposals": proposals,
+            "promoteHint": f"total-recall vault import-promote {preview_id}",
+        }
+        self._write_json(self.home / "reviews" / "obsidian" / f"{preview_id}.json", preview)
+        return preview
+
+    def vault_import_promote(
+        self,
+        preview_id: str,
+        *,
+        proposal_ids: Optional[Iterable[str]] = None,
+        session_id: str = "",
+        scope: str = "",
+    ) -> Dict[str, Any]:
+        preview_path = self.home / "reviews" / "obsidian" / f"{_safe_id(preview_id)}.json"
+        if not preview_path.exists():
+            return {"ok": False, "status": "ERROR", "error": "preview_not_found", "preview_id": preview_id}
+        preview = self._read_json(preview_path)
+        if preview.get("promoted_at"):
+            return {"ok": False, "status": "ERROR", "error": "preview_already_promoted", "preview_id": preview_id}
+        selected = set(str(item) for item in proposal_ids or [])
+        proposals = [item for item in preview.get("proposals") or [] if not selected or str(item.get("proposal_id")) in selected]
+        events = []
+        for proposal in proposals:
+            event = self.ingest(
+                kind="obsidian_note_import",
+                text=f"Obsidian note import: {proposal.get('note')}\n\n{proposal.get('text')}",
+                session_id=session_id or preview.get("session_id") or "obsidian-import",
+                scope=scope or preview.get("scope") or "private",
+                source=f"obsidian:{proposal.get('note')}",
+                metadata={
+                    **(proposal.get("metadata") or {}),
+                    "proposal_id": proposal.get("proposal_id"),
+                    "owner_authorized": True,
+                    "imported_at": utc_now(),
+                },
+            ).get("event")
+            events.append(event)
+        preview["promoted_at"] = utc_now()
+        preview["promoted_event_ids"] = [event.get("event_id") for event in events if event]
+        self._write_json(preview_path, preview)
+        self._write_json(
+            self.home / "reviews" / "obsidian" / "promoted" / f"{_safe_id(preview_id)}.json",
+            {"schema": OBSIDIAN_IMPORT_SCHEMA_VERSION, "preview": preview, "events": events},
+        )
+        return {"ok": True, "status": "PASS", "schema": OBSIDIAN_IMPORT_SCHEMA_VERSION, "previewId": preview_id, "eventCount": len(events), "events": events}
+
+    def federation_register(
+        self,
+        name: str,
+        path: str | Path,
+        *,
+        role: str = "agent",
+        scopes: Optional[Iterable[str]] = None,
+        description: str = "",
+    ) -> Dict[str, Any]:
+        safe_name = _safe_id(name)
+        home = self._resolve_total_recall_home(Path(path).expanduser())
+        registry = self._federation_registry()
+        target = {
+            "name": safe_name,
+            "path": str(home),
+            "role": _safe_id(role or "agent"),
+            "scopes": [str(scope) for scope in scopes or []],
+            "description": description,
+            "registered_at": utc_now(),
+            "home_hash": sha256_json({"home": str(home.resolve())}),
+        }
+        registry["targets"][safe_name] = target
+        self._write_json(self.home / "federation" / "targets.json", registry)
+        return {"ok": True, "status": "PASS", "schema": FEDERATION_SCHEMA_VERSION, "target": target}
+
+    def federation_list(self) -> Dict[str, Any]:
+        registry = self._federation_registry()
+        return {"ok": True, "status": "PASS", "schema": FEDERATION_SCHEMA_VERSION, "targets": list(registry.get("targets", {}).values())}
+
+    def federation_remove(self, name: str) -> Dict[str, Any]:
+        registry = self._federation_registry()
+        removed = registry.get("targets", {}).pop(_safe_id(name), None)
+        self._write_json(self.home / "federation" / "targets.json", registry)
+        return {"ok": removed is not None, "status": "PASS" if removed else "MISSING", "removed": removed}
+
+    def federation_query(
+        self,
+        query: str,
+        *,
+        targets: Optional[Iterable[str]] = None,
+        authorize: bool = False,
+        mode: str = "normal",
+        allowed_scopes: Optional[Iterable[str]] = None,
+        max_results: int = 8,
+        at_time: str = "",
+    ) -> Dict[str, Any]:
+        registry = self._federation_registry()
+        target_names = [str(item) for item in targets or registry.get("targets", {}).keys()]
+        homes = []
+        resolved_targets = []
+        for name in target_names:
+            target = registry.get("targets", {}).get(_safe_id(name))
+            if not target:
+                continue
+            resolved_targets.append(target)
+            homes.append(target.get("path"))
+        result = self.knowledge_query(
+            query,
+            mode=mode,
+            max_results=max_results,
+            at_time=at_time,
+            allowed_scopes=allowed_scopes,
+            federate=homes,
+            federation_authorized=authorize,
+        )
+        result["registry"] = {"targets": resolved_targets, "authorized": authorize}
+        return result
+
+    def export_obsidian_vault(
+        self,
+        out: str | Path,
+        *,
+        force: bool = False,
+        allowed_scopes: Optional[Iterable[str]] = None,
+        max_events: int = 500,
+        max_entities: int = 100,
+    ) -> Dict[str, Any]:
+        out_path = Path(out).expanduser()
+        try:
+            resolved_out = out_path.resolve(strict=False)
+            if resolved_out == self.home or self.home in resolved_out.parents:
+                return {
+                    "ok": False,
+                    "status": "ERROR",
+                    "error": "vault_output_inside_total_recall_home",
+                    "path": str(out_path),
+                    "nextSteps": ["Choose an output folder outside the Total Recall home/store."],
+                }
+        except Exception:
+            pass
+        scopes = list(allowed_scopes or self.config.allowed_scopes)
+        state = self.reduce_state(write=True)
+        events = [event for event in self._read_events(verify_chain=True) if str(event.get("scope") or "private") in scopes]
+        events = events[-max(1, int(max_events or 500)) :]
+        if out_path.exists():
+            if not out_path.is_dir():
+                return {"ok": False, "status": "ERROR", "error": "output_path_is_not_directory", "path": str(out_path)}
+            if any(out_path.iterdir()) and not force:
+                return {
+                    "ok": False,
+                    "status": "EXISTS",
+                    "error": "vault_output_not_empty",
+                    "path": str(out_path),
+                    "nextSteps": ["Re-run with --force to regenerate the derived vault."],
+                }
+            if force:
+                shutil.rmtree(out_path)
+        out_path.mkdir(parents=True, exist_ok=True)
+
+        graph = self.knowledge_graph_inspect(limit=max_entities, allowed_scopes=scopes)
+        entities = graph.get("entities") or []
+        edges = graph.get("edges") or []
+        sources_by_ref = {f"ledger:{event.get('event_id')}": event for event in events}
+        entities_by_id = {str(item.get("entity_id")): item for item in entities if item.get("entity_id")}
+        entity_pages = {
+            str(item.get("entity_id")): f"Entities/{_vault_slug(str(item.get('name') or item.get('entity_id')))}-{_short_hash(str(item.get('entity_id')))}"
+            for item in entities
+            if item.get("entity_id")
+        }
+        source_pages = {ref: f"Sources/{_vault_slug(ref.replace(':', '_'))}" for ref in sources_by_ref}
+        document_events = [event for event in events if str(event.get("kind") or "") == "document"]
+        documents = _group_document_events(document_events)
+        document_pages = {doc_path: f"Documents/{_vault_slug(doc_path)}-{_short_hash(doc_path)}" for doc_path in documents}
+        written: List[str] = []
+
+        def write_page(rel_no_ext: str, content: str) -> None:
+            path = out_path / f"{rel_no_ext}.md"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+            written.append(str(path))
+
+        write_page(
+            "Index",
+            self._obsidian_index_markdown(
+                state=state,
+                events=events,
+                entities=entities,
+                edges=edges,
+                documents=documents,
+                entity_pages=entity_pages,
+                document_pages=document_pages,
+            ),
+        )
+        write_page("Graph Legend", self._obsidian_graph_legend_markdown())
+        write_page("Compiled Truth", self._obsidian_compiled_truth_markdown())
+
+        for doc_path, doc_events in sorted(documents.items()):
+            write_page(document_pages[doc_path], self._obsidian_document_markdown(doc_path, doc_events, source_pages=source_pages))
+
+        for event in events:
+            ref = f"ledger:{event.get('event_id')}"
+            source_entities = [entity for entity in entities if entity.get("source_ref") == ref]
+            source_edges = [edge for edge in edges if edge.get("source_ref") == ref]
+            write_page(
+                source_pages[ref],
+                self._obsidian_source_markdown(
+                    event,
+                    entities=source_entities,
+                    edges=source_edges,
+                    entities_by_id=entities_by_id,
+                    entity_pages=entity_pages,
+                    document_pages=document_pages,
+                ),
+            )
+
+        for entity in entities:
+            entity_id = str(entity.get("entity_id") or "")
+            if not entity_id:
+                continue
+            related_edges = [edge for edge in edges if edge.get("source_entity_id") == entity_id or edge.get("target_entity_id") == entity_id]
+            write_page(
+                entity_pages[entity_id],
+                self._obsidian_entity_markdown(
+                    entity,
+                    edges=related_edges,
+                    entities_by_id=entities_by_id,
+                    entity_pages=entity_pages,
+                    source_pages=source_pages,
+                ),
+            )
+
+        categorized = {
+            "Decisions": [event for event in events if _event_looks_decision(event)],
+            "Promises": [event for event in events if _event_looks_promise(event)],
+            "Tasks": [event for event in events if _event_looks_task(event)],
+        }
+        for folder, folder_events in categorized.items():
+            for event in folder_events:
+                write_page(f"{folder}/{_vault_slug(str(event.get('event_id') or folder))}", self._obsidian_category_markdown(folder[:-1], event, source_pages=source_pages))
+
+        for day, day_events in sorted(_group_events_by_day(events).items()):
+            write_page(f"Timeline/{day}", self._obsidian_timeline_markdown(day, day_events, source_pages=source_pages))
+
+        write_page(
+            "README",
+            "# Total Recall Vault Export\n\n"
+            "This Obsidian vault is a derived projection. The Total Recall ledger, checkpoints, and signed anchors remain the authority.\n\n"
+            "Regenerate this vault from Total Recall when memory changes. Edited notes become canonical only through `total-recall vault import-preview` followed by `total-recall vault import-promote`.\n",
+        )
+        manifest = {
+            "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+            "exported_at": utc_now(),
+            "total_recall_home": str(self.home),
+            "state_hash": state.get("state_hash"),
+            "last_event_hash": state.get("last_event_hash"),
+            "event_count": len(events),
+            "document_count": len(documents),
+            "entity_count": len(entities),
+            "edge_count": len(edges),
+            "scopes": scopes,
+            "files": [str(Path(path).relative_to(out_path)) for path in written],
+            "authority": "ledger/checkpoints/anchors",
+            "import_status": "selected_edit_preview_and_promote_available",
+        }
+        self._write_json(out_path / ".total-recall-vault.json", manifest)
+        return {
+            "ok": True,
+            "status": "PASS",
+            "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+            "path": str(out_path),
+            "manifest": str(out_path / ".total-recall-vault.json"),
+            "files": written,
+            "fileCount": len(written) + 1,
+            "eventCount": len(events),
+            "documentCount": len(documents),
+            "entityCount": len(entities),
+            "edgeCount": len(edges),
+            "authority": "ledger/checkpoints/anchors",
+            "note": "Vault is a derived Obsidian projection; Total Recall remains authority.",
+        }
+
+    def _obsidian_index_markdown(
+        self,
+        *,
+        state: Dict[str, Any],
+        events: List[Dict[str, Any]],
+        entities: List[Dict[str, Any]],
+        edges: List[Dict[str, Any]],
+        documents: Dict[str, List[Dict[str, Any]]],
+        entity_pages: Dict[str, str],
+        document_pages: Dict[str, str],
+    ) -> str:
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": "index",
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "generated_at": utc_now(),
+                    "total_recall_home": str(self.home),
+                    "state_hash": state.get("state_hash"),
+                    "last_event_hash": state.get("last_event_hash"),
+                    "event_count": len(events),
+                    "entity_count": len(entities),
+                    "edge_count": len(edges),
+                    "document_count": len(documents),
+                }
+            ),
+            "# Total Recall Vault",
+            "",
+            "This vault is a derived Obsidian projection of Total Recall memory. The signed ledger, checkpoints, and anchors remain the authority.",
+            "",
+            "## Start Here",
+            f"- {_vault_link('Compiled Truth')}",
+            f"- {_vault_link('Graph Legend')}",
+            "- `Sources/` holds one cited ledger page per memory event.",
+            "- `Entities/` turns the derived knowledge graph into wikilinked pages.",
+            "- `Documents/` groups document-ingest chunks into readable source files.",
+            "- `Timeline/` groups memory by day.",
+            "",
+            "## Counts",
+            f"- Events exported: `{len(events)}`",
+            f"- Documents: `{len(documents)}`",
+            f"- Entities: `{len(entities)}`",
+            f"- Edges: `{len(edges)}`",
+            "",
+        ]
+        if documents:
+            lines.extend(["## Documents"])
+            for doc_path in sorted(documents)[:40]:
+                lines.append(f"- {_vault_link(document_pages[doc_path], doc_path)}")
+            if len(documents) > 40:
+                lines.append(f"- ... {len(documents) - 40} more")
+            lines.append("")
+        if entities:
+            lines.extend(["## Entities"])
+            for entity in entities[:40]:
+                entity_id = str(entity.get("entity_id") or "")
+                page = entity_pages.get(entity_id)
+                if page:
+                    label = str(entity.get("name") or entity_id)
+                    lines.append(f"- {_vault_link(page, label)} `{entity.get('type') or 'entity'}`")
+            if len(entities) > 40:
+                lines.append(f"- ... {len(entities) - 40} more")
+            lines.append("")
+        if events:
+            lines.extend(["## Recent Memory"])
+            for event in list(reversed(events))[:25]:
+                ref = _event_source_ref(event)
+                source_page = f"Sources/{_vault_slug(ref.replace(':', '_'))}"
+                lines.append(
+                    f"- `{event.get('timestamp')}` {_vault_link(source_page, _event_title(event))} "
+                    f"`{event.get('kind')}` `{event.get('scope')}`"
+                )
+            if len(events) > 25:
+                lines.append(f"- ... {len(events) - 25} more")
+            lines.append("")
+        lines.extend(
+            [
+                "## Edit Boundary",
+                "Edit these notes for reading and annotation. Changes become Total Recall memory only through `vault import-preview` and explicit owner promotion.",
+                "",
+            ]
+        )
+        return "\n".join(lines)
+
+    def _obsidian_graph_legend_markdown(self) -> str:
+        return "\n".join(
+            [
+                _vault_frontmatter({"type": "guide", "schema": OBSIDIAN_VAULT_SCHEMA_VERSION, "generated_at": utc_now()}),
+                "# Graph Legend",
+                "",
+                "Obsidian's graph view is powered by wikilinks generated from Total Recall's derived knowledge graph.",
+                "",
+                "## Node Types",
+                "- `Index.md`: the vault home.",
+                "- `Compiled Truth.md`: current derived truth projection with ledger citations.",
+                "- `Sources/`: authoritative evidence pages for each exported ledger event.",
+                "- `Entities/`: graph entities extracted from cited source events.",
+                "- `Documents/`: grouped document-ingest chunks.",
+                "- `Decisions/`, `Promises/`, `Tasks/`: convenience views over ledger events.",
+                "- `Timeline/`: day-by-day event pages.",
+                "",
+                "## Authority",
+                "The vault is disposable and regenerable. Total Recall's ledger, checkpoints, and anchors remain canonical.",
+                "",
+                "## Future Import",
+                "Two-way import is explicit: select edited notes, preview proposed ledger events, then promote them with owner approval.",
+                "",
+            ]
+        )
+
+    def _obsidian_compiled_truth_markdown(self) -> str:
+        prefix = _vault_frontmatter(
+            {"type": "compiled_truth", "schema": OBSIDIAN_VAULT_SCHEMA_VERSION, "generated_at": utc_now()}
+        )
+        try:
+            payload = self.knowledge_compiled_truth_show(format_="md")
+            body = str(payload.get("text") or "") if payload.get("ok") else ""
+        except Exception as exc:
+            body = f"# Total Recall Compiled Truth\n\nCompiled truth could not be generated during vault export: `{exc}`.\n"
+        if not body.strip():
+            body = "# Total Recall Compiled Truth\n\nNo compiled truth projection is available yet.\n"
+        return (
+            prefix
+            + body.strip()
+            + "\n\n## Vault Note\n\nThis page is regenerated from the local knowledge projection. Ledger citations remain the source of truth.\n"
+        )
+
+    def _obsidian_document_markdown(
+        self,
+        doc_path: str,
+        doc_events: List[Dict[str, Any]],
+        *,
+        source_pages: Dict[str, str],
+    ) -> str:
+        source_refs = [_event_source_ref(event) for event in doc_events]
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": "document",
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "document_path": doc_path,
+                    "chunk_count": len(doc_events),
+                    "source_refs": source_refs,
+                    "generated_at": utc_now(),
+                }
+            ),
+            f"# {doc_path}",
+            "",
+            "This note groups document-ingest chunks from the Total Recall ledger.",
+            "",
+            "## Source Chunks",
+        ]
+        for event in doc_events:
+            ref = _event_source_ref(event)
+            metadata = event.get("metadata") or {}
+            chunk = metadata.get("chunk_index") or "?"
+            total = metadata.get("chunk_count") or "?"
+            source_link = _vault_link(source_pages.get(ref, ""), f"chunk {chunk}/{total}") if source_pages.get(ref) else f"`{ref}`"
+            lines.append(f"- {source_link} `{ref}` evidence `{event.get('hash')}`")
+        lines.append("")
+        lines.append("## Extracts")
+        for event in doc_events[:20]:
+            ref = _event_source_ref(event)
+            metadata = event.get("metadata") or {}
+            chunk = metadata.get("chunk_index") or "?"
+            total = metadata.get("chunk_count") or "?"
+            lines.extend(
+                [
+                    "",
+                    f"### Chunk {chunk}/{total}",
+                    _vault_link(source_pages.get(ref, ""), ref) if source_pages.get(ref) else f"`{ref}`",
+                    "",
+                    _fenced_text(str(event.get("text") or "")[:1600]),
+                ]
+            )
+        if len(doc_events) > 20:
+            lines.append(f"\nAdditional chunks omitted from this document note: `{len(doc_events) - 20}`.")
+        lines.append("")
+        return "\n".join(lines)
+
+    def _obsidian_source_markdown(
+        self,
+        event: Dict[str, Any],
+        *,
+        entities: List[Dict[str, Any]],
+        edges: List[Dict[str, Any]],
+        entities_by_id: Dict[str, Dict[str, Any]],
+        entity_pages: Dict[str, str],
+        document_pages: Dict[str, str],
+    ) -> str:
+        metadata = event.get("metadata") or {}
+        ref = _event_source_ref(event)
+        doc_path = str(metadata.get("document_path") or "")
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": "source",
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "source_ref": ref,
+                    "event_id": event.get("event_id"),
+                    "event_hash": event.get("hash"),
+                    "kind": event.get("kind"),
+                    "scope": event.get("scope"),
+                    "session_id": event.get("session_id"),
+                    "timestamp": event.get("timestamp"),
+                    "document_path": doc_path or None,
+                    "generated_at": utc_now(),
+                }
+            ),
+            f"# {_event_title(event)}",
+            "",
+            f"- Source ref: `{ref}`",
+            f"- Evidence hash: `{event.get('hash')}`",
+            f"- Kind: `{event.get('kind')}`",
+            f"- Scope: `{event.get('scope')}`",
+            f"- Session: `{event.get('session_id')}`",
+            f"- Timestamp: `{event.get('timestamp')}`",
+            "",
+        ]
+        if doc_path and document_pages.get(doc_path):
+            lines.extend(["## Document", f"- {_vault_link(document_pages[doc_path], doc_path)}", ""])
+        if entities:
+            lines.extend(["## Entities"])
+            for entity in entities:
+                entity_id = str(entity.get("entity_id") or "")
+                page = entity_pages.get(entity_id)
+                label = str(entity.get("name") or entity_id)
+                lines.append(f"- {_vault_link(page, label) if page else label} `{entity.get('type')}` confidence `{entity.get('confidence')}`")
+            lines.append("")
+        if edges:
+            lines.extend(["## Relationships"])
+            for edge in edges:
+                source = entities_by_id.get(str(edge.get("source_entity_id") or ""), {})
+                target = entities_by_id.get(str(edge.get("target_entity_id") or ""), {})
+                source_page = entity_pages.get(str(edge.get("source_entity_id") or ""))
+                target_page = entity_pages.get(str(edge.get("target_entity_id") or ""))
+                source_label = str(source.get("name") or edge.get("source_entity_id") or "source")
+                target_label = str(target.get("name") or edge.get("target_entity_id") or "target")
+                source_link = _vault_link(source_page, source_label) if source_page else source_label
+                target_link = _vault_link(target_page, target_label) if target_page else target_label
+                lines.append(f"- {source_link} -- `{edge.get('relation')}` --> {target_link} evidence `{edge.get('evidence_hash')}`")
+            lines.append("")
+        lines.extend(["## Text", "", _fenced_text(str(event.get("text") or "")), ""])
+        return "\n".join(lines)
+
+    def _obsidian_entity_markdown(
+        self,
+        entity: Dict[str, Any],
+        *,
+        edges: List[Dict[str, Any]],
+        entities_by_id: Dict[str, Dict[str, Any]],
+        entity_pages: Dict[str, str],
+        source_pages: Dict[str, str],
+    ) -> str:
+        entity_id = str(entity.get("entity_id") or "")
+        source_ref = str(entity.get("source_ref") or "")
+        source_link = _vault_link(source_pages[source_ref], source_ref) if source_ref in source_pages else f"`{source_ref}`"
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": "entity",
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "entity_id": entity_id,
+                    "name": entity.get("name"),
+                    "entity_type": entity.get("type"),
+                    "source_ref": source_ref,
+                    "evidence_hash": entity.get("evidence_hash"),
+                    "confidence": entity.get("confidence"),
+                    "scope": entity.get("scope"),
+                    "created_at": entity.get("created_at"),
+                    "generated_at": utc_now(),
+                }
+            ),
+            f"# {entity.get('name') or entity_id}",
+            "",
+            f"- Type: `{entity.get('type')}`",
+            f"- Confidence: `{entity.get('confidence')}`",
+            f"- Evidence: {source_link}",
+            f"- Evidence hash: `{entity.get('evidence_hash')}`",
+            "",
+            "## Relationships",
+        ]
+        if not edges:
+            lines.append("- No exported relationships.")
+        for edge in edges:
+            source_id = str(edge.get("source_entity_id") or "")
+            target_id = str(edge.get("target_entity_id") or "")
+            other_id = target_id if source_id == entity_id else source_id
+            other = entities_by_id.get(other_id, {})
+            other_page = entity_pages.get(other_id)
+            other_label = str(other.get("name") or other_id or "unknown")
+            direction = "to" if source_id == entity_id else "from"
+            rel_source = str(edge.get("source_ref") or "")
+            rel_source_link = _vault_link(source_pages[rel_source], rel_source) if rel_source in source_pages else f"`{rel_source}`"
+            lines.append(
+                f"- `{edge.get('relation')}` {direction} {_vault_link(other_page, other_label) if other_page else other_label} "
+                f"via {rel_source_link} evidence `{edge.get('evidence_hash')}`"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _obsidian_category_markdown(
+        self,
+        kind: str,
+        event: Dict[str, Any],
+        *,
+        source_pages: Dict[str, str],
+    ) -> str:
+        ref = _event_source_ref(event)
+        source_link = _vault_link(source_pages[ref], ref) if ref in source_pages else f"`{ref}`"
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": kind.lower(),
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "source_ref": ref,
+                    "event_id": event.get("event_id"),
+                    "event_hash": event.get("hash"),
+                    "scope": event.get("scope"),
+                    "session_id": event.get("session_id"),
+                    "timestamp": event.get("timestamp"),
+                    "generated_at": utc_now(),
+                }
+            ),
+            f"# {kind}: {_event_title(event)}",
+            "",
+            f"- Evidence: {source_link}",
+            f"- Evidence hash: `{event.get('hash')}`",
+            "",
+            "## Text",
+            "",
+            _fenced_text(str(event.get("text") or "")),
+            "",
+        ]
+        return "\n".join(lines)
+
+    def _obsidian_timeline_markdown(
+        self,
+        day: str,
+        events: List[Dict[str, Any]],
+        *,
+        source_pages: Dict[str, str],
+    ) -> str:
+        lines = [
+            _vault_frontmatter(
+                {
+                    "type": "timeline",
+                    "schema": OBSIDIAN_VAULT_SCHEMA_VERSION,
+                    "day": day,
+                    "event_count": len(events),
+                    "generated_at": utc_now(),
+                }
+            ),
+            f"# {day}",
+            "",
+        ]
+        for event in sorted(events, key=lambda item: str(item.get("timestamp") or "")):
+            ref = _event_source_ref(event)
+            source_link = _vault_link(source_pages[ref], _event_title(event)) if ref in source_pages else f"`{ref}`"
+            tags = []
+            if _event_looks_decision(event):
+                tags.append("decision")
+            if _event_looks_promise(event):
+                tags.append("promise")
+            if _event_looks_task(event):
+                tags.append("task")
+            tag_text = f" {' '.join('#' + tag for tag in tags)}" if tags else ""
+            lines.append(
+                f"- `{event.get('timestamp')}` {source_link} `{event.get('kind')}` `{event.get('scope')}`{tag_text}"
+            )
+        lines.append("")
+        return "\n".join(lines)
+
+    def _document_candidates(self, paths: Sequence[str | Path], *, recursive: bool) -> List[Tuple[Path, Path, bool]]:
+        candidates: List[Tuple[Path, Path, bool]] = []
+        seen = set()
+        for raw in paths:
+            path = Path(raw).expanduser()
+            if not path.exists():
+                candidates.append((path, path.parent, True))
+                continue
+            if path.is_file():
+                resolved = path.resolve()
+                if resolved not in seen:
+                    candidates.append((path, path.parent, True))
+                    seen.add(resolved)
+                continue
+            if not path.is_dir():
+                candidates.append((path, path.parent, True))
+                continue
+            iterator = path.rglob("*") if recursive else path.iterdir()
+            for item in sorted(iterator):
+                if not item.is_file():
+                    continue
+                resolved = item.resolve()
+                if resolved in seen:
+                    continue
+                candidates.append((item, path, False))
+                seen.add(resolved)
+        return candidates
+
+    def _prepare_document_file(
+        self,
+        path: Path,
+        *,
+        root: Path,
+        explicit: bool,
+        include_extensions: set[str],
+        exclude_globs: set[str],
+        max_file_bytes: int,
+        chunk_chars: int,
+        ingest_id: str,
+        session_id: str,
+        scope: str,
+    ) -> Dict[str, Any]:
+        display_path = _display_document_path(path, root=root)
+        file_info: Dict[str, Any] = {
+            "path": str(path),
+            "documentPath": display_path,
+            "status": "skipped",
+            "chunks": 0,
+        }
+        if not path.exists():
+            file_info["reason"] = "missing"
+            return {"file": file_info, "events": []}
+        if not path.is_file():
+            file_info["reason"] = "not_a_file"
+            return {"file": file_info, "events": []}
+        if not explicit and _is_ignored_document_path(path, root=root, exclude_globs=exclude_globs):
+            file_info["reason"] = "ignored_path"
+            return {"file": file_info, "events": []}
+        suffix = path.suffix.lower()
+        if suffix not in include_extensions:
+            file_info["reason"] = "unsupported_extension"
+            file_info["extension"] = suffix
+            return {"file": file_info, "events": []}
+        stat = path.stat()
+        file_info["bytes"] = stat.st_size
+        file_info["extension"] = suffix
+        if stat.st_size > max(1, int(max_file_bytes)):
+            file_info["reason"] = "file_too_large"
+            file_info["maxFileBytes"] = max_file_bytes
+            return {"file": file_info, "events": []}
+        raw = path.read_bytes()
+        if _looks_binary(raw):
+            file_info["reason"] = "binary_or_unsupported_text"
+            return {"file": file_info, "events": []}
+        text = raw.decode("utf-8-sig", errors="replace").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text:
+            file_info["reason"] = "empty"
+            return {"file": file_info, "events": []}
+        file_hash = hashlib.sha256(raw).hexdigest()
+        chunks = _chunk_document_text(text, max_chars=chunk_chars)
+        file_info.update(
+            {
+                "status": "planned",
+                "reason": "",
+                "chunks": len(chunks),
+                "sha256": file_hash,
+            }
+        )
+        events = []
+        for index, chunk in enumerate(chunks, start=1):
+            chunk_text = f"Document: {display_path}\nChunk: {index}/{len(chunks)}\n\n{chunk}".strip()
+            events.append(
+                {
+                    "event_id": self._new_id("evt"),
+                    "timestamp": utc_now(),
+                    "kind": "document",
+                    "session_id": session_id or "documents",
+                    "scope": scope,
+                    "source": f"document:{display_path}",
+                    "text": chunk_text,
+                    "metadata": {
+                        "schema": DOCUMENT_INGEST_SCHEMA_VERSION,
+                        "document_ingest_id": ingest_id,
+                        "document_path": display_path,
+                        "file_name": path.name,
+                        "file_extension": suffix,
+                        "file_sha256": file_hash,
+                        "file_size_bytes": stat.st_size,
+                        "chunk_index": index,
+                        "chunk_count": len(chunks),
+                        "chunk_chars": len(chunk),
+                    },
+                }
+            )
+        return {"file": file_info, "events": events}
 
     def sync_turn(
         self,
@@ -673,8 +2120,10 @@ class TotalRecallCore:
                 "metadata": event.get("metadata") or {},
             })
 
+        # Reports are generated audit artifacts. They can contain prior search
+        # payloads and rehydrate output, so indexing them lets Total Recall
+        # recursively recall its own recall transcripts.
         for directory, kind in (
-            (self.home / "reports", "report"),
             (self.home / "incidents", "incident"),
             (self.home / "checkpoints", "checkpoint"),
         ):
@@ -861,6 +2310,8 @@ class TotalRecallCore:
             "incidents",
             "external-memory",
             "keys",
+            "reviews",
+            "federation",
         ]
         if include_index:
             include_dirs.append("index")
@@ -951,7 +2402,7 @@ class TotalRecallCore:
                     return {"ok": False, "error": "manifest_hash_mismatch", "path": str(rel)}
 
             if replace:
-                for rel_dir in ("ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "keys", "index"):
+                for rel_dir in ("ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "keys", "index", "reviews", "federation"):
                     shutil.rmtree(self.home / rel_dir, ignore_errors=True)
             self._ensure_layout()
             for item in manifest.get("files", []):
@@ -976,7 +2427,7 @@ class TotalRecallCore:
         def add(name: str, ok: bool, **details: Any) -> None:
             checks.append({"name": name, "ok": ok, **details})
 
-        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys"]
+        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys", "knowledge", "reviews", "federation"]
         for rel_dir in required_dirs:
             add(f"dir:{rel_dir}", (self.home / rel_dir).is_dir(), path=str(self.home / rel_dir))
 
@@ -1002,15 +2453,430 @@ class TotalRecallCore:
             add("derived_index_status", False, error=str(exc))
 
         try:
+            knowledge_status = self.knowledge_status()
+            add("knowledge_engine_status", bool(knowledge_status.get("ok")), status=knowledge_status.get("status"), index=knowledge_status.get("index"), graph=knowledge_status.get("graph"))
+        except Exception as exc:
+            add("knowledge_engine_status", False, error=str(exc))
+
+        try:
             public_key = self._ed25519_public_key_hex()
             add("ed25519_public_key", bool(public_key), keyId=self._key_id())
         except Exception as exc:
             add("ed25519_public_key", False, error=str(exc))
 
-        ok = all(check.get("ok") for check in checks if check["name"] != "checkpoint_present") and latest_checkpoint is not None
+        advisory_checks = {"checkpoint_present", "knowledge_engine_status"}
+        ok = all(check.get("ok") for check in checks if check["name"] not in advisory_checks) and latest_checkpoint is not None
         payload = {"ok": ok, "status": "PASS" if ok else "DEGRADED", "home": str(self.home), "checks": checks}
         payload["report"] = self._write_report("doctor", "latest", payload)
         return payload
+
+    def trust_gate_status(self) -> Dict[str, Any]:
+        latest = self.home / "reports" / "trust_gate_latest.json"
+        if not latest.exists():
+            return {"ok": False, "status": "NO_TRUST_GATE", "error": "trust_gate_report_not_found", "reportFile": str(latest)}
+        payload = self._read_json(latest)
+        return {"ok": bool(payload.get("ok")), "status": payload.get("status") or "UNKNOWN", "reportFile": str(latest), **payload}
+
+    def trust_gate_run(self, *, persist: bool = True) -> Dict[str, Any]:
+        self._ensure_layout()
+        gate_id = f"gate_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
+        checks: List[Dict[str, Any]] = []
+        state: Dict[str, Any] = {}
+
+        def add(name: str, ok: bool, summary: str, *, evidence: Optional[Dict[str, Any]] = None, severity: str = "required") -> None:
+            checks.append(self._trust_gate_check(name, ok, summary, evidence=evidence, severity=severity))
+
+        try:
+            state = self.reduce_state(write=True)
+            add(
+                "real_store_ledger_hash_chain",
+                True,
+                "Ledger reduces with hash-chain verification enabled.",
+                evidence={
+                    "eventCount": state.get("event_count"),
+                    "stateHash": state.get("state_hash"),
+                    "lastEventHash": state.get("last_event_hash"),
+                },
+            )
+        except Exception as exc:
+            add("real_store_ledger_hash_chain", False, f"Ledger hash-chain verification failed: {exc}", evidence={"error": str(exc)})
+            state = {"event_count": -1}
+
+        event_count = int(state.get("event_count") or 0)
+        latest_checkpoint = self._latest_file(self.home / "checkpoints", "*.json")
+        if event_count <= 0 and latest_checkpoint is None:
+            add(
+                "real_store_checkpoint_anchor_current",
+                True,
+                "Empty store has no ledger events requiring a checkpoint yet.",
+                evidence={"eventCount": event_count, "checkpointFile": None},
+            )
+        elif latest_checkpoint is None:
+            add(
+                "real_store_checkpoint_anchor_current",
+                False,
+                "Ledger has events but no checkpoint/anchor to pin durable state.",
+                evidence={"eventCount": event_count, "checkpointFile": None},
+            )
+        else:
+            verification = self.verify(checkpoint_file=str(latest_checkpoint))
+            lag = int(verification.get("checkpointLagEvents") or 0)
+            add(
+                "real_store_checkpoint_anchor_current",
+                bool(verification.get("ok")) and lag == 0,
+                "Latest checkpoint and signed anchor verify and pin the current ledger state.",
+                evidence={
+                    "verificationStatus": verification.get("status"),
+                    "failures": verification.get("failures") or [],
+                    "warnings": verification.get("warnings") or [],
+                    "checkpointLagEvents": lag,
+                    "checkpointFile": str(latest_checkpoint),
+                },
+            )
+
+        try:
+            index_status = self.index_status(state=state if state.get("event_count", -1) >= 0 else None)
+            if not index_status.get("fresh"):
+                rebuilt = self.rebuild_index(backends=["sqlite-fts"])
+                index_status = rebuilt.get("index") or self.index_status()
+            add(
+                "real_store_core_index_rebuildable",
+                bool(index_status.get("fresh")),
+                "Core retrieval index is fresh or was rebuilt from the ledger.",
+                evidence={
+                    "fresh": index_status.get("fresh"),
+                    "backends": index_status.get("backends"),
+                    "eventCount": index_status.get("eventCount"),
+                },
+            )
+        except Exception as exc:
+            add("real_store_core_index_rebuildable", False, f"Core retrieval index check failed: {exc}", evidence={"error": str(exc)})
+
+        try:
+            knowledge_status = self.knowledge_status()
+            knowledge_index = knowledge_status.get("index") or {}
+            if not knowledge_index.get("fresh"):
+                self.knowledge_index_rebuild()
+                knowledge_status = self.knowledge_status()
+                knowledge_index = knowledge_status.get("index") or {}
+            graph = knowledge_status.get("graph") or {}
+            add(
+                "real_store_knowledge_authority",
+                bool(knowledge_status.get("ok")) and bool(knowledge_index.get("fresh")) and graph.get("uncitedActiveItems", 0) == 0,
+                "Knowledge Engine derives from the current ledger and graph evidence remains cited.",
+                evidence={
+                    "status": knowledge_status.get("status"),
+                    "indexFresh": knowledge_index.get("fresh"),
+                    "sourceCount": knowledge_index.get("sourceCount"),
+                    "graphStatus": graph.get("status"),
+                    "uncitedActiveItems": graph.get("uncitedActiveItems"),
+                },
+            )
+        except Exception as exc:
+            add("real_store_knowledge_authority", False, f"Knowledge Engine authority check failed: {exc}", evidence={"error": str(exc)})
+
+        checks.extend(self._trust_gate_fixture_checks())
+        checks.append(self._trust_gate_export_import_check(state))
+        checks.extend(self._trust_gate_hermes_bundle_checks())
+
+        failed_required = [check for check in checks if check.get("severity") == "required" and not check.get("ok")]
+        failed_advisory = [check for check in checks if check.get("severity") != "required" and not check.get("ok")]
+        ok = not failed_required
+        payload = {
+            "ok": ok,
+            "status": "PASS" if ok else "FAIL_CLOSED",
+            "schema": TRUST_GATE_SCHEMA_VERSION,
+            "gate_id": gate_id,
+            "created_at": utc_now(),
+            "home": str(self.home),
+            "authority": "hard-coded-runtime-checks-not-docs-or-agent-vibes",
+            "summary": {
+                "totalChecks": len(checks),
+                "passed": sum(1 for check in checks if check.get("ok")),
+                "failedRequired": len(failed_required),
+                "failedAdvisory": len(failed_advisory),
+            },
+            "failedRequired": [check["name"] for check in failed_required],
+            "failedAdvisory": [check["name"] for check in failed_advisory],
+            "releaseGate": {
+                "publicFacingPlugin": ok,
+                "minimumRequiredChecks": len([check for check in checks if check.get("severity") == "required"]),
+                "failedRequired": [check["name"] for check in failed_required],
+            },
+            "checks": checks,
+        }
+        if persist:
+            payload["report"] = self._write_report("trust_gate", gate_id, payload)
+            self._write_json(self.home / "reports" / "trust_gate_latest.json", payload)
+            if not ok:
+                incident = self.create_incident(
+                    title="Trust gate failed",
+                    severity="FAIL_CLOSED",
+                    summary=", ".join(payload["failedRequired"]),
+                    metadata={
+                        "gate_id": gate_id,
+                        "failedRequired": payload["failedRequired"],
+                        "report": payload.get("report"),
+                        "created_at": payload.get("created_at"),
+                    },
+                )
+                payload["incident"] = incident.get("incident")
+        return payload
+
+    def _trust_gate_fixture_checks(self) -> List[Dict[str, Any]]:
+        checks: List[Dict[str, Any]] = []
+
+        def add(name: str, ok: bool, summary: str, *, evidence: Optional[Dict[str, Any]] = None, severity: str = "required") -> None:
+            checks.append(self._trust_gate_check(name, ok, summary, evidence=evidence, severity=severity))
+
+        try:
+            with tempfile.TemporaryDirectory(prefix="total-recall-trust-gate-") as tmp:
+                root = Path(tmp)
+                home = root / "store"
+                fed_home = root / "federated"
+                imported_home = root / "imported"
+                core = TotalRecallCore(TotalRecallConfig(home=home, enable_lancedb=False, enable_qmd=False))
+
+                first = core.ingest_source(
+                    source_type="meeting",
+                    title="January Promise Review",
+                    text="Decision: Brand promise is same-day delivery.",
+                    occurred_at="2026-01-10T10:00:00Z",
+                    scope="public",
+                    session_id="trust-gate",
+                    metadata={"freshness_category": "promise"},
+                )
+                second = core.ingest_source(
+                    source_type="slack",
+                    title="February Promise Update",
+                    text="Decision: Brand promise is seven-day fulfillment. This supersedes old same-day promise.",
+                    occurred_at="2026-02-10T10:00:00Z",
+                    scope="public",
+                    session_id="trust-gate",
+                    metadata={"freshness_category": "promise"},
+                )
+                events = core._read_events(verify_chain=True)
+                source_events = [event for event in events if str(event.get("kind") or "").startswith("source_")]
+                add(
+                    "fixture_source_ingest_ledgered",
+                    bool(first.get("ok")) and bool(second.get("ok")) and len(source_events) == 2 and source_events[0].get("hash") and source_events[1].get("prev_hash") == source_events[0].get("hash"),
+                    "Working-context source ingest writes hash-chained ledger events with effective timestamps.",
+                    evidence={
+                        "sourceKinds": [event.get("kind") for event in source_events],
+                        "occurredAt": [(event.get("metadata") or {}).get("occurred_at") for event in source_events],
+                    },
+                )
+
+                core.knowledge_index_rebuild()
+                freshness = core.knowledge_freshness_report(
+                    entity="brand promise",
+                    category="promise",
+                    at_time="2026-03-01T00:00:00Z",
+                    allowed_scopes=["public"],
+                )
+                counts = freshness.get("counts") or {}
+                add(
+                    "fixture_freshness_supersession",
+                    bool(freshness.get("ok")) and counts.get("current") == 1 and counts.get("superseded") == 1,
+                    "Freshness reporting distinguishes current from superseded promises.",
+                    evidence={"counts": counts, "itemCount": len(freshness.get("items") or [])},
+                )
+
+                timeline = core.knowledge_graph_timeline(
+                    "brand promise",
+                    at_time="2026-01-20T00:00:00Z",
+                    allowed_scopes=["public"],
+                )
+                as_of_text = canonical_json(timeline.get("asOf") or [])
+                after_text = canonical_json(timeline.get("afterAsOf") or [])
+                add(
+                    "fixture_temporal_graph_timeline",
+                    bool(timeline.get("ok")) and "same-day delivery" in as_of_text and "seven-day fulfillment" in after_text,
+                    "Temporal graph timeline separates as-of evidence from later changes.",
+                    evidence={"asOfCount": len(timeline.get("asOf") or []), "afterAsOfCount": len(timeline.get("afterAsOf") or [])},
+                )
+
+                vault = root / "vault"
+                exported_vault = core.export_obsidian_vault(vault, allowed_scopes=["public"], force=True)
+                edited = vault / "Edited Promise.md"
+                edited.write_text(
+                    "---\ntype: \"edited_note\"\n---\n# Edited Promise\n\nDecision: Storefront promise is seven-day fulfillment after owner review.\n",
+                    encoding="utf-8",
+                )
+                before_preview_count = core.health()["eventCount"]
+                preview = core.vault_import_preview(vault, notes=["Edited Promise.md"], session_id="trust-gate-import", scope="internal")
+                after_preview_count = core.health()["eventCount"]
+                preview_path = core.home / "reviews" / "obsidian" / f"{preview.get('preview_id')}.json"
+                add(
+                    "fixture_obsidian_preview_no_ledger_write",
+                    bool(exported_vault.get("ok")) and bool(preview.get("ok")) and preview.get("proposalCount") == 1 and before_preview_count == after_preview_count and preview_path.exists(),
+                    "Obsidian import preview creates a review artifact without mutating the ledger.",
+                    evidence={
+                        "vaultExportOk": exported_vault.get("ok"),
+                        "proposalCount": preview.get("proposalCount"),
+                        "eventCountBefore": before_preview_count,
+                        "eventCountAfter": after_preview_count,
+                        "previewFile": str(preview_path),
+                    },
+                )
+                promoted = core.vault_import_promote(str(preview.get("preview_id") or ""))
+                promoted_path = core.home / "reviews" / "obsidian" / "promoted" / f"{preview.get('preview_id')}.json"
+                promoted_events = promoted.get("events") or []
+                add(
+                    "fixture_obsidian_promote_ledgered",
+                    bool(promoted.get("ok")) and promoted.get("eventCount") == 1 and promoted_events and promoted_events[0].get("kind") == "obsidian_note_import" and promoted_path.exists(),
+                    "Obsidian import promotion writes explicit owner-reviewed ledger events.",
+                    evidence={"eventCount": promoted.get("eventCount"), "eventKind": promoted_events[0].get("kind") if promoted_events else None},
+                )
+
+                federated = TotalRecallCore(TotalRecallConfig(home=fed_home, enable_lancedb=False, enable_qmd=False))
+                federated.ingest(kind="note", text="Federated workspace return policy is thirty-day returns.", session_id="fed", scope="public")
+                federated.knowledge_index_rebuild()
+                registered = core.federation_register("agent-beta", fed_home, role="hermes-agent", scopes=["public"])
+                blocked = core.federation_query("return policy", targets=["agent-beta"], allowed_scopes=["public"])
+                allowed = core.federation_query("return policy", targets=["agent-beta"], authorize=True, allowed_scopes=["public"])
+                blocked_federation = blocked.get("federation") or {}
+                allowed_federation = allowed.get("federation") or {}
+                workspaces = allowed_federation.get("workspaces") or []
+                add(
+                    "fixture_federation_authorization_required",
+                    bool(registered.get("ok")) and blocked_federation.get("status") == "AUTHORIZATION_REQUIRED" and not blocked_federation.get("workspaces"),
+                    "Federation refuses to read another workspace without explicit authorization.",
+                    evidence={"blockedStatus": blocked_federation.get("status"), "workspaceCount": len(blocked_federation.get("workspaces") or [])},
+                )
+                add(
+                    "fixture_federation_workspace_separated",
+                    bool(workspaces and workspaces[0].get("citations")) and allowed_federation.get("merged") is False,
+                    "Authorized federation returns cited, workspace-separated results without silent merge.",
+                    evidence={"authorized": allowed_federation.get("authorized"), "merged": allowed_federation.get("merged"), "workspaceCount": len(workspaces)},
+                )
+
+                checkpoint = core.checkpoint(session_id="trust-gate", label="trust_gate_fixture")
+                verification = core.verify(session_id="trust-gate")
+                bundle = root / "fixture-export.tar.gz"
+                exported = core.export_bundle(str(bundle))
+                imported = TotalRecallCore(TotalRecallConfig(home=imported_home, enable_lancedb=False, enable_qmd=False))
+                imported_result = imported.import_bundle(str(bundle))
+                imported_state = imported.reduce_state(write=True)
+                add(
+                    "fixture_persistence_checkpoint_export_import",
+                    bool(checkpoint.get("ok")) and bool(verification.get("ok")) and bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == core.health().get("eventCount"),
+                    "Checkpoint, signed verify, export manifest, and import restore preserve the fixture ledger.",
+                    evidence={
+                        "verifyStatus": verification.get("status"),
+                        "exportFileCount": exported.get("fileCount"),
+                        "importedEventCount": imported_state.get("event_count"),
+                    },
+                )
+        except Exception as exc:
+            add("fixture_trust_gate_harness_exception", False, f"Trust gate fixture harness failed: {exc}", evidence={"error": str(exc)})
+        return checks
+
+    def _trust_gate_export_import_check(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            event_count = int(state.get("event_count") or 0)
+            if event_count <= 0:
+                return self._trust_gate_check(
+                    "real_store_export_import_round_trip",
+                    True,
+                    "Empty real store has no ledger payload requiring export/import proof yet.",
+                    evidence={"eventCount": event_count},
+                )
+            with tempfile.TemporaryDirectory(prefix="total-recall-real-roundtrip-") as tmp:
+                root = Path(tmp)
+                bundle = root / "real-store.tar.gz"
+                exported = self.export_bundle(str(bundle))
+                imported = TotalRecallCore(TotalRecallConfig(home=root / "imported", enable_lancedb=False, enable_qmd=False))
+                imported_result = imported.import_bundle(str(bundle))
+                imported_state = imported.reduce_state(write=True)
+                return self._trust_gate_check(
+                    "real_store_export_import_round_trip",
+                    bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == event_count and imported_state.get("last_event_hash") == state.get("last_event_hash"),
+                    "Real store can be exported, manifest-verified, imported, and reduced to the same ledger point.",
+                    evidence={
+                        "exportOk": exported.get("ok"),
+                        "importOk": imported_result.get("ok"),
+                        "eventCount": event_count,
+                        "importedEventCount": imported_state.get("event_count"),
+                        "lastEventHash": state.get("last_event_hash"),
+                        "importedLastEventHash": imported_state.get("last_event_hash"),
+                    },
+                )
+        except Exception as exc:
+            return self._trust_gate_check("real_store_export_import_round_trip", False, f"Real store export/import proof failed: {exc}", evidence={"error": str(exc)})
+
+    def _trust_gate_hermes_bundle_checks(self) -> List[Dict[str, Any]]:
+        checks: List[Dict[str, Any]] = []
+        try:
+            from . import hermes_installer
+
+            generated = hermes_installer.plugin_files()
+            yaml_text = str(generated.get("plugin.yaml") or "")
+            init_text = str(generated.get("__init__.py") or "")
+            missing_generated = sorted(tool for tool in TRUST_GATE_REQUIRED_HERMES_TOOLS if tool not in yaml_text)
+            provider_ok = "TotalRecallMemoryProvider" in init_text and "register" in init_text
+
+            repo_source = hermes_installer.repo_plugin_source()
+            missing_repo: List[str] = []
+            repo_ok = True
+            if repo_source is not None:
+                repo_yaml = (repo_source / "plugin.yaml").read_text(encoding="utf-8")
+                repo_init = (repo_source / "__init__.py").read_text(encoding="utf-8")
+                missing_repo = sorted(tool for tool in TRUST_GATE_REQUIRED_HERMES_TOOLS if tool not in repo_yaml)
+                repo_ok = not missing_repo and "TotalRecallMemoryProvider" in repo_init and "register" in repo_init
+
+            with tempfile.TemporaryDirectory(prefix="total-recall-hermes-bundle-gate-") as tmp:
+                bundle_path = Path(tmp) / "total-recall-hermes-plugin.tar.gz"
+                bundled = hermes_installer.bundle_plugin(out=str(bundle_path), force=True)
+                bundled_yaml = ""
+                names: List[str] = []
+                if bundle_path.exists():
+                    with tarfile.open(bundle_path, "r:gz") as tar:
+                        names = sorted(tar.getnames())
+                        member = tar.extractfile("total-recall/plugin.yaml")
+                        if member is not None:
+                            bundled_yaml = member.read().decode("utf-8")
+                missing_bundled = sorted(tool for tool in TRUST_GATE_REQUIRED_HERMES_TOOLS if tool not in bundled_yaml)
+
+            checks.append(
+                self._trust_gate_check(
+                    "fixture_hermes_plugin_bundle_surface",
+                    not missing_generated and provider_ok and repo_ok and bool(bundled.get("ok")) and not missing_bundled,
+                    "Hermes plugin generator, repo bundle, and distributable tar expose the required memory-provider tools.",
+                    evidence={
+                        "requiredTools": sorted(TRUST_GATE_REQUIRED_HERMES_TOOLS),
+                        "missingGenerated": missing_generated,
+                        "missingRepo": missing_repo,
+                        "missingBundled": missing_bundled,
+                        "providerEntrypointOk": provider_ok,
+                        "repoPluginSource": str(repo_source) if repo_source else None,
+                        "bundleOk": bundled.get("ok"),
+                        "bundleMembers": names,
+                    },
+                )
+            )
+        except Exception as exc:
+            checks.append(self._trust_gate_check("fixture_hermes_plugin_bundle_surface", False, f"Hermes plugin bundle proof failed: {exc}", evidence={"error": str(exc)}))
+        return checks
+
+    @staticmethod
+    def _trust_gate_check(
+        name: str,
+        ok: bool,
+        summary: str,
+        *,
+        evidence: Optional[Dict[str, Any]] = None,
+        severity: str = "required",
+    ) -> Dict[str, Any]:
+        return {
+            "name": name,
+            "ok": bool(ok),
+            "severity": severity,
+            "status": "PASS" if ok else "FAIL",
+            "summary": summary,
+            "evidence": evidence or {},
+            "checked_at": utc_now(),
+        }
 
     def backup_status(self, out_dir: str) -> Dict[str, Any]:
         directory = Path(out_dir).expanduser()
@@ -1741,10 +3607,27 @@ class TotalRecallCore:
             "external-memory/rejected",
             "index",
             "keys",
+            "knowledge/index",
+            "knowledge/graph",
+            "knowledge/synthesis/staging",
+            "knowledge/synthesis/runs",
+            "knowledge/synthesis/promoted",
+            "knowledge/compiled",
+            "knowledge/quarantine",
+            "knowledge/reports",
+            "knowledge/eval",
+            "knowledge/providers",
+            "reviews/obsidian/promoted",
+            "federation",
         ):
             (self.home / rel).mkdir(parents=True, exist_ok=True)
         self.ledger_file.touch(exist_ok=True)
         self.lock_file.touch(exist_ok=True)
+
+    def _knowledge(self):
+        from .knowledge import KnowledgeEngine
+
+        return KnowledgeEngine(self)
 
     @contextmanager
     def _locked(self, *, shared: bool = False):
@@ -1998,6 +3881,28 @@ class TotalRecallCore:
             if path.exists():
                 return path
         return None
+
+    def _resolve_total_recall_home(self, path: Path) -> Path:
+        candidate = path.expanduser()
+        if (candidate / "ledger" / "events.jsonl").exists() or candidate.name == ".total-recall":
+            return candidate
+        if (candidate / ".total-recall" / "ledger" / "events.jsonl").exists():
+            return candidate / ".total-recall"
+        if (candidate / "total-recall" / "ledger" / "events.jsonl").exists():
+            return candidate / "total-recall"
+        return candidate
+
+    def _federation_registry(self) -> Dict[str, Any]:
+        path = self.home / "federation" / "targets.json"
+        if path.exists():
+            try:
+                payload = self._read_json(path)
+                payload.setdefault("schema", FEDERATION_SCHEMA_VERSION)
+                payload.setdefault("targets", {})
+                return payload
+            except Exception:
+                pass
+        return {"schema": FEDERATION_SCHEMA_VERSION, "created_at": utc_now(), "targets": {}}
 
     def _new_id(self, prefix: str) -> str:
         return f"{_safe_id(prefix)}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}"
