@@ -59,11 +59,36 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
         "total_recall_status",
         "total_recall_checkpoint",
         "total_recall_verify",
+        "total_recall_trust_verify",
         "total_recall_rehydrate",
         "total_recall_incidents",
+        "total_recall_source_ingest",
+        "total_recall_knowledge_query",
+        "total_recall_knowledge_freshness",
+        "total_recall_knowledge_status",
+        "total_recall_knowledge_synthesis_status",
+        "total_recall_knowledge_compiled_truth",
+        "total_recall_knowledge_graph_inspect",
+        "total_recall_knowledge_graph_timeline",
+        "total_recall_federation_query",
     }
 
     provider.sync_turn("remember plugin lifecycle", "stored", session_id="s1")
+    source = json.loads(
+        provider.handle_tool_call(
+            "total_recall_source_ingest",
+            {
+                "source_type": "meeting",
+                "text": "Decision: Plugin promise is day-one install.",
+                "title": "Plugin Launch Review",
+                "occurred_at": "2026-01-01T00:00:00Z",
+                "scope": "public",
+            },
+        )
+    )
+    assert source["ok"] is True
+    assert source["event"]["kind"] == "source_meeting"
+
     result = json.loads(provider.handle_tool_call("total_recall_search", {"query": "plugin lifecycle"}))
     assert result["ok"] is True
     assert result["results"]
@@ -75,6 +100,38 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     rehydrated = json.loads(provider.handle_tool_call("total_recall_rehydrate", {"session_id": "s1", "query": "plugin lifecycle"}))
     assert rehydrated["ok"] is True
     assert "Total Recall Rehydrate Authority" in rehydrated["context_block"]
+
+    knowledge = json.loads(
+        provider.handle_tool_call(
+            "total_recall_knowledge_query",
+            {"query": "plugin lifecycle", "session_id": "s1", "mode": "explore"},
+        )
+    )
+    assert knowledge["ok"] is True
+    assert knowledge["citations"]
+    assert knowledge["providerCalls"][0]["provider"] == "local-hash-rerank"
+
+    freshness = json.loads(provider.handle_tool_call("total_recall_knowledge_freshness", {"entity": "plugin promise", "category": "promise"}))
+    assert freshness["ok"] is True
+    assert freshness["items"]
+    assert freshness["items"][0]["subject"] == "Plugin promise"
+
+    truth = json.loads(provider.handle_tool_call("total_recall_knowledge_compiled_truth", {"action": "show", "format": "md"}))
+    assert truth["ok"] is True
+    assert "plugin lifecycle" in truth["text"]
+
+    graph = json.loads(provider.handle_tool_call("total_recall_knowledge_graph_inspect", {"entity": "lifecycle"}))
+    assert graph["ok"] is True
+    assert graph["entities"]
+    assert graph["citations"]
+
+    timeline = json.loads(provider.handle_tool_call("total_recall_knowledge_graph_timeline", {"entity": "plugin promise"}))
+    assert timeline["ok"] is True
+    assert timeline["timeline"]
+
+    fed = json.loads(provider.handle_tool_call("total_recall_federation_query", {"query": "plugin promise"}))
+    assert fed["ok"] is True
+    assert fed["federation"]["status"] == "NOT_REQUESTED"
 
 
 def test_plugin_pre_compress_and_session_switch_schedule_auto_rehydrate(tmp_path, monkeypatch):

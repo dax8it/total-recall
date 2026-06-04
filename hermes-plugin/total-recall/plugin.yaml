@@ -1,3 +1,26 @@
 name: total-recall
 version: 1.3.0
-description: "Total Recall — local deterministic continuity engine with ledger, checkpoints, signed anchors, verify, rehydrate, and derived LanceDB/QMD/SQLite retrieval."
+kind: memory-provider
+entrypoint: "__init__.py"
+provider_class: "TotalRecallMemoryProvider"
+requires_python: ">=3.11"
+python_dependencies:
+  - total-recall-core==1.3.0
+description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, compiled truth, and explicit federation."
+tools:
+  - total_recall_search
+  - total_recall_status
+  - total_recall_checkpoint
+  - total_recall_verify
+  - total_recall_trust_verify
+  - total_recall_rehydrate
+  - total_recall_incidents
+  - total_recall_source_ingest
+  - total_recall_knowledge_query
+  - total_recall_knowledge_freshness
+  - total_recall_knowledge_status
+  - total_recall_knowledge_synthesis_status
+  - total_recall_knowledge_compiled_truth
+  - total_recall_knowledge_graph_inspect
+  - total_recall_knowledge_graph_timeline
+  - total_recall_federation_query
