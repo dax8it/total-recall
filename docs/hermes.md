@@ -8,7 +8,7 @@ incidents written by the core.
 ## One-Command Install
 
 Install the core package into the Python environment Hermes actually uses,
-write the plugin bundle, enable it, select it for the profile, and verify it
+write the plugin bundle, select it for the profile, and verify it
 with one command:
 
 ```bash
@@ -22,15 +22,22 @@ environment only when the package is missing or the version is stale. It then
 writes a clean plugin bundle to:
 
 ```text
+~/.hermes/plugins/memory/total-recall
 ~/.hermes/plugins/total-recall
 ```
+
+The `plugins/memory/total-recall` path follows the public provider-plugin
+layout. The flat `plugins/total-recall` path is a compatibility provider path
+for Hermes v0.15.x, whose local memory loader scans `$HERMES_HOME/plugins/<name>`
+for user-installed memory providers. The manifest intentionally omits a
+general-plugin `kind` so Hermes auto-detects it as an exclusive memory provider
+instead of loading it as a normal tool plugin.
 
 It validates the bundle and, when `--profile <profile> --activate` is present,
 runs:
 
 ```bash
 <hermes-python> -m pip install --upgrade <this-checkout-or-total-recall-core-version>
-hermes plugins enable total-recall
 hermes -p <profile> config set memory.provider total-recall
 hermes -p <profile> memory status
 ```
@@ -78,6 +85,10 @@ total-recall hermes bundle --out dist/total-recall-hermes-plugin.tar.gz
 The archive contains:
 
 ```text
+memory/total-recall/
+  __init__.py
+  plugin.yaml
+  README.md
 total-recall/
   __init__.py
   plugin.yaml
@@ -141,7 +152,6 @@ Test on a non-live profile before switching an active agent:
 
 ```bash
 hermes profile create total-recall-smoke || true
-hermes plugins enable total-recall
 hermes -p total-recall-smoke config set memory.provider total-recall
 hermes -p total-recall-smoke memory status
 ```
@@ -171,7 +181,6 @@ total-recall hermes install --profile <profile> --activate
 Manual equivalent:
 
 ```bash
-hermes plugins enable total-recall
 hermes -p <profile> config set memory.provider total-recall
 hermes -p <profile> memory status
 ```

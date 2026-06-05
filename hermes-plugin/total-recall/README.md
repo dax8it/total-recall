@@ -26,15 +26,17 @@ total-recall hermes doctor
 
 The installer detects Hermes' Python environment, installs or upgrades
 `total-recall-core` there when needed, writes the plugin bundle to
-`~/.hermes/plugins/total-recall`, enables the plugin, selects it as the
-profile's memory provider, and verifies Hermes memory status.
+`~/.hermes/plugins/memory/total-recall`, also writes the flat
+`~/.hermes/plugins/total-recall` compatibility provider path used by Hermes
+v0.15.x, selects it as the profile's memory provider, and verifies Hermes
+memory status.
 
 Manual fallback:
 
 ```bash
-mkdir -p ~/.hermes/plugins
+mkdir -p ~/.hermes/plugins/memory
+cp -R total-recall ~/.hermes/plugins/memory/total-recall
 cp -R total-recall ~/.hermes/plugins/total-recall
-hermes plugins enable total-recall
 hermes -p <profile> config set memory.provider total-recall
 hermes -p <profile> memory status
 ```

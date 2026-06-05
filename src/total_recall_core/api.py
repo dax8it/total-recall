@@ -3098,7 +3098,7 @@ class TotalRecallCore:
                 if bundle_path.exists():
                     with tarfile.open(bundle_path, "r:gz") as tar:
                         names = sorted(tar.getnames())
-                        member = tar.extractfile("total-recall/plugin.yaml")
+                        member = tar.extractfile("memory/total-recall/plugin.yaml")
                         if member is not None:
                             bundled_yaml = member.read().decode("utf-8")
                 missing_bundled = sorted(tool for tool in TRUST_GATE_REQUIRED_HERMES_TOOLS if tool not in bundled_yaml)
@@ -3115,6 +3115,7 @@ class TotalRecallCore:
                         "missingBundled": missing_bundled,
                         "providerEntrypointOk": provider_ok,
                         "repoPluginSource": str(repo_source) if repo_source else None,
+                        "expectedBundleRoot": "memory/total-recall",
                         "bundleOk": bundled.get("ok"),
                         "bundleMembers": names,
                     },

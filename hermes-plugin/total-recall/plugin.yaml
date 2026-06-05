@@ -1,6 +1,5 @@
 name: total-recall
 version: 1.3.0
-kind: memory-provider
 entrypoint: "__init__.py"
 provider_class: "TotalRecallMemoryProvider"
 requires_python: ">=3.11"

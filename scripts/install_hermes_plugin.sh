@@ -29,7 +29,6 @@ The installer checks Hermes' Python environment and installs total-recall-core
 there unless you pass --core-install skip.
 
 If you did not pass --profile <profile> --activate, select it with:
-  hermes plugins enable total-recall
   hermes -p <profile> config set memory.provider total-recall
   hermes -p <profile> memory status
 

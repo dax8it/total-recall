@@ -27,15 +27,16 @@ Before sharing a release outside the private repo:
 - verify `total-recall hermes install --hermes-home <tmp> --force` writes a
   clean plugin bundle
 - verify `total-recall hermes status` resolves the default plugin location as
-  `~/.hermes/plugins/total-recall`
+  `~/.hermes/plugins/memory/total-recall` and the Hermes v0.15.x compatibility
+  location as `~/.hermes/plugins/total-recall`
 - verify `total-recall hermes doctor` reports the Hermes Python path and
   confirms `total-recall-core` is importable there
 - verify a fresh checkout install can use
   `total-recall hermes install --core-install always --profile <profile> --activate`
   to install or refresh the core package inside Hermes' own Python environment
 - verify `total-recall hermes bundle --out <tmp>/total-recall-hermes-plugin.tar.gz`
-  creates a tarball containing only `total-recall/__init__.py`,
-  `total-recall/plugin.yaml`, and `total-recall/README.md`
+  creates a tarball containing `memory/total-recall/{__init__.py,plugin.yaml,README.md}`
+  and `total-recall/{__init__.py,plugin.yaml,README.md}`
 - verify the Hermes plugin loads from `hermes-plugin/total-recall` and from an
   installed copy-mode bundle
 - if Hermes is available locally, verify

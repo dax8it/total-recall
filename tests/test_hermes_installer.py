@@ -41,9 +41,19 @@ def _load_plugin(path: Path):
 
 def test_hermes_installer_writes_clean_importable_bundle(tmp_path, monkeypatch):
     _install_fake_hermes_modules(monkeypatch)
-    installed = hermes_installer.install_plugin(hermes_home=str(tmp_path / "hermes"), force=True, core_install="skip")
+    hermes_home = tmp_path / "hermes"
+    compatibility_path = hermes_home / "plugins" / "total-recall"
+    compatibility_path.mkdir(parents=True)
+    (compatibility_path / "plugin.yaml").write_text("name: total-recall\n", encoding="utf-8")
+    (compatibility_path / "__init__.py").write_text("TotalRecallMemoryProvider = object\n", encoding="utf-8")
+
+    installed = hermes_installer.install_plugin(hermes_home=str(hermes_home), force=True, core_install="skip")
 
     assert installed["ok"] is True
+    assert installed["kind"] == "memory-provider"
+    assert installed["compatibilityInstall"]["status"] == "installed_copy"
+    assert compatibility_path.exists()
+    assert (compatibility_path / "plugin.yaml").is_file()
     plugin_path = Path(installed["path"])
     assert (plugin_path / "__init__.py").is_file()
     assert (plugin_path / "plugin.yaml").is_file()
@@ -65,13 +75,13 @@ def test_hermes_installer_default_path_matches_global_hermes_plugins(tmp_path, m
 
     path = hermes_installer.installed_plugin_path()
 
-    assert path == tmp_path / ".hermes" / "plugins" / "total-recall"
+    assert path == tmp_path / ".hermes" / "plugins" / "memory" / "total-recall"
 
 
 def test_hermes_installer_honors_explicit_hermes_home(tmp_path):
     path = hermes_installer.installed_plugin_path(hermes_home=str(tmp_path / "custom-hermes"))
 
-    assert path == tmp_path / "custom-hermes" / "plugins" / "total-recall"
+    assert path == tmp_path / "custom-hermes" / "plugins" / "memory" / "total-recall"
 
 
 def test_hermes_status_tolerates_runtime_python_cache(tmp_path):
@@ -166,7 +176,7 @@ else:
     assert ["-m", "pip", "install", "--upgrade", "/tmp/total-recall-core-test-source"] in recorded
 
 
-def test_hermes_activation_enables_plugin_and_selects_provider(tmp_path, monkeypatch):
+def test_hermes_activation_selects_memory_provider(tmp_path, monkeypatch):
     calls = tmp_path / "calls.jsonl"
     hermes = tmp_path / "hermes"
     hermes.write_text(
@@ -176,9 +186,7 @@ import sys
 from pathlib import Path
 
 Path({str(calls)!r}).open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[1:] == ["plugins", "enable", "total-recall"]:
-    print("enabled total-recall")
-elif sys.argv[1:] == ["-p", "smoke", "config", "set", "memory.provider", "total-recall"]:
+if sys.argv[1:] == ["-p", "smoke", "config", "set", "memory.provider", "total-recall"]:
     print("configured")
 elif sys.argv[1:] == ["-p", "smoke", "memory", "status"]:
     print("Plugin: installed OK")
@@ -197,7 +205,6 @@ else:
     assert result["ok"] is True
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
     assert recorded == [
-        ["plugins", "enable", "total-recall"],
         ["-p", "smoke", "config", "set", "memory.provider", "total-recall"],
         ["-p", "smoke", "memory", "status"],
     ]
@@ -210,6 +217,9 @@ def test_hermes_bundle_tarball_contains_complete_plugin(tmp_path):
     assert result["ok"] is True
     with tarfile.open(bundle, "r:gz") as tar:
         names = set(tar.getnames())
+    assert "memory/total-recall/__init__.py" in names
+    assert "memory/total-recall/plugin.yaml" in names
+    assert "memory/total-recall/README.md" in names
     assert "total-recall/__init__.py" in names
     assert "total-recall/plugin.yaml" in names
     assert "total-recall/README.md" in names

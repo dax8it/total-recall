@@ -7,7 +7,7 @@ Date: 2026-05-09
 | Area | Status | Evidence |
 |---|---:|---|
 | Standalone repo | PASS | Core, CLI, tests, docs, and Hermes plugin live in this repo. |
-| Core unit tests | PASS | `python -m pytest -q` -> 51 passed, 1 skipped. |
+| Core unit tests | PASS | `python -m pytest -q` -> 54 passed, 1 skipped. |
 | Hermes plugin lifecycle tests | PASS | Tests cover initialize, sync, source ingest, search, checkpoint, verify, rehydrate, pre-compress, session switch, context-threshold auto-rehydrate, freshness, graph timeline, federation query, and fail-closed tamper behavior. |
 | Fresh install smoke | PASS | `scripts/install_smoke.sh` installs package in a fresh virtualenv and runs health, ingest, document ingest, source ingest, freshness, temporal graph timeline, vault export, vault import preview/promote, federation register/query, search, checkpoint, verify, trust verify, rehydrate, doctor, export, import, restored verify, backup run, backup status, Hermes install/status, and Hermes bundle. |
 | Privacy scan | PASS | `python scripts/privacy_scan.py` reports no local paths or sensitive configuration strings. |
@@ -25,7 +25,7 @@ Date: 2026-05-09
 | Broader tamper matrix | PASS | Tests cover anchor tamper, ledger text changes, deleted/reordered ledger events, checkpoint mutation, missing anchors, and anchor hash mutation. |
 | Hermes install docs | PASS | Dedicated setup, smoke, provider, rehydrate, backup, and troubleshooting guide lives in `docs/hermes.md`. |
 | Admin dashboard | PASS | `total-recall dashboard` serves a local remote-MCP/admin-style control center with Trust Spine gates, Knowledge Engine operations, source ingest, freshness, graph timeline, Obsidian export/import review, remote provider readiness, backup download links, launchd plist generation, and count/day retention. |
-| Hermes plugin installer | PASS | `total-recall hermes install` writes a clean copy-mode plugin bundle, checks/installs `total-recall-core` into Hermes' Python, `total-recall hermes doctor` reports readiness, `total-recall hermes bundle` emits a distributable tarball with the expanded tool surface, and tests verify the installed wrapper imports through Hermes-style modules. |
+| Hermes plugin installer | PASS | `total-recall hermes install` writes a clean docs-style memory-provider bundle under `plugins/memory/total-recall` plus the flat `plugins/total-recall` compatibility provider path used by Hermes v0.15.x, checks/installs `total-recall-core` into Hermes' Python, `total-recall hermes doctor` reports readiness, `total-recall hermes bundle` emits a distributable tarball with the expanded tool surface, and tests verify the installed wrapper imports through Hermes-style modules. |
 
 ## Remaining Hardening
 
@@ -46,6 +46,6 @@ Expected local result:
 
 ```text
 Privacy scan passed.
-51 passed, 1 skipped
+54 passed, 1 skipped
 Install smoke passed.
 ```

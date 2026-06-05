@@ -139,6 +139,25 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     assert fed["federation"]["status"] == "NOT_REQUESTED"
 
 
+def test_plugin_save_config_writes_profile_local_memory_provider_config(tmp_path, monkeypatch):
+    module = _load_plugin(monkeypatch)
+    provider = module.TotalRecallMemoryProvider()
+    provider.save_config(
+        {
+            "home": str(tmp_path / "custom-recall"),
+            "auto_rehydrate.enabled": "false",
+            "auto_rehydrate.context_threshold": "0.82",
+        },
+        str(tmp_path),
+    )
+
+    text = (tmp_path / "config.yaml").read_text(encoding="utf-8")
+    assert "total-recall" in text
+    assert str(tmp_path / "custom-recall") in text
+    assert "false" in text.lower()
+    assert "0.82" in text
+
+
 def test_plugin_pre_compress_and_session_switch_schedule_auto_rehydrate(tmp_path, monkeypatch):
     module = _load_plugin(monkeypatch)
     provider = module.TotalRecallMemoryProvider()

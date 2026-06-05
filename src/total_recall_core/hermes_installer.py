@@ -90,15 +90,17 @@ total-recall hermes doctor
 
 The installer detects Hermes' Python environment, installs or upgrades
 `total-recall-core` there when needed, writes the plugin bundle to
-`~/.hermes/plugins/total-recall`, enables the plugin, selects it as the
-profile's memory provider, and verifies Hermes memory status.
+`~/.hermes/plugins/memory/total-recall`, also writes the flat
+`~/.hermes/plugins/total-recall` compatibility provider path used by Hermes
+v0.15.x, selects it as the profile's memory provider, and verifies Hermes
+memory status.
 
 Manual fallback:
 
 ```bash
-mkdir -p ~/.hermes/plugins
+mkdir -p ~/.hermes/plugins/memory
+cp -R total-recall ~/.hermes/plugins/memory/total-recall
 cp -R total-recall ~/.hermes/plugins/total-recall
-hermes plugins enable total-recall
 hermes -p <profile> config set memory.provider total-recall
 hermes -p <profile> memory status
 ```
@@ -113,7 +115,6 @@ def plugin_yaml() -> str:
     return (
         f"name: {PLUGIN_NAME}\n"
         f"version: {__version__}\n"
-        'kind: memory-provider\n'
         'entrypoint: "__init__.py"\n'
         'provider_class: "TotalRecallMemoryProvider"\n'
         'requires_python: ">=3.11"\n'
@@ -171,28 +172,75 @@ def _plugin_root(*, hermes_home: str = "", plugin_dir: str = "") -> Path:
 
 
 def installed_plugin_path(*, hermes_home: str = "", plugin_dir: str = "") -> Path:
+    return _plugin_root(hermes_home=hermes_home, plugin_dir=plugin_dir) / "memory" / PLUGIN_NAME
+
+
+def compatibility_plugin_path(*, hermes_home: str = "", plugin_dir: str = "") -> Path:
     return _plugin_root(hermes_home=hermes_home, plugin_dir=plugin_dir) / PLUGIN_NAME
 
 
-def legacy_memory_plugin_path(*, hermes_home: str = "", plugin_dir: str = "") -> Path:
-    root = _plugin_root(hermes_home=hermes_home, plugin_dir=plugin_dir)
-    return root / "memory" / PLUGIN_NAME
+def standalone_plugin_path(*, hermes_home: str = "", plugin_dir: str = "") -> Path:
+    """Backward-compatible name for the flat Hermes v0.15.x provider path."""
+    return compatibility_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
 
 
-def ensure_legacy_memory_link(destination: Path, *, force: bool = False) -> Dict[str, Any]:
-    legacy = destination.parent / "memory" / PLUGIN_NAME
-    if legacy.exists() or legacy.is_symlink():
-        if legacy.is_symlink() and legacy.resolve() == destination.resolve():
-            return {"ok": True, "status": "already_linked", "path": str(legacy)}
+def _looks_like_total_recall_plugin(path: Path) -> bool:
+    if path.is_symlink():
+        try:
+            return _looks_like_total_recall_plugin(path.resolve())
+        except OSError:
+            return True
+    plugin_yaml_path = path / "plugin.yaml"
+    init_path = path / "__init__.py"
+    try:
+        yaml_text = plugin_yaml_path.read_text(encoding="utf-8") if plugin_yaml_path.exists() else ""
+        init_text = init_path.read_text(encoding="utf-8") if init_path.exists() else ""
+    except OSError:
+        return False
+    return f"name: {PLUGIN_NAME}" in yaml_text or "TotalRecallMemoryProvider" in init_text
+
+
+def write_compatibility_plugin(destination: Path, *, mode: str, force: bool = False) -> Dict[str, Any]:
+    """Install the flat user-provider path used by Hermes v0.15.x."""
+    destination = destination.expanduser()
+    if destination.exists() or destination.is_symlink():
+        if not _looks_like_total_recall_plugin(destination):
+            return {
+                "ok": False,
+                "status": "foreign_plugin_at_compatibility_path",
+                "path": str(destination),
+                "message": "A non-Total Recall plugin exists at the flat user provider path.",
+            }
         if not force:
-            return {"ok": False, "error": "legacy_plugin_destination_exists", "path": str(legacy)}
-        if legacy.is_symlink() or legacy.is_file():
-            legacy.unlink()
+            return {
+                "ok": True,
+                "status": "already_installed",
+                "path": str(destination),
+                "message": "Flat user-provider compatibility bundle already exists.",
+            }
+        if destination.is_symlink() or destination.is_file():
+            destination.unlink()
         else:
-            shutil.rmtree(legacy)
-    legacy.parent.mkdir(parents=True, exist_ok=True)
-    legacy.symlink_to(destination, target_is_directory=True)
-    return {"ok": True, "status": "linked", "path": str(legacy), "target": str(destination)}
+            shutil.rmtree(destination)
+
+    if mode == "symlink":
+        source = repo_plugin_source()
+        if source is None:
+            return {"ok": False, "status": "SYMLINK_SOURCE_NOT_FOUND", "path": str(destination)}
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.symlink_to(source, target_is_directory=True)
+        return {
+            "ok": True,
+            "status": "installed_symlink",
+            "path": str(destination),
+            "source": str(source),
+            "message": "Installed flat user-provider compatibility symlink for Hermes v0.15.x.",
+        }
+
+    result = write_plugin_bundle(destination, force=True)
+    result["status"] = "installed_copy" if result.get("ok") else "install_failed"
+    result["message"] = "Installed flat user-provider compatibility copy for Hermes v0.15.x."
+    return result
 
 
 def repo_plugin_source() -> Path | None:
@@ -478,18 +526,22 @@ def install_plugin(
     core_source: str = "",
 ) -> Dict[str, Any]:
     destination = installed_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
+    compatibility = compatibility_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
     payload: Dict[str, Any] = {
         "ok": True,
         "plugin": PLUGIN_NAME,
         "version": __version__,
+        "kind": "memory-provider",
         "mode": mode,
         "path": str(destination),
+        "compatibilityPath": str(compatibility),
         "dryRun": dry_run,
     }
     if dry_run:
         payload["actions"] = [
             "ensure_core_in_hermes_python" if core_install != "skip" else "core_install_skipped",
-            "write_plugin_bundle",
+            "write_docs_memory_provider_bundle",
+            "write_flat_user_provider_compatibility_bundle",
             "activate_profile" if activate or profile else "activation_skipped",
         ]
         payload["core"] = {
@@ -533,7 +585,10 @@ def install_plugin(
 
     payload["validation"] = validate_plugin_bundle(destination, strict_clean=(mode != "symlink"))
     payload["ok"] = payload["ok"] and bool(payload["validation"].get("ok"))
-    payload["legacyCompatibility"] = ensure_legacy_memory_link(destination, force=force)
+    payload["compatibilityInstall"] = write_compatibility_plugin(compatibility, mode=mode, force=force)
+    payload["ok"] = payload["ok"] and bool(payload["compatibilityInstall"].get("ok"))
+    payload["compatibilityValidation"] = validate_plugin_bundle(compatibility, strict_clean=(mode != "symlink"))
+    payload["ok"] = payload["ok"] and bool(payload["compatibilityValidation"].get("ok"))
 
     should_activate = bool(activate or profile)
     if should_activate:
@@ -544,7 +599,6 @@ def install_plugin(
             "ok": True,
             "status": "SKIPPED",
             "commands": [
-                f"hermes plugins enable {PLUGIN_NAME}",
                 f"hermes -p <profile> config set memory.provider {PLUGIN_NAME}",
                 "hermes -p <profile> memory status",
             ],
@@ -584,13 +638,18 @@ def bundle_plugin(*, out: str, force: bool = False) -> Dict[str, Any]:
         return {"ok": False, "error": "bundle_exists", "path": str(out_path)}
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="total-recall-hermes-plugin-") as tmp:
-        root = Path(tmp) / PLUGIN_NAME
-        written = write_plugin_bundle(root, force=True)
+        memory_root = Path(tmp) / "memory" / PLUGIN_NAME
+        compat_root = Path(tmp) / PLUGIN_NAME
+        written = write_plugin_bundle(memory_root, force=True)
         if not written.get("ok"):
             return written
+        compat_written = write_plugin_bundle(compat_root, force=True)
+        if not compat_written.get("ok"):
+            return compat_written
         with tarfile.open(out_path, "w:gz") as tar:
-            tar.add(root, arcname=PLUGIN_NAME)
-    return {"ok": True, "bundle": str(out_path), "plugin": PLUGIN_NAME, "version": __version__}
+            tar.add(memory_root, arcname=f"memory/{PLUGIN_NAME}")
+            tar.add(compat_root, arcname=PLUGIN_NAME)
+    return {"ok": True, "bundle": str(out_path), "plugin": PLUGIN_NAME, "kind": "memory-provider", "version": __version__}
 
 
 def activate_profile(*, profile: str, hermes_bin: str = "hermes") -> Dict[str, Any]:
@@ -598,11 +657,6 @@ def activate_profile(*, profile: str, hermes_bin: str = "hermes") -> Dict[str, A
     if not hermes_path:
         return {"ok": False, "status": "HERMES_NOT_FOUND", "error": f"{hermes_bin} not found on PATH"}
     commands = [
-        {
-            "command": [hermes_path, "plugins", "enable", PLUGIN_NAME],
-            "optional": True,
-            "status": "PLUGIN_ENABLE_UNAVAILABLE",
-        },
         {
             "command": [hermes_path, "-p", profile, "config", "set", "memory.provider", PLUGIN_NAME],
             "optional": False,
@@ -651,33 +705,41 @@ def status(
     check_core: bool = True,
 ) -> Dict[str, Any]:
     path = installed_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
-    legacy_path = legacy_memory_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
+    compatibility = compatibility_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
     validation = validate_plugin_bundle(path, strict_clean=False) if path.exists() else {"ok": False, "missing": ["plugin_directory"], "path": str(path)}
+    compatibility_validation = validate_plugin_bundle(compatibility, strict_clean=False) if compatibility.exists() or compatibility.is_symlink() else {"ok": False, "missing": ["compatibility_plugin_directory"], "path": str(compatibility)}
     core = check_core_in_hermes_python(hermes_bin=hermes_bin, hermes_python=hermes_python) if check_core else {
         "ok": True,
         "status": "SKIPPED",
         "message": "Core runtime check skipped.",
     }
-    ready = bool(validation.get("ok")) and bool(core.get("ok"))
+    compatibility_installed = compatibility.exists() or compatibility.is_symlink()
+    compatibility_ours = compatibility_installed and _looks_like_total_recall_plugin(compatibility)
+    ready = bool(validation.get("ok")) and bool(compatibility_validation.get("ok")) and bool(core.get("ok")) and bool(compatibility_ours)
     return {
         "ok": ready,
         "ready": ready,
         "plugin": PLUGIN_NAME,
+        "kind": "memory-provider",
         "version": __version__,
         "path": str(path),
         "installed": path.exists(),
-        "legacyPath": str(legacy_path),
-        "legacyInstalled": legacy_path.exists() or legacy_path.is_symlink(),
+        "compatibilityPath": str(compatibility),
+        "compatibilityInstalled": compatibility_installed,
+        "compatibilityLooksLikeTotalRecall": bool(compatibility_ours),
         "validation": validation,
+        "compatibilityValidation": compatibility_validation,
         "core": core,
-        "nextSteps": _status_next_steps(validation=validation, core=core),
+        "nextSteps": _status_next_steps(validation=validation, compatibility_validation=compatibility_validation, core=core, compatibility_ours=bool(compatibility_ours)),
     }
 
 
-def _status_next_steps(*, validation: Dict[str, Any], core: Dict[str, Any]) -> list[str]:
+def _status_next_steps(*, validation: Dict[str, Any], compatibility_validation: Dict[str, Any], core: Dict[str, Any], compatibility_ours: bool = False) -> list[str]:
     steps: list[str] = []
     if not validation.get("ok"):
         steps.append("Run `total-recall hermes install --force` to write a clean Hermes plugin bundle.")
+    if not compatibility_validation.get("ok") or not compatibility_ours:
+        steps.append("Run `total-recall hermes install --force` to write the flat user-provider compatibility bundle used by Hermes v0.15.x.")
     if not core.get("ok"):
         steps.extend(core.get("nextSteps") or ["Run `total-recall hermes install --core-install always`."])
     return steps

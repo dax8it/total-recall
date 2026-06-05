@@ -55,9 +55,10 @@ hermes -p <profile> memory status
 
 The installer detects the Python environment Hermes actually runs under,
 installs or upgrades `total-recall-core` there when needed, writes
-`~/.hermes/plugins/total-recall`, validates the bundle, enables the Hermes
-plugin, selects `memory.provider=total-recall` for the profile, and checks
-Hermes memory status.
+`~/.hermes/plugins/memory/total-recall`, also writes the flat
+`~/.hermes/plugins/total-recall` compatibility provider path used by Hermes
+v0.15.x, validates the bundle, selects `memory.provider=total-recall` for the
+profile, and checks Hermes memory status.
 
 Check readiness at any time:
 

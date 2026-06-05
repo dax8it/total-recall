@@ -525,6 +525,39 @@ class TotalRecallMemoryProvider(MemoryProvider):
             }
         ]
 
+    def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
+        """Persist setup-wizard values in Hermes' profile-local config."""
+        if not values:
+            return
+        config_path = Path(hermes_home) / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config = self._read_config_yaml(config_path)
+        memory = config.setdefault("memory", {})
+        if not isinstance(memory, dict):
+            memory = {}
+            config["memory"] = memory
+        memory["provider"] = self.name
+        provider_cfg = memory.setdefault(self.name, {})
+        if not isinstance(provider_cfg, dict):
+            provider_cfg = {}
+            memory[self.name] = provider_cfg
+
+        home = str(values.get("home") or "").strip()
+        if home:
+            provider_cfg["home"] = home
+        auto = provider_cfg.setdefault("auto_rehydrate", {})
+        if not isinstance(auto, dict):
+            auto = {}
+            provider_cfg["auto_rehydrate"] = auto
+        if "auto_rehydrate.enabled" in values:
+            auto["enabled"] = str(values.get("auto_rehydrate.enabled", "")).lower() not in {"0", "false", "no", "off"}
+        if "auto_rehydrate.context_threshold" in values:
+            try:
+                auto["context_threshold"] = float(values.get("auto_rehydrate.context_threshold"))
+            except Exception:
+                auto["context_threshold"] = 0.70
+        self._write_config_yaml(config_path, config)
+
     def _handle_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         core = self._core()
         if tool_name == "total_recall_search":
@@ -672,6 +705,36 @@ class TotalRecallMemoryProvider(MemoryProvider):
         if os.getenv("TOTAL_RECALL_HOME"):
             return os.environ["TOTAL_RECALL_HOME"]
         return str(Path(self._hermes_home or os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "total-recall")
+
+    @staticmethod
+    def _read_config_yaml(path: Path) -> Dict[str, Any]:
+        if not path.exists():
+            return {}
+        try:
+            import yaml
+
+            loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                return loaded if isinstance(loaded, dict) else {}
+            except Exception:
+                return {}
+
+    @staticmethod
+    def _write_config_yaml(path: Path, payload: Dict[str, Any]) -> None:
+        try:
+            import yaml
+
+            text = yaml.safe_dump(payload, sort_keys=False, allow_unicode=True)
+        except Exception:
+            text = json.dumps(payload, indent=2, sort_keys=False)
+        path.write_text(text, encoding="utf-8")
+        try:
+            path.chmod(0o600)
+        except Exception:
+            pass
 
     def _auto_rehydrate_config(self) -> Dict[str, Any]:
         defaults = {
