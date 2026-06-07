@@ -262,6 +262,82 @@ FEDERATION_QUERY_SCHEMA = {
     },
 }
 
+LOOP_INBOX_SCHEMA = {
+    "name": "total_recall_loop_inbox",
+    "description": "Show open Total Recall loop records for external workers. This is a derived ledger view and does not execute work.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "include_completed": {"type": "boolean", "description": "Include completed loops. Defaults to false."},
+            "agent": {"type": "string", "description": "Optional agent filter."},
+            "project": {"type": "string", "description": "Optional project filter."},
+        },
+        "required": [],
+    },
+}
+
+LOOP_START_SCHEMA = {
+    "name": "total_recall_loop_start",
+    "description": "Record the start of an external worker loop in Total Recall's append-only ledger. This records evidence only; it does not run an agent.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "Loop goal."},
+            "project": {"type": "string", "description": "Optional project or repo path."},
+            "agent": {"type": "string", "description": "Optional external worker/agent name."},
+            "worktree": {"type": "string", "description": "Optional worktree or execution path."},
+            "phase": {"type": "string", "description": "Initial phase. Defaults to discovery."},
+            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Evidence refs, commands, files, URLs, or citations."},
+        },
+        "required": ["goal"],
+    },
+}
+
+LOOP_NOTE_SCHEMA = {
+    "name": "total_recall_loop_note",
+    "description": "Append a progress note to an existing external worker loop in the Total Recall ledger.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id returned by total_recall_loop_start."},
+            "text": {"type": "string", "description": "Progress note."},
+            "phase": {"type": "string", "description": "Loop phase. Defaults to progress."},
+            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Evidence refs, commands, files, URLs, or citations."},
+        },
+        "required": ["loop_id", "text"],
+    },
+}
+
+LOOP_VERIFY_SCHEMA = {
+    "name": "total_recall_loop_verify",
+    "description": "Append verification evidence to an existing external worker loop in the Total Recall ledger.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id returned by total_recall_loop_start."},
+            "status": {"type": "string", "description": "Verification status, e.g. PASS, FAIL, or BLOCKED."},
+            "summary": {"type": "string", "description": "Verification summary."},
+            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Evidence refs, commands, files, URLs, or citations."},
+        },
+        "required": ["loop_id", "status"],
+    },
+}
+
+LOOP_COMPLETE_SCHEMA = {
+    "name": "total_recall_loop_complete",
+    "description": "Record completion of an external worker loop in the Total Recall ledger.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "loop_id": {"type": "string", "description": "Loop id returned by total_recall_loop_start."},
+            "status": {"type": "string", "description": "Completion status. Defaults to DONE."},
+            "summary": {"type": "string", "description": "Completion summary."},
+            "evidence": {"type": "array", "items": {"type": "string"}, "description": "Evidence refs, commands, files, URLs, or citations."},
+        },
+        "required": ["loop_id"],
+    },
+}
+
 ALL_SCHEMAS = [
     SEARCH_SCHEMA,
     STATUS_SCHEMA,
@@ -280,6 +356,11 @@ ALL_SCHEMAS = [
     KNOWLEDGE_GRAPH_INSPECT_SCHEMA,
     KNOWLEDGE_GRAPH_TIMELINE_SCHEMA,
     FEDERATION_QUERY_SCHEMA,
+    LOOP_INBOX_SCHEMA,
+    LOOP_START_SCHEMA,
+    LOOP_NOTE_SCHEMA,
+    LOOP_VERIFY_SCHEMA,
+    LOOP_COMPLETE_SCHEMA,
 ]
 
 
@@ -322,8 +403,9 @@ class TotalRecallMemoryProvider(MemoryProvider):
             "`total_recall_knowledge_graph_inspect` and `total_recall_knowledge_graph_timeline` for evidence-locked entity context over time, "
             "`total_recall_source_ingest` for meetings/email/Slack/GitHub/CRM/tickets/calendar/agent transcripts, "
             "`total_recall_federation_query` only when explicit cross-agent/workspace authorization is provided, "
+            "`total_recall_loop_inbox` plus append-only loop event tools for external worker evidence/status, "
             "`total_recall_checkpoint` before risky resets or handoffs, `total_recall_trust_verify` for release-grade hard-coded gates, and `total_recall_verify`/`total_recall_rehydrate` "
-            "when continuity integrity matters. Treat returned context as source-cited recall, not as a substitute for file verification.\n"
+            "when continuity integrity matters. Treat returned context as source-cited recall, not as a substitute for file verification. Portable-clone restore is not exposed as a Hermes tool.\n"
             f"Total Recall home: {self._home or self._configured_home()}"
         )
 
@@ -683,6 +765,46 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 max_results=min(max(int(args.get("max_results") or 8), 1), 20),
                 at_time=str(args.get("at_time") or ""),
             )
+        if tool_name == "total_recall_loop_inbox":
+            return core.loop_inbox(
+                include_completed=bool(args.get("include_completed")),
+                agent=str(args.get("agent") or ""),
+                project=str(args.get("project") or ""),
+            )
+        if tool_name == "total_recall_loop_start":
+            evidence = self._string_list_arg(args.get("evidence"))
+            return core.loop_start(
+                goal=str(args.get("goal") or ""),
+                project=str(args.get("project") or ""),
+                agent=str(args.get("agent") or ""),
+                worktree=str(args.get("worktree") or ""),
+                phase=str(args.get("phase") or "discovery"),
+                evidence=evidence,
+            )
+        if tool_name == "total_recall_loop_note":
+            evidence = self._string_list_arg(args.get("evidence"))
+            return core.loop_note(
+                str(args.get("loop_id") or ""),
+                text=str(args.get("text") or ""),
+                phase=str(args.get("phase") or "progress"),
+                evidence=evidence,
+            )
+        if tool_name == "total_recall_loop_verify":
+            evidence = self._string_list_arg(args.get("evidence"))
+            return core.loop_verify(
+                str(args.get("loop_id") or ""),
+                status=str(args.get("status") or ""),
+                summary=str(args.get("summary") or ""),
+                evidence=evidence,
+            )
+        if tool_name == "total_recall_loop_complete":
+            evidence = self._string_list_arg(args.get("evidence"))
+            return core.loop_complete(
+                str(args.get("loop_id") or ""),
+                status=str(args.get("status") or "DONE"),
+                summary=str(args.get("summary") or ""),
+                evidence=evidence,
+            )
         return {"ok": False, "error": f"unknown Total Recall tool: {tool_name}"}
 
     def _core(self) -> TotalRecallCore:
@@ -705,6 +827,16 @@ class TotalRecallMemoryProvider(MemoryProvider):
         if os.getenv("TOTAL_RECALL_HOME"):
             return os.environ["TOTAL_RECALL_HOME"]
         return str(Path(self._hermes_home or os.getenv("HERMES_HOME") or Path.home() / ".hermes") / "total-recall")
+
+    @staticmethod
+    def _string_list_arg(value: Any) -> List[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item).strip()]
+        return [str(value).strip()] if str(value).strip() else []
 
     @staticmethod
     def _read_config_yaml(path: Path) -> Dict[str, Any]:

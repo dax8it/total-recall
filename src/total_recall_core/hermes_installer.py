@@ -52,6 +52,11 @@ from total_recall_core.hermes_provider import (  # noqa: E402,F401
     KNOWLEDGE_STATUS_SCHEMA,
     KNOWLEDGE_SYNTHESIS_STATUS_SCHEMA,
     LEARNING_REVIEW_SCHEMA,
+    LOOP_COMPLETE_SCHEMA,
+    LOOP_INBOX_SCHEMA,
+    LOOP_NOTE_SCHEMA,
+    LOOP_START_SCHEMA,
+    LOOP_VERIFY_SCHEMA,
     REHYDRATE_SCHEMA,
     SEARCH_SCHEMA,
     SOURCE_INGEST_SCHEMA,
@@ -74,11 +79,13 @@ explicit federation, and an evidence-locked Knowledge Engine.
 
 The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/learning-review/rehydrate,
 working-context source ingest, cited Knowledge Engine query, freshness,
-compiled truth, graph inspect/timeline, and explicit federation query tools.
+compiled truth, graph inspect/timeline, explicit federation query tools, and
+append-only loop inbox/event tools for external workers.
 Federation requires explicit authorization and returns workspace-separated
 results rather than silently merging another agent's memory. Learning review
 returns candidate cards, layer-routing decisions, action boundaries, and a
 wake-up diff without mutating the ledger.
+Portable-clone restore is deliberately not exposed as a Hermes tool.
 
 ## Compaction And Rehydration In Plain English
 
@@ -188,6 +195,11 @@ def plugin_yaml() -> str:
         "  - total_recall_knowledge_graph_inspect\n"
         "  - total_recall_knowledge_graph_timeline\n"
         "  - total_recall_federation_query\n"
+        "  - total_recall_loop_inbox\n"
+        "  - total_recall_loop_start\n"
+        "  - total_recall_loop_note\n"
+        "  - total_recall_loop_verify\n"
+        "  - total_recall_loop_complete\n"
     )
 
 

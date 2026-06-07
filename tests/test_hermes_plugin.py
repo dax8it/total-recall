@@ -72,6 +72,11 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
         "total_recall_knowledge_graph_inspect",
         "total_recall_knowledge_graph_timeline",
         "total_recall_federation_query",
+        "total_recall_loop_inbox",
+        "total_recall_loop_start",
+        "total_recall_loop_note",
+        "total_recall_loop_verify",
+        "total_recall_loop_complete",
     }
 
     provider.sync_turn("remember plugin lifecycle", "stored", session_id="s1")
@@ -137,6 +142,25 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     fed = json.loads(provider.handle_tool_call("total_recall_federation_query", {"query": "plugin promise"}))
     assert fed["ok"] is True
     assert fed["federation"]["status"] == "NOT_REQUESTED"
+
+    loop_start = json.loads(
+        provider.handle_tool_call(
+            "total_recall_loop_start",
+            {"goal": "Plugin loop evidence", "project": "total-recall", "agent": "sparky", "evidence": ["pytest tests/test_hermes_plugin.py"]},
+        )
+    )
+    assert loop_start["ok"] is True
+    loop_id = loop_start["loop"]["loop_id"]
+    loop_note = json.loads(provider.handle_tool_call("total_recall_loop_note", {"loop_id": loop_id, "text": "Plugin tool recorded progress."}))
+    assert loop_note["ok"] is True
+    loop_verify = json.loads(provider.handle_tool_call("total_recall_loop_verify", {"loop_id": loop_id, "status": "PASS", "summary": "Verified via plugin."}))
+    assert loop_verify["loop"]["lastVerification"]["status"] == "PASS"
+    loop_inbox = json.loads(provider.handle_tool_call("total_recall_loop_inbox", {"agent": "sparky"}))
+    assert loop_inbox["count"] == 1
+    assert loop_inbox["loops"][0]["loop_id"] == loop_id
+    loop_complete = json.loads(provider.handle_tool_call("total_recall_loop_complete", {"loop_id": loop_id, "summary": "Done."}))
+    assert loop_complete["loop"]["status"] == "completed"
+    assert json.loads(provider.handle_tool_call("total_recall_loop_inbox", {"agent": "sparky"}))["count"] == 0
 
 
 def test_plugin_save_config_writes_profile_local_memory_provider_config(tmp_path, monkeypatch):

@@ -59,6 +59,11 @@ TRUST_GATE_REQUIRED_HERMES_TOOLS = {
     "total_recall_knowledge_graph_inspect",
     "total_recall_knowledge_graph_timeline",
     "total_recall_federation_query",
+    "total_recall_loop_inbox",
+    "total_recall_loop_start",
+    "total_recall_loop_note",
+    "total_recall_loop_verify",
+    "total_recall_loop_complete",
 }
 DEFAULT_DOCUMENT_EXTENSIONS = {
     ".adoc",

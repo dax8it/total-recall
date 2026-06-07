@@ -9,11 +9,13 @@ explicit federation, and an evidence-locked Knowledge Engine.
 
 The provider exposes Total Recall search/status/checkpoint/verify/trust-verify/learning-review/rehydrate,
 working-context source ingest, cited Knowledge Engine query, freshness,
-compiled truth, graph inspect/timeline, and explicit federation query tools.
+compiled truth, graph inspect/timeline, explicit federation query tools, and
+append-only loop inbox/event tools for external workers.
 Federation requires explicit authorization and returns workspace-separated
 results rather than silently merging another agent's memory. Learning review
 returns candidate cards, layer-routing decisions, action boundaries, and a
 wake-up diff without mutating the ledger.
+Portable-clone restore is deliberately not exposed as a Hermes tool.
 
 ## Compaction And Rehydration In Plain English
 
