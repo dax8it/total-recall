@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import fnmatch
 import hashlib
 import hmac
@@ -18,6 +19,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
 
 VERSION = "1.3.0"
 SIGNING_ALGORITHM = "ed25519-local-v1"
@@ -32,6 +38,8 @@ WORKING_CONTEXT_SCHEMA_VERSION = "total-recall-working-context-source-v1"
 OBSIDIAN_IMPORT_SCHEMA_VERSION = "total-recall-obsidian-import-review-v1"
 LEARNING_REVIEW_SCHEMA_VERSION = "total-recall-learning-review-v1"
 FEDERATION_SCHEMA_VERSION = "total-recall-federation-registry-v1"
+PORTABLE_CLONE_SCHEMA_VERSION = "total-recall-portable-clone-v1"
+LOOP_EVENT_SCHEMA_VERSION = "total-recall-loop-event-v1"
 TRUST_GATE_SCHEMA_VERSION = "total-recall-trust-gate-v1"
 TRUST_GATE_REQUIRED_HERMES_TOOLS = {
     "total_recall_search",
@@ -2660,13 +2668,284 @@ class TotalRecallCore:
             "verification": verification,
         }
 
+    def portable_clone_export(
+        self,
+        *,
+        out_dir: str | Path,
+        passphrase: str = "",
+        provider: str = "huggingface",
+        repo_id: str = "",
+        upload: bool = False,
+        include_index: bool = False,
+    ) -> Dict[str, Any]:
+        """Create an encrypted portable-clone bundle for remote storage.
+
+        This is deliberately encryption-first: remote providers only ever see an
+        AES-GCM ciphertext envelope plus a non-secret manifest. The plaintext
+        Total Recall export is written only to a temporary directory.
+        """
+        secret = passphrase or os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", "")
+        if not secret:
+            return {"ok": False, "error": "passphrase_required", "schema": PORTABLE_CLONE_SCHEMA_VERSION}
+        provider_id = _safe_id(provider or "huggingface")
+        if provider_id != "huggingface" and upload:
+            return {"ok": False, "error": "provider_upload_not_supported", "provider": provider_id}
+
+        out_path = Path(out_dir).expanduser()
+        out_path.mkdir(parents=True, exist_ok=True)
+        checkpoint = self.checkpoint(session_id="portable-clone", label="portable_clone_export")
+        state = self.reduce_state(write=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        clone_id = f"clone_{stamp}_{secrets.token_hex(4)}"
+        encrypted_path = out_path / f"total-recall-portable-clone-{stamp}-{secrets.token_hex(3)}.tar.gz.enc"
+        manifest_path = encrypted_path.with_suffix(encrypted_path.suffix + ".manifest.json")
+
+        with tempfile.TemporaryDirectory(prefix="total-recall-portable-clone.") as tmpdir:
+            plaintext_bundle = Path(tmpdir) / "total-recall-export.tar.gz"
+            exported = self.export_bundle(str(plaintext_bundle), include_index=include_index)
+            plaintext = plaintext_bundle.read_bytes()
+
+        salt = secrets.token_bytes(16)
+        nonce = secrets.token_bytes(12)
+        iterations = 390_000
+        key = self._portable_clone_key(secret, salt=salt, iterations=iterations)
+        ciphertext = AESGCM(key).encrypt(nonce, plaintext, None)
+        manifest = {
+            "schema": PORTABLE_CLONE_SCHEMA_VERSION,
+            "cloneId": clone_id,
+            "createdAt": utc_now(),
+            "version": VERSION,
+            "provider": {
+                "id": provider_id,
+                "repoId": repo_id or None,
+                "type": "dataset" if provider_id == "huggingface" else "remote",
+                "storageContract": "encrypted-bundle-only",
+            },
+            "encryption": {
+                "algorithm": "AES-256-GCM/PBKDF2-SHA256",
+                "kdf": "PBKDF2HMAC-SHA256",
+                "iterations": iterations,
+                "salt": base64.b64encode(salt).decode("ascii"),
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+            },
+            "plaintext": {
+                "sha256": hashlib.sha256(plaintext).hexdigest(),
+                "bytes": len(plaintext),
+                "export": exported,
+            },
+            "ledger": {
+                "eventCount": state.get("event_count"),
+                "lastEventHash": state.get("last_event_hash"),
+                "stateHash": state.get("state_hash"),
+                "latestCheckpoint": (checkpoint.get("checkpoint") or {}),
+            },
+            "restore": {
+                "command": f"total-recall portable-clone restore {encrypted_path.name} --replace",
+                "requiresPassphraseEnv": "TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE",
+                "postRestoreGate": "total-recall verify && total-recall trust verify",
+            },
+        }
+        envelope = {
+            "schema": PORTABLE_CLONE_SCHEMA_VERSION,
+            "manifest": manifest,
+            "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        }
+        encrypted_path.write_text(json.dumps(envelope, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        manifest["encrypted"] = {
+            "sha256": self._file_sha256(encrypted_path),
+            "bytes": encrypted_path.stat().st_size,
+            "path": encrypted_path.name,
+        }
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+        upload_result: Optional[Dict[str, Any]] = None
+        status = "READY_FOR_UPLOAD"
+        ok = True
+        if upload:
+            upload_result = self._portable_clone_hf_upload(
+                repo_id=repo_id,
+                encrypted_path=encrypted_path,
+                manifest_path=manifest_path,
+            )
+            ok = bool(upload_result.get("ok"))
+            status = "UPLOADED" if ok else "UPLOAD_FAILED"
+
+        payload = {
+            "ok": ok,
+            "schema": PORTABLE_CLONE_SCHEMA_VERSION,
+            "status": status,
+            "cloneId": clone_id,
+            "provider": manifest["provider"],
+            "encryptedBundle": str(encrypted_path),
+            "manifestFile": str(manifest_path),
+            "ledger": manifest["ledger"],
+            "upload": upload_result,
+            "nextSteps": [
+                "Upload the .enc bundle and manifest to a private Hugging Face dataset or bucket.",
+                "On a new machine, download both files and run portable-clone restore with the passphrase in TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE.",
+                "After restore, run verify, trust verify, and rebuild derived search catalogs before trusting the clone.",
+            ],
+        }
+        payload["report"] = self._write_report("portable_clone", clone_id, payload)
+        return payload
+
+    def portable_clone_restore(
+        self,
+        bundle: str | Path,
+        *,
+        passphrase: str = "",
+        replace: bool = False,
+    ) -> Dict[str, Any]:
+        secret = passphrase or os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", "")
+        if not secret:
+            return {"ok": False, "error": "passphrase_required", "schema": PORTABLE_CLONE_SCHEMA_VERSION}
+        encrypted_path = Path(bundle).expanduser()
+        if not encrypted_path.exists():
+            return {"ok": False, "error": "encrypted_bundle_not_found", "bundle": str(encrypted_path)}
+        try:
+            envelope = json.loads(encrypted_path.read_text(encoding="utf-8"))
+            manifest = envelope.get("manifest") or {}
+            encryption = manifest.get("encryption") or {}
+            salt = base64.b64decode(encryption.get("salt") or "")
+            nonce = base64.b64decode(encryption.get("nonce") or "")
+            iterations = int(encryption.get("iterations") or 390_000)
+            ciphertext = base64.b64decode(envelope.get("ciphertext") or "")
+            key = self._portable_clone_key(secret, salt=salt, iterations=iterations)
+            plaintext = AESGCM(key).decrypt(nonce, ciphertext, None)
+        except (InvalidTag, ValueError, json.JSONDecodeError) as exc:
+            return {"ok": False, "error": "decrypt_failed", "bundle": str(encrypted_path), "detail": exc.__class__.__name__}
+
+        expected_hash = ((manifest.get("plaintext") or {}).get("sha256") or "")
+        actual_hash = hashlib.sha256(plaintext).hexdigest()
+        if expected_hash and actual_hash != expected_hash:
+            return {"ok": False, "error": "plaintext_hash_mismatch", "expected": expected_hash, "actual": actual_hash}
+
+        with tempfile.TemporaryDirectory(prefix="total-recall-portable-restore.") as tmpdir:
+            plaintext_bundle = Path(tmpdir) / "total-recall-export.tar.gz"
+            plaintext_bundle.write_bytes(plaintext)
+            imported = self.import_bundle(str(plaintext_bundle), replace=replace)
+
+        verification = imported.get("verification") or self.verify()
+        return {
+            "ok": bool(imported.get("ok")) and bool(verification.get("ok")),
+            "schema": PORTABLE_CLONE_SCHEMA_VERSION,
+            "status": "PASS" if imported.get("ok") and verification.get("ok") else "FAIL_CLOSED",
+            "bundle": str(encrypted_path),
+            "home": str(self.home),
+            "manifest": manifest,
+            "import": imported,
+            "verification": verification,
+            "nextSteps": [
+                "Run total-recall trust verify.",
+                "Run total-recall knowledge index rebuild and graph rebuild if this clone will answer semantic queries.",
+                "Point Hermes profile memory.provider at this restored Total Recall home only after verify/trust gates pass.",
+            ],
+        }
+
+    def loop_start(
+        self,
+        *,
+        goal: str,
+        project: str = "",
+        agent: str = "",
+        worktree: str = "",
+        phase: str = "discovery",
+        evidence: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        if not str(goal or "").strip():
+            return {"ok": False, "error": "goal_required", "schema": LOOP_EVENT_SCHEMA_VERSION}
+        loop_id = self._new_id("loop")
+        metadata = {
+            "schema": LOOP_EVENT_SCHEMA_VERSION,
+            "loop_id": loop_id,
+            "loop_event": "start",
+            "goal": str(goal).strip(),
+            "project": project or "",
+            "agent": agent or "",
+            "worktree": worktree or "",
+            "phase": phase or "discovery",
+            "status": "active",
+            "evidence": list(evidence or []),
+        }
+        result = self.ingest(
+            kind="loop",
+            text=f"Loop started: {metadata['goal']}",
+            session_id=f"loop:{loop_id}",
+            source="loop:start",
+            metadata=metadata,
+        )
+        loop = self._loop_index().get(loop_id, {})
+        self._write_loop_index()
+        return {"ok": True, "schema": LOOP_EVENT_SCHEMA_VERSION, "loop": loop, "event": result.get("event")}
+
+    def loop_note(
+        self,
+        loop_id: str,
+        *,
+        text: str,
+        phase: str = "progress",
+        evidence: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        return self._record_loop_event(loop_id, "note", text=text, phase=phase, evidence=evidence)
+
+    def loop_verify(
+        self,
+        loop_id: str,
+        *,
+        status: str,
+        summary: str = "",
+        evidence: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        verdict = str(status or "").upper() or "UNKNOWN"
+        text = summary or f"Loop verification: {verdict}"
+        return self._record_loop_event(
+            loop_id,
+            "verify",
+            text=text,
+            phase="verified",
+            evidence=evidence,
+            extra={"verification": {"status": verdict, "summary": summary or text}},
+        )
+
+    def loop_complete(
+        self,
+        loop_id: str,
+        *,
+        status: str = "DONE",
+        summary: str = "",
+        evidence: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        result_status = str(status or "DONE").upper()
+        final_status = "cancelled" if result_status in {"CANCELLED", "FAILED", "FAIL"} else "completed"
+        return self._record_loop_event(
+            loop_id,
+            "complete",
+            text=summary or f"Loop completed: {result_status}",
+            phase="complete",
+            evidence=evidence,
+            extra={"status": final_status, "result": result_status, "summary": summary},
+        )
+
+    def loop_inbox(self, *, include_completed: bool = False, agent: str = "", project: str = "") -> Dict[str, Any]:
+        loops = list(self._loop_index().values())
+        if not include_completed:
+            loops = [item for item in loops if item.get("status") == "active"]
+        if agent:
+            loops = [item for item in loops if item.get("agent") == agent]
+        if project:
+            loops = [item for item in loops if item.get("project") == project]
+        loops.sort(key=lambda item: item.get("updated_at") or "", reverse=True)
+        payload = {"ok": True, "schema": LOOP_EVENT_SCHEMA_VERSION, "count": len(loops), "loops": loops}
+        self._write_loop_index()
+        return payload
+
     def doctor(self) -> Dict[str, Any]:
         checks: List[Dict[str, Any]] = []
 
         def add(name: str, ok: bool, **details: Any) -> None:
             checks.append({"name": name, "ok": ok, **details})
 
-        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys", "knowledge", "reviews", "federation"]
+        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys", "knowledge", "reviews", "federation", "portable-clones", "loops"]
         for rel_dir in required_dirs:
             add(f"dir:{rel_dir}", (self.home / rel_dir).is_dir(), path=str(self.home / rel_dir))
 
@@ -3886,6 +4165,8 @@ class TotalRecallCore:
             "reviews/learning",
             "reviews/obsidian/promoted",
             "federation",
+            "portable-clones",
+            "loops",
         ):
             (self.home / rel).mkdir(parents=True, exist_ok=True)
         self.ledger_file.touch(exist_ok=True)
@@ -4103,7 +4384,10 @@ class TotalRecallCore:
                         "state_hash": payload.get("state_hash"),
                         "checkpoint_hash": payload.get("checkpoint_hash"),
                     })
-        latest_checkpoint = max(checkpoints, key=lambda item: str(item.get("created_at") or "")) if checkpoints else None
+        latest_checkpoint = max(
+            checkpoints,
+            key=lambda item: (str(item.get("created_at") or ""), int(item.get("event_count") or 0)),
+        ) if checkpoints else None
         return {
             "ok": True,
             "bundle": str(bundle),
@@ -4140,6 +4424,158 @@ class TotalRecallCore:
         ]
         self._write_markdown(md_path, "\n".join(md))
         return {"json": str(json_path), "markdown": str(md_path)}
+
+    def _portable_clone_key(self, passphrase: str, *, salt: bytes, iterations: int) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+        )
+        return kdf.derive(passphrase.encode("utf-8"))
+
+    def _portable_clone_hf_upload(self, *, repo_id: str, encrypted_path: Path, manifest_path: Path) -> Dict[str, Any]:
+        if not repo_id:
+            return {"ok": False, "error": "repo_id_required", "provider": "huggingface"}
+        hf_bin = shutil.which("hf") or shutil.which("huggingface-cli")
+        if not hf_bin:
+            return {
+                "ok": False,
+                "error": "hf_cli_not_found",
+                "provider": "huggingface",
+                "files": [str(encrypted_path), str(manifest_path)],
+            }
+        commands = [
+            [hf_bin, "upload", repo_id, str(encrypted_path), encrypted_path.name, "--repo-type", "dataset"],
+            [hf_bin, "upload", repo_id, str(manifest_path), manifest_path.name, "--repo-type", "dataset"],
+        ]
+        results: List[Dict[str, Any]] = []
+        for command in commands:
+            run = subprocess.run(command, text=True, capture_output=True, timeout=300)
+            results.append(
+                {
+                    "command": " ".join(command[:3] + ["<file>", command[4], "--repo-type", "dataset"]),
+                    "returncode": run.returncode,
+                    "stdout": run.stdout[-1000:],
+                    "stderr": run.stderr[-1000:],
+                }
+            )
+            if run.returncode != 0:
+                return {"ok": False, "error": "hf_upload_failed", "provider": "huggingface", "repoId": repo_id, "results": results}
+        return {"ok": True, "provider": "huggingface", "repoId": repo_id, "results": results}
+
+    def _loop_index(self) -> Dict[str, Dict[str, Any]]:
+        loops: Dict[str, Dict[str, Any]] = {}
+        for event in self._read_events(verify_chain=True):
+            metadata = event.get("metadata") or {}
+            if metadata.get("schema") != LOOP_EVENT_SCHEMA_VERSION:
+                continue
+            loop_id = str(metadata.get("loop_id") or "")
+            if not loop_id:
+                continue
+            event_name = str(metadata.get("loop_event") or "note")
+            created = str(event.get("timestamp") or utc_now())
+            current = loops.setdefault(
+                loop_id,
+                {
+                    "loop_id": loop_id,
+                    "schema": LOOP_EVENT_SCHEMA_VERSION,
+                    "goal": metadata.get("goal") or "",
+                    "project": metadata.get("project") or "",
+                    "agent": metadata.get("agent") or "",
+                    "worktree": metadata.get("worktree") or "",
+                    "status": "active",
+                    "phase": metadata.get("phase") or "discovery",
+                    "created_at": created,
+                    "updated_at": created,
+                    "eventCount": 0,
+                    "events": [],
+                },
+            )
+            if event_name == "start":
+                current.update(
+                    {
+                        "goal": metadata.get("goal") or current.get("goal") or "",
+                        "project": metadata.get("project") or current.get("project") or "",
+                        "agent": metadata.get("agent") or current.get("agent") or "",
+                        "worktree": metadata.get("worktree") or current.get("worktree") or "",
+                        "status": metadata.get("status") or "active",
+                        "phase": metadata.get("phase") or current.get("phase") or "discovery",
+                    }
+                )
+            if metadata.get("phase"):
+                current["phase"] = metadata.get("phase")
+            if metadata.get("status"):
+                current["status"] = metadata.get("status")
+            if metadata.get("verification"):
+                current["lastVerification"] = metadata.get("verification")
+            if metadata.get("result"):
+                current["result"] = metadata.get("result")
+            event_summary = {
+                "event_id": event.get("event_id"),
+                "ledgerRef": f"ledger:{event.get('event_id')}",
+                "event": event_name,
+                "timestamp": created,
+                "text": event.get("text"),
+                "phase": metadata.get("phase"),
+                "evidence": metadata.get("evidence") or [],
+            }
+            current.setdefault("events", []).append(event_summary)
+            current["eventCount"] = len(current.get("events") or [])
+            current["lastEvent"] = event_name
+            current["lastEventId"] = event.get("event_id")
+            current["updated_at"] = created
+        return loops
+
+    def _write_loop_index(self) -> None:
+        payload = {
+            "schema": "total-recall-loop-index-v1",
+            "updated_at": utc_now(),
+            "loops": self._loop_index(),
+        }
+        self._write_json(self.home / "loops" / "index.json", payload)
+
+    def _record_loop_event(
+        self,
+        loop_id: str,
+        event_name: str,
+        *,
+        text: str,
+        phase: str = "progress",
+        evidence: Optional[Sequence[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        safe_loop_id = str(loop_id or "").strip()
+        if not safe_loop_id:
+            return {"ok": False, "error": "loop_id_required", "schema": LOOP_EVENT_SCHEMA_VERSION}
+        existing = self._loop_index().get(safe_loop_id)
+        if not existing:
+            return {"ok": False, "error": "loop_not_found", "schema": LOOP_EVENT_SCHEMA_VERSION, "loop_id": safe_loop_id}
+        body = str(text or "").strip()
+        if not body:
+            return {"ok": False, "error": "text_required", "schema": LOOP_EVENT_SCHEMA_VERSION, "loop_id": safe_loop_id}
+        metadata = {
+            "schema": LOOP_EVENT_SCHEMA_VERSION,
+            "loop_id": safe_loop_id,
+            "loop_event": event_name,
+            "goal": existing.get("goal") or "",
+            "project": existing.get("project") or "",
+            "agent": existing.get("agent") or "",
+            "worktree": existing.get("worktree") or "",
+            "phase": phase,
+            "evidence": list(evidence or []),
+        }
+        metadata.update(extra or {})
+        result = self.ingest(
+            kind="loop",
+            text=body,
+            session_id=f"loop:{safe_loop_id}",
+            source=f"loop:{event_name}",
+            metadata=metadata,
+        )
+        loop = self._loop_index().get(safe_loop_id, {})
+        self._write_loop_index()
+        return {"ok": True, "schema": LOOP_EVENT_SCHEMA_VERSION, "loop": loop, "event": result.get("event")}
 
     def _find_external(self, external_id: str) -> Optional[Path]:
         safe = _safe_id(external_id)

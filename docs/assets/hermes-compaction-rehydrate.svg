@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="620" viewBox="0 0 1280 620" role="img" aria-labelledby="title desc">
+  <title id="title">Hermes compaction and Total Recall rehydration lifecycle</title>
+  <desc id="desc">A simplified continuity lifecycle: Hermes saves completed turns to Total Recall, enters one context risk zone before compaction, checkpoints and verifies the ledger, then rehydrates verified cited context after compaction, reset, resume, or restart. Backups are recovery protection and are not the memory authority.</desc>
+  <defs>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="#1e293b" stroke-width="0.75"/>
+    </pattern>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#38bdf8"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="8" markerHeight="8" orient="auto">
+      <path d="M0 0L10 5L0 10z" fill="#34d399"/>
+    </marker>
+    <style>
+      .bg{fill:#020617}.title{font:700 28px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e2e8f0}.subtitle{font:15px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.label{font:700 18px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#e2e8f0}.small{font:13px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#cbd5e1}.tiny{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;fill:#94a3b8}.card{rx:18;stroke-width:2}.runtime{fill:rgba(8,51,68,.44);stroke:#22d3ee}.risk{fill:rgba(120,53,15,.35);stroke:#fbbf24}.authority{fill:rgba(136,19,55,.30);stroke:#fb7185}.safe{fill:rgba(6,78,59,.38);stroke:#34d399}.derived{fill:rgba(76,29,149,.30);stroke:#a78bfa}.muted{fill:rgba(30,41,59,.58);stroke:#64748b}.flow{fill:none;stroke:#38bdf8;stroke-width:2.8;marker-end:url(#arrow)}.flowGreen{fill:none;stroke:#34d399;stroke-width:2.8;marker-end:url(#arrowGreen)}.dash{stroke-dasharray:8 6}.badge{fill:#020617;stroke:#334155;stroke-width:1;rx:12}
+    </style>
+  </defs>
+  <rect class="bg" width="1280" height="620"/>
+  <rect width="1280" height="620" fill="url(#grid)" opacity="0.65"/>
+
+  <text x="48" y="56" class="title">One operator model: save → checkpoint → verify → rehydrate</text>
+  <text x="48" y="86" class="subtitle">Use one visible “context risk zone” in docs/dashboard. The extra high-context threshold is only a safety net, not a second memory authority.</text>
+
+  <rect x="55" y="135" width="245" height="210" class="card runtime"/>
+  <text x="84" y="174" class="label">1. Working session</text>
+  <text x="84" y="207" class="small">Hermes chats, calls tools,</text>
+  <text x="84" y="231" class="small">and completes turns.</text>
+  <rect x="84" y="262" width="170" height="42" class="badge"/>
+  <text x="102" y="288" class="tiny">turns sync to ledger</text>
+
+  <rect x="360" y="135" width="250" height="210" class="card risk"/>
+  <text x="389" y="174" class="label">2. Context risk zone</text>
+  <text x="389" y="207" class="small">Recommended simple setup:</text>
+  <text x="389" y="231" class="small">align rehydrate trigger</text>
+  <text x="389" y="255" class="small">with compaction trigger.</text>
+  <text x="389" y="292" class="tiny">on_pre_compress captures state</text>
+  <text x="389" y="313" class="tiny">before old chat is summarized</text>
+
+  <rect x="670" y="135" width="250" height="210" class="card authority"/>
+  <text x="699" y="174" class="label">3. Trust spine</text>
+  <text x="699" y="207" class="small">ledger → checkpoint</text>
+  <text x="699" y="231" class="small">→ anchor → verify</text>
+  <text x="699" y="265" class="small">If verify fails,</text>
+  <text x="699" y="289" class="small">rehydrate refuses.</text>
+
+  <rect x="980" y="135" width="245" height="210" class="card safe"/>
+  <text x="1009" y="174" class="label">4. Rehydrate</text>
+  <text x="1009" y="207" class="small">After compaction, reset,</text>
+  <text x="1009" y="231" class="small">resume, restart, or</text>
+  <text x="1009" y="255" class="small">manual request.</text>
+  <rect x="1009" y="286" width="170" height="42" class="badge"/>
+  <text x="1027" y="312" class="tiny">cited context only</text>
+
+  <path class="flow" d="M300 240H350"/>
+  <path class="flow" d="M610 240H660"/>
+  <path class="flowGreen" d="M920 240H970"/>
+
+  <rect x="110" y="405" width="470" height="92" class="card derived"/>
+  <text x="139" y="439" class="label">Ask later by use case</text>
+  <text x="139" y="466" class="small">“What were we doing before compaction?”</text>
+  <text x="139" y="489" class="small">“What decisions did we make about backup freshness?”</text>
+
+  <rect x="700" y="405" width="470" height="92" class="card muted"/>
+  <text x="729" y="439" class="label">Backups are recovery protection</text>
+  <text x="729" y="466" class="small">They preserve the same verified ledger point for restore.</text>
+  <text x="729" y="489" class="small">They do not replace checkpoint/verify/rehydrate.</text>
+
+  <path class="flow dash" d="M177 345C177 390 230 390 230 405"/>
+  <path class="flowGreen dash" d="M795 345C795 390 935 390 935 405"/>
+
+  <text x="48" y="565" class="small">Operational shortcut: if the dashboard says Compaction / rehydrate guard = Ready, the current ledger point has checkpoint/verify coverage for safe rehydrate.</text>
+  <text x="48" y="590" class="tiny">Generated for Total Recall docs. Retrieval indexes, dashboards, vaults, reports, and backups are derived/recovery surfaces; ledger/checkpoints/anchors remain authority.</text>
+</svg>

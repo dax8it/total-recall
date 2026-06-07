@@ -101,7 +101,9 @@ The first screen is the operator surface for a Hermes/Total Recall memory stack:
 - status strip for authority, checkpoint, Knowledge Engine, scorecard, backups,
   and remote MCP readiness
 - Trust Spine gates for ledger, checkpoint, incidents, retrieval, Knowledge
-  Engine authority, and backup inventory
+  Engine authority, and backup coverage
+- Backups & Compaction Safety rows that say whether the latest archive covers
+  the same ledger point as local memory and whether rehydrate is ready
 - Knowledge Engine controls for rebuild index, rebuild graph, build compiled
   truth, run scorecard, run synthesis, and show compiled truth
 - Operator Workbench for cited queries, graph inspection, temporal timeline,

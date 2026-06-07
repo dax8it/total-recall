@@ -3,12 +3,13 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import subprocess
 import sys
 import tarfile
 import types
 from pathlib import Path
 
-from total_recall_core import hermes_installer
+from total_recall_core import hermes_installer, qmd_installer
 
 
 class _FakeMemoryProvider:
@@ -186,7 +187,12 @@ import sys
 from pathlib import Path
 
 Path({str(calls)!r}).open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[1:] == ["-p", "smoke", "config", "set", "memory.provider", "total-recall"]:
+if sys.argv[1:] in [
+    ["-p", "smoke", "config", "set", "memory.provider", "total-recall"],
+    ["-p", "smoke", "config", "set", "compression.threshold", "0.55"],
+    ["-p", "smoke", "config", "set", "memory.total-recall.auto_rehydrate.enabled", "true"],
+    ["-p", "smoke", "config", "set", "memory.total-recall.auto_rehydrate.context_threshold", "0.55"],
+]:
     print("configured")
 elif sys.argv[1:] == ["-p", "smoke", "memory", "status"]:
     print("Plugin: installed OK")
@@ -206,8 +212,16 @@ else:
     recorded = [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()]
     assert recorded == [
         ["-p", "smoke", "config", "set", "memory.provider", "total-recall"],
+        ["-p", "smoke", "config", "set", "compression.threshold", "0.55"],
+        ["-p", "smoke", "config", "set", "memory.total-recall.auto_rehydrate.enabled", "true"],
+        ["-p", "smoke", "config", "set", "memory.total-recall.auto_rehydrate.context_threshold", "0.55"],
         ["-p", "smoke", "memory", "status"],
     ]
+    assert result["contextRiskPolicy"] == {
+        "compression.threshold": "0.55",
+        "memory.total-recall.auto_rehydrate.enabled": True,
+        "memory.total-recall.auto_rehydrate.context_threshold": "0.55",
+    }
 
 
 def test_hermes_bundle_tarball_contains_complete_plugin(tmp_path):
@@ -231,3 +245,80 @@ def test_repo_plugin_wrapper_matches_embedded_installer_bundle():
     assert (repo_plugin / "__init__.py").read_text(encoding="utf-8") == hermes_installer.plugin_files()["__init__.py"]
     assert (repo_plugin / "plugin.yaml").read_text(encoding="utf-8") == hermes_installer.plugin_files()["plugin.yaml"]
     assert (repo_plugin / "README.md").read_text(encoding="utf-8") == hermes_installer.plugin_files()["README.md"]
+
+
+def _fake_qmd(path: Path) -> Path:
+    path.write_text(
+        f"""#!{sys.executable}
+import sys
+if sys.argv[1:] in (["--version"], ["status"], ["--help"]):
+    print("qmd-test 1.0")
+    raise SystemExit(0)
+print("fake qmd")
+""",
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+    return path
+
+
+def test_qmd_link_installs_symlink_in_explicit_user_bin(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = _fake_qmd(tmp_path / "bun-qmd")
+    bin_dir = tmp_path / ".local" / "bin"
+
+    result = qmd_installer.link_qmd(source=str(source), bin_dir=str(bin_dir))
+
+    destination = bin_dir / "qmd"
+    assert result["ok"] is True
+    assert result["status"] == "LINKED"
+    assert destination.is_symlink()
+    assert destination.resolve() == source
+    assert result["probe"]["stdout"] == "qmd-test 1.0"
+
+
+def test_qmd_link_auto_uses_writable_path_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    source = _fake_qmd(tmp_path / "qmd-source")
+    writable_path = tmp_path / "bin"
+    writable_path.mkdir()
+    monkeypatch.setenv("PATH", str(writable_path))
+
+    result = qmd_installer.link_qmd(source=str(source))
+
+    assert result["ok"] is True
+    assert Path(result["destination"]) == writable_path / "qmd"
+    assert (writable_path / "qmd").resolve() == source
+    assert "already on PATH" in result["pathHint"]
+
+
+def test_qmd_link_cli_json(tmp_path):
+    source = _fake_qmd(tmp_path / "qmd-source")
+    bin_dir = tmp_path / "linked-bin"
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "qmd",
+            "link",
+            "--source",
+            str(source),
+            "--bin-dir",
+            str(bin_dir),
+            "--format",
+            "json",
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        env=env,
+    )
+
+    assert completed.returncode == 0
+    payload = json.loads(completed.stdout)
+    assert payload["ok"] is True
+    assert Path(payload["destination"]).resolve() == (bin_dir / "qmd").resolve()

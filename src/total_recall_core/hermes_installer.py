@@ -13,6 +13,7 @@ from typing import Any, Dict
 from . import __version__
 
 PLUGIN_NAME = "total-recall"
+DEFAULT_CONTEXT_RISK_THRESHOLD = "0.55"
 
 PLUGIN_INIT = '''from __future__ import annotations
 
@@ -79,6 +80,53 @@ results rather than silently merging another agent's memory. Learning review
 returns candidate cards, layer-routing decisions, action boundaries, and a
 wake-up diff without mutating the ledger.
 
+## Compaction And Rehydration In Plain English
+
+Use one operator model:
+
+```text
+save completed turns -> checkpoint -> verify -> rehydrate cited context
+```
+
+Hermes owns when old chat is compacted. Total Recall owns whether memory is safe
+to reuse after that context changes. The easiest profile policy is to align the
+Hermes compaction threshold and Total Recall auto-rehydrate threshold so both are
+one visible **context risk zone**:
+
+```yaml
+compression:
+  enabled: true
+  threshold: 0.55
+
+memory:
+  provider: total-recall
+  total-recall:
+    auto_rehydrate:
+      enabled: true
+      context_threshold: 0.55
+```
+
+If the Total Recall threshold is higher than the Hermes compaction threshold,
+treat it as an extra high-context safety net, not a separate memory authority.
+The provider still handles Hermes compaction hooks.
+
+What gets saved:
+
+- completed turns through `sync_turn()`
+- pre-compaction continuity through `on_pre_compress(messages)`
+- session switches/resets/resumes as lifecycle events
+- session end plus checkpoint on shutdown
+- explicit checkpoint events when Hermes or the user calls the checkpoint tool
+
+Search and rehydrate examples:
+
+```bash
+total-recall rehydrate --session-id main --query "active work before compaction"
+total-recall search "Total Recall dashboard backup panel"
+total-recall knowledge query --query "What was the last verified state before rehydrate?" --format text
+total-recall knowledge query --query "What decisions did we make about backup freshness?" --format text
+```
+
 ## Install
 
 Preferred:
@@ -92,8 +140,9 @@ The installer detects Hermes' Python environment, installs or upgrades
 `total-recall-core` there when needed, writes the plugin bundle to
 `~/.hermes/plugins/memory/total-recall`, also writes the flat
 `~/.hermes/plugins/total-recall` compatibility provider path used by Hermes
-v0.15.x, selects it as the profile's memory provider, and verifies Hermes
-memory status.
+v0.15.x, selects it as the profile's memory provider, writes aligned Context Risk
+Zone defaults (`compression.threshold=0.55`, `auto_rehydrate.enabled=true`,
+`auto_rehydrate.context_threshold=0.55`), and verifies Hermes memory status.
 
 Manual fallback:
 
@@ -542,7 +591,7 @@ def install_plugin(
             "ensure_core_in_hermes_python" if core_install != "skip" else "core_install_skipped",
             "write_docs_memory_provider_bundle",
             "write_flat_user_provider_compatibility_bundle",
-            "activate_profile" if activate or profile else "activation_skipped",
+            "activate_profile_with_context_risk_defaults" if activate or profile else "activation_skipped",
         ]
         payload["core"] = {
             "mode": core_install,
@@ -600,6 +649,9 @@ def install_plugin(
             "status": "SKIPPED",
             "commands": [
                 f"hermes -p <profile> config set memory.provider {PLUGIN_NAME}",
+                f"hermes -p <profile> config set compression.threshold {DEFAULT_CONTEXT_RISK_THRESHOLD}",
+                "hermes -p <profile> config set memory.total-recall.auto_rehydrate.enabled true",
+                f"hermes -p <profile> config set memory.total-recall.auto_rehydrate.context_threshold {DEFAULT_CONTEXT_RISK_THRESHOLD}",
                 "hermes -p <profile> memory status",
             ],
         }
@@ -663,6 +715,21 @@ def activate_profile(*, profile: str, hermes_bin: str = "hermes") -> Dict[str, A
             "status": "CONFIG_SET_FAILED",
         },
         {
+            "command": [hermes_path, "-p", profile, "config", "set", "compression.threshold", DEFAULT_CONTEXT_RISK_THRESHOLD],
+            "optional": False,
+            "status": "COMPRESSION_THRESHOLD_SET_FAILED",
+        },
+        {
+            "command": [hermes_path, "-p", profile, "config", "set", "memory.total-recall.auto_rehydrate.enabled", "true"],
+            "optional": False,
+            "status": "AUTO_REHYDRATE_ENABLE_FAILED",
+        },
+        {
+            "command": [hermes_path, "-p", profile, "config", "set", "memory.total-recall.auto_rehydrate.context_threshold", DEFAULT_CONTEXT_RISK_THRESHOLD],
+            "optional": False,
+            "status": "AUTO_REHYDRATE_THRESHOLD_SET_FAILED",
+        },
+        {
             "command": [hermes_path, "-p", profile, "memory", "status"],
             "optional": False,
             "status": "MEMORY_STATUS_FAILED",
@@ -688,7 +755,17 @@ def activate_profile(*, profile: str, hermes_bin: str = "hermes") -> Dict[str, A
             return {"ok": False, "status": item["status"], "profile": profile, "results": results}
         if "NOT installed" in stdout:
             return {"ok": False, "status": "PLUGIN_NOT_INSTALLED", "profile": profile, "results": results}
-    return {"ok": True, "status": "PASS", "profile": profile, "results": results}
+    return {
+        "ok": True,
+        "status": "PASS",
+        "profile": profile,
+        "contextRiskPolicy": {
+            "compression.threshold": DEFAULT_CONTEXT_RISK_THRESHOLD,
+            "memory.total-recall.auto_rehydrate.enabled": True,
+            "memory.total-recall.auto_rehydrate.context_threshold": DEFAULT_CONTEXT_RISK_THRESHOLD,
+        },
+        "results": results,
+    }
 
 
 def _is_missing_plugins_command(*, stdout: str, stderr: str) -> bool:

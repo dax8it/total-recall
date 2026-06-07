@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import shlex
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List
@@ -36,11 +37,13 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                 self._send_html(_CONTROL_CENTER_HTML)
                 return
             if parsed.path == "/api/status":
+                backup = core.backup_status(str(backup_dir))
                 self._send_json({
                     "ok": True,
                     "health": core.health(),
                     "index": core.index_status(),
-                    "backup": core.backup_status(str(backup_dir)),
+                    "backup": backup,
+                    "backupReadiness": _backup_readiness(core, backup_dir=backup_dir, backup=backup),
                     "summary": _summary(core),
                     "trustGate": _trust_gate_summary(core),
                     "knowledge": _knowledge_summary(core),
@@ -116,6 +119,9 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
             parsed = urlparse(self.path)
             if parsed.path == "/api/backup/run":
                 self._send_json(core.backup_run(str(backup_dir), keep=keep, keep_days=keep_days))
+                return
+            if parsed.path == "/api/protection/fix-all":
+                self._send_json(_fix_all(core, backup_dir=backup_dir, keep=keep, keep_days=keep_days))
                 return
             if parsed.path == "/api/vault/export":
                 payload = self._read_body_json()
@@ -287,6 +293,108 @@ def _summary(core: TotalRecallCore) -> Dict[str, Any]:
     }
 
 
+def _backup_readiness(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    backup = backup or core.backup_status(str(backup_dir))
+    summary = _summary(core)
+    health = core.health()
+    sync = _guarded_call(lambda: core.sync_status(str(backup_dir)))
+    latest_path = backup.get("latest")
+    latest = next((item for item in backup.get("backups", []) if item.get("path") == latest_path), None)
+    latest_modified = (latest or {}).get("modified")
+    latest_age_seconds = _age_seconds(latest_modified) if latest_modified else None
+    relation = sync.get("relation") if sync.get("ok") else "unknown"
+    local_event_count = int(((sync.get("local") or {}).get("eventCount") or summary.get("eventCount") or 0))
+    archive_checkpoint = ((sync.get("archive") or {}).get("latestCheckpoint") or {}) if sync.get("ok") else {}
+    archive_event_count = int(archive_checkpoint.get("event_count") or 0) if archive_checkpoint else None
+    events_not_backed_up = max(0, local_event_count - archive_event_count) if archive_event_count is not None else local_event_count
+    checkpoint_current = summary.get("checkpointStatus") == "current"
+    no_open_incidents = int(summary.get("openIncidents") or 0) == 0
+    verified_ledger = bool(health.get("ok"))
+    rehydrate_ready = verified_ledger and checkpoint_current and no_open_incidents
+
+    if not backup.get("count"):
+        status = "NO_BACKUP"
+        tone = "warn"
+        next_action = "Click Fix All to save a restore point, verify memory, and write the first backup archive."
+    elif relation == "in_sync" and rehydrate_ready:
+        status = "CURRENT"
+        tone = "ok"
+        next_action = "Memory is protected. Click Fix All again after meaningful new work."
+    elif relation == "local_ahead":
+        status = "BACKUP_BEHIND"
+        tone = "warn"
+        next_action = "Click Fix All so the latest backup covers the current memory vault."
+    elif not checkpoint_current:
+        status = "CHECKPOINT_STALE"
+        tone = "warn"
+        next_action = "Save a restore point before continuing, then back it up."
+    elif not no_open_incidents:
+        status = "INCIDENTS_OPEN"
+        tone = "bad"
+        next_action = "Resolve safety incidents before trusting restored memory."
+    elif relation == "archive_ahead":
+        status = "ARCHIVE_AHEAD"
+        tone = "warn"
+        next_action = "Latest archive is ahead; inspect/import before continuing local work."
+    elif relation == "diverged":
+        status = "DIVERGED"
+        tone = "bad"
+        next_action = "Do not auto-merge. Inspect local and archive hashes."
+    else:
+        status = "CHECK"
+        tone = "warn"
+        next_action = sync.get("message") or "Click Fix All, then refresh this panel."
+
+    return {
+        "ok": status == "CURRENT",
+        "status": status,
+        "tone": tone,
+        "backupDir": str(backup_dir.expanduser()),
+        "latestPath": latest_path,
+        "latestName": Path(str(latest_path)).name if latest_path else None,
+        "latestModified": latest_modified,
+        "latestAgeSeconds": latest_age_seconds,
+        "latestAgeLabel": _age_label(latest_age_seconds),
+        "backupCount": int(backup.get("count") or 0),
+        "totalBytes": int(backup.get("totalBytes") or 0),
+        "relation": relation,
+        "message": sync.get("message") or "Backup relation unavailable.",
+        "localEventCount": local_event_count,
+        "archiveEventCount": archive_event_count,
+        "eventsNotBackedUp": events_not_backed_up,
+        "checkpointStatus": summary.get("checkpointStatus"),
+        "checkpointLagEvents": int(summary.get("checkpointLagEvents") or 0),
+        "openIncidents": int(summary.get("openIncidents") or 0),
+        "rehydrateReady": rehydrate_ready,
+        "compactionRule": "Before a long session compresses: save and verify a restore point. After restart: restore only from verified Total Recall. Backups protect recovery; they are not memory authority by themselves.",
+        "nextAction": next_action,
+        "sync": sync,
+    }
+
+
+def _age_seconds(iso_timestamp: str) -> int | None:
+    try:
+        modified = datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return max(0, int((datetime.now(timezone.utc) - modified).total_seconds()))
+
+
+def _age_label(seconds: int | None) -> str:
+    if seconds is None:
+        return "unknown age"
+    if seconds < 60:
+        return "just now"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m old"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h old"
+    days = hours // 24
+    return f"{days}d old"
+
+
 def _guarded_call(fn: Any) -> Dict[str, Any]:
     try:
         payload = fn()
@@ -295,6 +403,32 @@ def _guarded_call(fn: Any) -> Dict[str, Any]:
         return {"ok": True, "result": payload}
     except Exception as exc:
         return {"ok": False, "status": "ERROR", "error": str(exc)}
+
+
+def _fix_all(core: TotalRecallCore, *, backup_dir: Path, keep: int, keep_days: int | None) -> Dict[str, Any]:
+    steps: list[Dict[str, Any]] = []
+
+    def step(name: str, fn: Any) -> Dict[str, Any]:
+        result = _guarded_call(fn)
+        steps.append({"name": name, "ok": result.get("ok") is not False, "result": result})
+        return result
+
+    step("save_restore_point", lambda: core.checkpoint(session_id="dashboard", label="fix_all_before_rebuild"))
+    step("rebuild_search_catalog", core.knowledge_index_rebuild)
+    step("rebuild_graph", core.knowledge_graph_rebuild)
+    step("build_compiled_truth", core.knowledge_compiled_truth_build)
+    step("run_release_gate", core.knowledge_evaluate_run)
+    step("write_latest_backup", lambda: core.backup_run(str(backup_dir), keep=keep, keep_days=keep_days))
+    backup = core.backup_status(str(backup_dir))
+    return {
+        "ok": all(item["ok"] for item in steps),
+        "status": "PASS" if all(item["ok"] for item in steps) else "ATTENTION",
+        "schema": "total-recall-fix-all-v1",
+        "steps": steps,
+        "backupReadiness": _backup_readiness(core, backup_dir=backup_dir, backup=backup),
+        "summary": _summary(core),
+        "knowledge": _knowledge_summary(core),
+    }
 
 
 def _knowledge_summary(core: TotalRecallCore) -> Dict[str, Any]:
@@ -343,8 +477,8 @@ def _mcp_summary(core: TotalRecallCore) -> Dict[str, Any]:
         "hermesProvider": "implemented",
         "home": str(core.home),
         "controls": [
-            {"name": "Hermes MemoryProvider", "status": "implemented", "detail": "Lifecycle hooks, rehydrate, verify, and Knowledge Engine tools."},
-            {"name": "Remote MCP HTTP", "status": "planned", "detail": "This dashboard is the admin shape; secured remote serving still needs OAuth and scope enforcement."},
+            {"name": "Hermes MemoryProvider", "status": "implemented", "detail": "Lifecycle hooks, safe restore, verify, and Search Catalog tools."},
+            {"name": "Remote admin HTTP", "status": "planned", "detail": "This dashboard is the local control shape; secured remote serving still needs OAuth and scope enforcement."},
             {"name": "OAuth 2.1 clients", "status": "planned", "detail": "No remote clients are accepted by this local dashboard."},
             {"name": "Live activity stream", "status": "planned", "detail": "Current control center uses explicit JSON actions and refresh."},
             {"name": "Provider adapters", "status": "guarded", "detail": "External providers require explicit authorization and redacted payloads."},
@@ -369,6 +503,7 @@ def _providers() -> list[Dict[str, Any]]:
         {"id": "google_drive", "name": "Google Drive", "status": "planned", "default": True, "note": "First direct cloud adapter candidate: OAuth + resumable upload + encrypted bundles."},
         {"id": "arweave", "name": "Arweave", "status": "planned encrypted", "default": True, "note": "Durable archive layer: encrypted bundles, permanent receipts, manual approval for upload costs."},
         {"id": "github", "name": "GitHub", "status": "planned encrypted", "default": False, "note": "Good metadata/receipt mirror or private release assets; not primary memory authority."},
+        {"id": "huggingface", "name": "Hugging Face Hub", "status": "available encrypted", "default": False, "note": "Portable agent clone storage: encrypted bundle + manifest only, intended for private HF datasets or buckets."},
         {"id": "dropbox", "name": "Dropbox", "status": "planned", "default": False, "note": "OAuth or local Dropbox folder; encrypted upload adapter should store secrets in Keychain."},
         {"id": "s3", "name": "S3-compatible", "status": "planned encrypted", "default": False, "note": "Good for Backblaze/R2/S3 with Keychain-held credentials."},
         {"id": "pinata_ipfs", "name": "Pinata/IPFS", "status": "planned encrypted", "default": False, "note": "Upload encrypted bundles only; IPFS is not private by default."},
@@ -461,7 +596,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Total Recall Remote MCP Admin</title>
+  <title>Total Recall Memory Control Center</title>
   <style>
     :root {
       color-scheme: light;
@@ -578,6 +713,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       font-size: 12px;
     }
     .status-line { display: flex; align-items: center; gap: 8px; }
+    #side-home { overflow-wrap: anywhere; word-break: break-word; }
     .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--amber); box-shadow: 0 0 0 3px rgba(255,255,255,.08); }
     .status-dot.ok { background: #32d583; }
     .status-dot.bad { background: #f97066; }
@@ -610,6 +746,21 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     }
     .status-cell { min-height: 92px; padding: 14px 15px; border-right: 1px solid var(--line); }
     .status-cell:last-child { border-right: 0; }
+    .memory-hero {
+      margin: 16px 24px 0;
+      background: linear-gradient(135deg, #e7f6f3 0%, #ffffff 72%);
+      border: 1px solid #86d6cc;
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 18px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 16px;
+      align-items: center;
+    }
+    .memory-hero h2 { margin: 0; font-size: 20px; line-height: 1.2; }
+    .memory-hero p { margin: 7px 0 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+    .memory-hero .hero-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
     .eyeline { color: var(--muted); font-size: 11px; text-transform: uppercase; font-weight: 820; letter-spacing: .04em; }
     .status-value { margin-top: 8px; font-size: 20px; line-height: 1.1; font-weight: 820; overflow-wrap: anywhere; }
     .status-value.ok { color: var(--green); }
@@ -658,6 +809,23 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       background: #fff;
     }
     .gate strong, .data-row strong { display: block; font-size: 13px; line-height: 1.25; }
+    .row-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
+    .help-mark {
+      width: 17px;
+      height: 17px;
+      border-radius: 50%;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line-strong);
+      background: #f8fafc;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1;
+      font-weight: 900;
+      cursor: help;
+      flex: 0 0 auto;
+    }
+    .help-mark:hover, .help-mark:focus { color: var(--teal-ink); border-color: #86d6cc; background: var(--teal-soft); outline: none; }
     .detail { margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
     .badge {
       border-radius: 999px;
@@ -806,6 +974,8 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       .nav { grid-template-columns: repeat(4, minmax(0, 1fr)); margin-top: 8px; }
       .side-status { display: none; }
       .status-strip { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .memory-hero { grid-template-columns: 1fr; }
+      .memory-hero .hero-actions { justify-content: flex-start; }
       .status-cell { border-bottom: 1px solid var(--line); }
       .panel.trust, .panel.knowledge, .panel.workbench, .panel.remote { grid-column: 1 / -1; }
     }
@@ -813,6 +983,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       .topbar { position: relative; grid-template-columns: 1fr; padding: 16px; }
       .toolbar { justify-content: flex-start; }
       .status-strip { margin: 14px 16px 0; grid-template-columns: 1fr; }
+      .memory-hero { margin: 14px 16px 0; }
       .status-cell { border-right: 0; }
       .workspace { padding: 14px 16px 22px; grid-template-columns: 1fr; }
       .nav { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -832,14 +1003,14 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     <aside class="sidebar">
       <a class="brand" href="#top" aria-label="Total Recall home">
         <span class="brand-mark">TR</span>
-        <span><strong>Total Recall</strong><span>Remote MCP Admin</span></span>
+        <span><strong>Total Recall</strong><span>Memory Control Center</span></span>
       </a>
       <nav class="nav" aria-label="Control center">
         <a class="active" href="#top"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 13h7V4H4v9zM13 20h7V4h-7v16zM4 20h7v-5H4v5z"/></svg>Overview</a>
-        <a href="#trust"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3l7 3v5c0 4.5-2.8 8.5-7 10-4.2-1.5-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-5"/></svg>Trust Spine</a>
-        <a href="#knowledge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h16M4 12h16M4 18h10"/><path d="M17 15l3 3-3 3"/></svg>Knowledge</a>
-        <a href="#remote"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M5 12a7 7 0 0 1 14 0"/><path d="M12 12v8"/><path d="M8 16l4 4 4-4"/></svg>Remote</a>
-        <a href="#workbench"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>Workbench</a>
+        <a href="#trust"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3l7 3v5c0 4.5-2.8 8.5-7 10-4.2-1.5-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-5"/></svg>Safety Check</a>
+        <a href="#knowledge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h16M4 12h16M4 18h10"/><path d="M17 15l3 3-3 3"/></svg>Search Catalog</a>
+        <a href="#remote"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M5 12a7 7 0 0 1 14 0"/><path d="M12 12v8"/><path d="M8 16l4 4 4-4"/></svg>Connections</a>
+        <a href="#workbench"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>Ask Memory</a>
         <a href="#vault"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 5h7l2 3h9v11H3z"/><path d="M8 13h8"/><path d="M13 10l3 3-3 3"/></svg>Vault</a>
         <a href="#backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 7h16v12H4z"/><path d="M8 7V5h8v2"/><path d="M8 12h8"/></svg>Backups</a>
       </nav>
@@ -852,31 +1023,43 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     <div class="content">
       <header class="topbar" id="top">
         <div class="title-stack">
-          <h1>Remote MCP Admin Control Center</h1>
+          <h1>Memory Control Center</h1>
           <div class="path" id="home-path">Loading Total Recall home...</div>
         </div>
         <div class="toolbar">
-          <button onclick="refresh()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>Refresh</button>
-          <button onclick="runAction('/api/checkpoint', 'Manual checkpoint')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>Checkpoint</button>
-          <button class="primary" onclick="runProtectionCycle()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3l7 3v5c0 4.5-2.8 8.5-7 10-4.2-1.5-7-5.5-7-10V6l7-3z"/></svg>Protection Cycle</button>
+          <button onclick="refresh()" title="Refresh the dashboard from the local Total Recall store."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M20 11a8 8 0 1 0-2.3 5.7"/><path d="M20 4v7h-7"/></svg>Refresh</button>
+          <button onclick="runAction('/api/checkpoint', 'Save restore point')" title="Save the current memory vault position. This does not rebuild the Search Catalog or run the quality gate."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3v12"/><path d="M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>Save Restore Point</button>
+          <button class="primary" onclick="runProtectionCycle()" title="One-click maintenance: save/backup, rebuild the Search Catalog, rebuild compiled truth, run the quality gate, then refresh."><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3l7 3v5c0 4.5-2.8 8.5-7 10-4.2-1.5-7-5.5-7-10V6l7-3z"/></svg>Fix All</button>
         </div>
       </header>
 
       <section class="status-strip" aria-label="System status">
-        <div class="status-cell"><div class="eyeline">Authority</div><div class="status-value" id="metric-authority">-</div><div class="status-sub" id="metric-authority-sub">-</div></div>
-        <div class="status-cell"><div class="eyeline">Checkpoint</div><div class="status-value" id="metric-checkpoint">-</div><div class="status-sub" id="metric-checkpoint-sub">-</div></div>
-        <div class="status-cell"><div class="eyeline">Knowledge</div><div class="status-value" id="metric-knowledge">-</div><div class="status-sub" id="metric-knowledge-sub">-</div></div>
-        <div class="status-cell"><div class="eyeline">Scorecard</div><div class="status-value" id="metric-score">-</div><div class="status-sub" id="metric-score-sub">-</div></div>
+        <div class="status-cell"><div class="eyeline">Memory Vault <span class="help-mark" tabindex="0" title="The append-only Total Recall ledger. This is the authority for saved memory.">?</span></div><div class="status-value" id="metric-authority">-</div><div class="status-sub" id="metric-authority-sub">-</div></div>
+        <div class="status-cell"><div class="eyeline">Restore Point <span class="help-mark" tabindex="0" title="The latest signed checkpoint and anchor. Saving a restore point protects the current ledger position, but does not rebuild derived search or quality views.">?</span></div><div class="status-value" id="metric-checkpoint">-</div><div class="status-sub" id="metric-checkpoint-sub">-</div></div>
+        <div class="status-cell"><div class="eyeline">Search Catalog <span class="help-mark" tabindex="0" title="A rebuildable index/graph/compiled-truth layer used for fast cited answers. It can be stale even when the restore point is current.">?</span></div><div class="status-value" id="metric-knowledge">-</div><div class="status-sub" id="metric-knowledge-sub">-</div></div>
+        <div class="status-cell"><div class="eyeline">Quality Check <span class="help-mark" tabindex="0" title="Short dashboard label for the Release Gate scorecard. NO_EVAL means it has not been run for the current derived state.">?</span></div><div class="status-value" id="metric-score">-</div><div class="status-sub" id="metric-score-sub">-</div></div>
         <div class="status-cell"><div class="eyeline">Backups</div><div class="status-value" id="metric-backup">-</div><div class="status-sub" id="metric-backup-sub">-</div></div>
-        <div class="status-cell"><div class="eyeline">Remote MCP</div><div class="status-value" id="metric-remote">-</div><div class="status-sub" id="metric-remote-sub">-</div></div>
+        <div class="status-cell"><div class="eyeline">Connections</div><div class="status-value" id="metric-remote">-</div><div class="status-sub" id="metric-remote-sub">-</div></div>
+      </section>
+
+      <section class="memory-hero" aria-label="Memory protection summary">
+        <div>
+          <h2 id="hero-title">Checking memory protection...</h2>
+          <p id="hero-sub">Total Recall is checking the memory vault, latest restore point, search catalog, and backups.</p>
+        </div>
+        <div class="hero-actions">
+          <button class="primary" onclick="runProtectionCycle()" title="One-click maintenance: save/backup, rebuild the Search Catalog, rebuild compiled truth, run the quality gate, then refresh.">Fix All</button>
+          <button onclick="runAction('/api/checkpoint', 'Save restore point')" title="Save the current memory vault position. Derived Search Catalog rows may still need Fix All or manual rebuilds.">Save Restore Point</button>
+          <a class="button" href="#workbench" title="Ask cited questions against verified Total Recall memory.">Ask Memory</a>
+        </div>
       </section>
 
       <main class="workspace">
         <section class="panel trust" id="trust">
           <div class="panel-header">
             <div>
-              <h2>Trust Spine</h2>
-              <p>Ledger, checkpoint, anchor, incident, and retrieval gates.</p>
+              <h2>Safety Check</h2>
+              <p>Shows whether memory is safe to trust, restore, and search.</p>
             </div>
             <div class="split-actions">
               <button onclick="runAction('/api/doctor', 'Doctor')">Doctor</button>
@@ -892,19 +1075,19 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <section class="panel knowledge" id="knowledge">
           <div class="panel-header">
             <div>
-              <h2>Knowledge Engine</h2>
-              <p>Cited recall, graph evidence, compiled truth, and scorecards.</p>
+              <h2>Search Catalog</h2>
+              <p>The searchable catalog built from verified memory. Rebuild it from the vault whenever needed.</p>
             </div>
           </div>
           <div class="panel-body">
             <div class="row-list" id="knowledge-rows"></div>
             <div class="action-grid" style="margin-top: 10px;">
-              <button onclick="runKnowledgeAction('/api/knowledge/index/rebuild', 'Knowledge index rebuild')">Rebuild Index</button>
-              <button onclick="runKnowledgeAction('/api/knowledge/graph/rebuild', 'Graph rebuild')">Rebuild Graph</button>
-              <button onclick="runKnowledgeAction('/api/knowledge/truth/build', 'Compiled truth build')">Build Truth</button>
-              <button onclick="runKnowledgeAction('/api/knowledge/evaluate/run', 'Evaluation scorecard')">Run Scorecard</button>
-              <button onclick="runKnowledgeAction('/api/knowledge/synthesize/run', 'Derived synthesis')">Run Synthesis</button>
-              <button onclick="showCompiledTruth()">Show Truth</button>
+              <button onclick="runKnowledgeAction('/api/knowledge/index/rebuild', 'Knowledge index rebuild')" title="Rebuild the searchable index from the memory vault. Fixes Index: Stale.">Rebuild Index</button>
+              <button onclick="runKnowledgeAction('/api/knowledge/graph/rebuild', 'Graph rebuild')" title="Rebuild entity and relationship evidence from the memory vault.">Rebuild Graph</button>
+              <button onclick="runKnowledgeAction('/api/knowledge/truth/build', 'Compiled truth build')" title="Rebuild the readable compiled-truth projection from current evidence. Fixes Compiled Truth: STALE.">Build Truth</button>
+              <button onclick="runKnowledgeAction('/api/knowledge/evaluate/run', 'Evaluation scorecard')" title="Run the quality/release gate over the Search Catalog and compiled truth. Fixes NO_EVAL.">Run Scorecard</button>
+              <button onclick="runKnowledgeAction('/api/knowledge/synthesize/run', 'Derived synthesis')" title="Create provisional learning/summary candidates. This is optional and never rewrites authority silently.">Run Synthesis</button>
+              <button onclick="showCompiledTruth()" title="Display the current compiled-truth projection without rebuilding it.">Show Truth</button>
             </div>
           </div>
         </section>
@@ -912,8 +1095,8 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <section class="panel workbench" id="workbench">
           <div class="panel-header">
             <div>
-              <h2>Operator Workbench</h2>
-              <p>Recall, inspect, and verify the promise the agent is allowed to keep.</p>
+              <h2>Ask Memory</h2>
+              <p>Ask questions, inspect evidence, and check whether remembered facts are still current.</p>
             </div>
           </div>
           <div class="panel-body">
@@ -977,8 +1160,8 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <section class="panel remote" id="remote">
           <div class="panel-header">
             <div>
-              <h2>Remote MCP Readiness</h2>
-              <p>Local authority now, guarded remote surface next.</p>
+              <h2>Connection Readiness</h2>
+              <p>Local memory control works now. Remote/admin connections stay guarded until explicitly enabled.</p>
             </div>
           </div>
           <div class="panel-body">
@@ -1034,12 +1217,16 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <section class="panel backups" id="backups">
           <div class="panel-header">
             <div>
-              <h2>Backups</h2>
-              <p>Private archives, retention policy, and download handles.</p>
+              <h2>Memory Protection</h2>
+              <p>Shows whether the latest backup covers the same memory point you are using now. Save before long sessions; restore only after verify.</p>
             </div>
-            <a class="button" href="/api/launchd.plist" target="_blank">View LaunchAgent</a>
+            <div class="split-actions">
+              <button class="primary" onclick="runProtectionCycle()" title="One-click maintenance: save/backup, rebuild the Search Catalog, rebuild compiled truth, run the quality gate, then refresh.">Fix All</button>
+              <a class="button" href="/api/launchd.plist" target="_blank">View LaunchAgent</a>
+            </div>
           </div>
           <div class="panel-body">
+            <div class="row-list" id="protection-rows" style="margin-bottom: 12px;"></div>
             <table>
               <thead><tr><th>File</th><th>Size</th><th>Modified</th><th>Actions</th></tr></thead>
               <tbody id="backup-rows"><tr><td colspan="4">Loading...</td></tr></tbody>
@@ -1086,10 +1273,11 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         renderStatus(data);
         renderTrust(data);
         renderKnowledge(data.knowledge || {});
-      renderMcp(data.mcp || {});
-      renderProviders(data.providers || []);
-      renderBackups((data.backup || {}).backups || []);
-      renderVaultPolicy(data.policy || {});
+        renderMcp(data.mcp || {});
+        renderProtection(data);
+        renderProviders(data.providers || []);
+        renderBackups((data.backup || {}).backups || []);
+        renderVaultPolicy(data.policy || {});
       } catch (error) {
         renderRaw('Refresh failed', {ok: false, error: String(error.message || error)});
       }
@@ -1100,6 +1288,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       const health = data.health || {};
       const knowledge = data.knowledge || {};
       const backup = data.backup || {};
+      const backupReadiness = data.backupReadiness || {};
       const checkpointStatus = summary.checkpointStatus || 'missing';
       const authorityOk = !!health.ok && !summary.openIncidents;
       const knowledgeOk = !!knowledge.ok;
@@ -1108,15 +1297,26 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
 
       $('home-path').textContent = (data.policy || {}).home || 'Unknown home';
       $('side-home').textContent = (data.policy || {}).home || 'Unknown home';
-      $('side-state').textContent = authorityOk ? 'Verified local authority' : 'Attention required';
+      $('side-state').textContent = authorityOk ? 'Memory protected' : 'Attention required';
       $('side-dot').className = 'status-dot ' + (authorityOk ? 'ok' : 'bad');
 
-      setMetric('metric-authority', authorityOk ? 'Verified' : 'Attention', authorityOk ? 'ok' : 'bad', `${summary.eventCount || 0} ledger event(s)`);
-      setMetric('metric-checkpoint', titleCase(checkpointStatus), checkpointStatus === 'current' ? 'ok' : 'warn', checkpointStatus === 'stale' ? `${summary.checkpointLagEvents || 0} event(s) behind` : 'checkpoint freshness');
-      setMetric('metric-knowledge', knowledgeOk ? 'Ready' : 'Degraded', knowledgeOk ? 'ok' : 'warn', knowledgeSummary(knowledge));
-      setMetric('metric-score', score, scorecard.ok ? 'ok' : 'warn', scorecard.status || ((knowledge.scorecard || {}).status || 'evaluation status'));
-      setMetric('metric-backup', backup.count ? String(backup.count) : 'None', backup.count ? 'ok' : 'warn', backup.latest ? backup.latest.split('/').pop() : 'no bundle yet');
-      setMetric('metric-remote', 'Local', 'warn', 'remote OAuth MCP is planned');
+      const lag = Number(summary.checkpointLagEvents || 0);
+      const heroOk = authorityOk && checkpointStatus === 'current' && backupReadiness.ok === true;
+      $('hero-title').textContent = heroOk
+        ? 'Memory is protected'
+        : lag > 0
+          ? `${lag} new memor${lag === 1 ? 'y needs' : 'ies need'} saving`
+          : 'Memory needs a safety check';
+      $('hero-sub').textContent = heroOk
+        ? 'The vault is verified, the restore point is current, and the latest backup covers this memory point.'
+        : (backupReadiness.nextAction || 'Click Fix All to save a restore point, verify memory, and back it up.');
+
+      setMetric('metric-authority', authorityOk ? 'Protected' : 'Attention', authorityOk ? 'ok' : 'bad', `${summary.eventCount || 0} saved memory event(s)`);
+      setMetric('metric-checkpoint', checkpointStatus === 'current' ? 'Current' : 'Needs saving', checkpointStatus === 'current' ? 'ok' : 'warn', checkpointStatus === 'stale' ? `${lag} new memor${lag === 1 ? 'y' : 'ies'} since restore point` : 'restore-point freshness');
+      setMetric('metric-knowledge', knowledgeOk ? 'Ready' : 'Needs rebuild', knowledgeOk ? 'ok' : 'warn', knowledgeSummary(knowledge));
+      setMetric('metric-score', score, scorecard.ok ? 'ok' : 'warn', scorecard.status || ((knowledge.scorecard || {}).status || 'quality status'));
+      setMetric('metric-backup', backupMetricValue(backupReadiness, backup), backupReadiness.tone || (backup.count ? 'ok' : 'warn'), backupReadiness.nextAction || (backup.latest ? backup.latest.split('/').pop() : 'no backup yet'));
+      setMetric('metric-remote', 'Local', 'warn', 'remote admin connections are planned');
     }
 
     function setMetric(id, value, tone, sub) {
@@ -1132,15 +1332,16 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       const knowledge = data.knowledge || {};
       const backup = data.backup || {};
       const trustGate = data.trustGate || {};
+      const backupReadiness = data.backupReadiness || {};
       const checkpointStatus = summary.checkpointStatus || 'missing';
       const rows = [
-        gate('Ledger hash chain', !!health.ok, health.ok ? 'Readable and chained' : 'Verify before trusted rehydrate'),
-        gate('Checkpoint freshness', checkpointStatus === 'current', checkpointStatus === 'current' ? 'No ledger lag' : `${summary.checkpointLagEvents || 0} event(s) since latest checkpoint`),
-        gate('Execution trust gate', trustGate.ok === true, trustGateSummary(trustGate)),
-        gate('Incident posture', !summary.openIncidents, summary.openIncidents ? `${summary.openIncidents} open fail-closed incident(s)` : 'No open incidents'),
-        gate('Core retrieval index', !!index.fresh, index.fresh ? 'Derived index is fresh' : 'Will rebuild from ledger authority'),
-        gate('Knowledge authority', !!knowledge.ok, knowledge.ok ? 'Derived knowledge is gated by citations' : knowledge.error || knowledge.status || 'Knowledge layer needs attention'),
-        gate('Backup inventory', !!backup.count, backup.count ? `${backup.count} archive(s) available` : 'Run protection cycle to create first archive'),
+        gate('Memory vault', !!health.ok, health.ok ? 'Readable and chained' : 'Verify before trusting restored memory'),
+        gate('Restore point', checkpointStatus === 'current', checkpointStatus === 'current' ? 'No new memories waiting to be saved' : `${summary.checkpointLagEvents || 0} new memor${Number(summary.checkpointLagEvents || 0) === 1 ? 'y' : 'ies'} since latest restore point`),
+        gate('Full safety check', trustGate.ok === true, trustGateSummary(trustGate)),
+        gate('Safety incidents', !summary.openIncidents, summary.openIncidents ? `${summary.openIncidents} open safety incident(s)` : 'No open incidents'),
+        gate('Search catalog', !!index.fresh, index.fresh ? 'Search catalog is current' : 'Will rebuild from the memory vault when needed'),
+        gate('Cited answers', !!knowledge.ok, knowledge.ok ? 'Answers are gated by citations' : knowledge.error || knowledge.status || 'Search layer needs attention'),
+        gate('Backup coverage', backupReadiness.ok === true, backupReadiness.message || (backup.count ? `${backup.count} backup archive(s) available` : 'Click Fix All to create the first backup')),
       ];
       $('trust-gates').innerHTML = rows.join('');
     }
@@ -1173,6 +1374,39 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         return dataRow(item.name, item.status, item.detail, item.status === 'implemented', tone);
       });
       $('mcp-rows').innerHTML = rows.join('');
+    }
+
+    function renderProtection(data) {
+      const readiness = data.backupReadiness || {};
+      const backup = data.backup || {};
+      const latestDetail = readiness.latestName
+        ? `${readiness.latestName} · ${readiness.latestAgeLabel || 'unknown age'} · ${formatBytes(readiness.totalBytes || backup.totalBytes || 0)} total`
+        : 'No backup archive found.';
+      const coverageDetail = readiness.archiveEventCount == null
+        ? `${readiness.localEventCount || 0} local event(s); archive checkpoint unavailable.`
+        : `${readiness.localEventCount || 0} local event(s), ${readiness.archiveEventCount || 0} archived, ${readiness.eventsNotBackedUp || 0} not backed up.`;
+      const rehydrateDetail = readiness.rehydrateReady
+        ? 'Safe to restore from Total Recall: memory vault verified, restore point current, no open incidents.'
+        : `Hold restore until restore point=${readiness.checkpointStatus || 'unknown'}, unsaved memories=${readiness.checkpointLagEvents || 0}, open incidents=${readiness.openIncidents || 0}.`;
+      const rows = [
+        dataRow('Overall memory protection', titleCaseStatus(readiness.status || 'CHECK'), readiness.nextAction || 'Click Fix All, then refresh.', readiness.ok === true, readiness.tone || 'warn'),
+        dataRow('Latest backup', readiness.latestName ? 'Present' : 'Missing', latestDetail, !!readiness.latestName, readiness.latestName ? 'ok' : 'warn'),
+        dataRow('Backup coverage', readiness.relation || 'unknown', `${readiness.message || 'Backup relation unavailable.'} ${coverageDetail}`, readiness.relation === 'in_sync', readiness.relation === 'in_sync' ? 'ok' : 'warn'),
+        dataRow('Restore guard', readiness.rehydrateReady ? 'Ready' : 'Save first', readiness.compactionRule || rehydrateDetail, readiness.rehydrateReady === true, readiness.rehydrateReady ? 'ok' : 'warn'),
+      ];
+      $('protection-rows').innerHTML = rows.join('');
+    }
+
+    function backupMetricValue(readiness, backup) {
+      if (readiness && readiness.status === 'CURRENT') return 'Current';
+      if (readiness && readiness.status === 'BACKUP_BEHIND') return 'Behind';
+      if (readiness && readiness.status === 'NO_BACKUP') return 'None';
+      if (readiness && readiness.status) return titleCaseStatus(readiness.status);
+      return backup.count ? String(backup.count) : 'None';
+    }
+
+    function titleCaseStatus(value) {
+      return String(value || '').toLowerCase().split('_').map(titleCase).join(' ');
     }
 
     function renderProviders(providers) {
@@ -1224,7 +1458,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     }
 
     async function runProtectionCycle() {
-      return runAction('/api/backup/run', 'Protection cycle');
+      return runAction('/api/protection/fix-all', 'Fix All');
     }
 
     async function runKnowledgeAction(url, label) {
@@ -1540,12 +1774,36 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
 
     function gate(name, ok, detail) {
       const tone = ok ? 'ok' : 'warn';
-      return `<div class="gate"><span><strong>${escapeHtml(name)}</strong><span class="detail">${escapeHtml(detail || '')}</span></span>${badge(ok ? 'Pass' : 'Attention', tone)}</div>`;
+      return `<div class="gate"><span><strong>${titleWithHelp(name)}</strong><span class="detail">${escapeHtml(detail || '')}</span></span>${badge(ok ? 'Pass' : 'Attention', tone)}</div>`;
     }
 
     function dataRow(name, value, detail, ok, forcedTone) {
       const tone = forcedTone || (ok ? 'ok' : value === 'planned' || value === 'NO_EVAL' ? 'warn' : 'neutral');
-      return `<div class="data-row"><span><strong>${escapeHtml(name)}</strong><span class="detail">${escapeHtml(detail || '')}</span></span>${badge(escapeHtml(value || '-'), tone)}</div>`;
+      return `<div class="data-row"><span><strong>${titleWithHelp(name)}</strong><span class="detail">${escapeHtml(detail || '')}</span></span>${badge(escapeHtml(value || '-'), tone)}</div>`;
+    }
+
+    function titleWithHelp(name) {
+      const help = helpText(name);
+      const label = escapeHtml(name);
+      if (!help) return label;
+      return `<span class="row-title">${label}<span class="help-mark" tabindex="0" title="${escapeHtml(help)}" aria-label="${escapeHtml(help)}">?</span></span>`;
+    }
+
+    function helpText(name) {
+      const help = {
+        'Memory Vault': 'The append-only Total Recall ledger. This is the authority for saved memory.',
+        'Restore Point': 'The latest signed checkpoint and anchor. Saving a restore point protects the current ledger position, but does not rebuild derived search or quality views.',
+        'Search Catalog': 'A rebuildable index/graph/compiled-truth layer used for fast cited answers. It can be stale even when the restore point is current.',
+        'Index': 'Searchable source index rebuilt from the memory vault. If stale, click Rebuild Index or Fix All.',
+        'Graph': 'Derived entities and relationships rebuilt from cited ledger evidence.',
+        'Compiled Truth': 'Readable projection built from the Search Catalog. It is derived, not authority.',
+        'Synthesis': 'Optional provisional learning/summary output. It does not silently rewrite memory.',
+        'Release Gate': 'Quality scorecard for the Search Catalog and compiled truth. NO_EVAL means it has not been run for the current derived state.',
+        'Quality Check': 'Short dashboard label for the Release Gate scorecard.',
+        'Backup coverage': 'Whether the latest backup archive covers the same event count as the local memory vault.',
+        'Restore guard': 'Whether verified restore/rehydrate is safe from the current local memory state.'
+      };
+      return help[name] || '';
     }
 
     function badge(text, tone) {

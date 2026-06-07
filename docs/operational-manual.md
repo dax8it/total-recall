@@ -54,6 +54,19 @@ Rules:
 7. Generated reports are audit artifacts, not memory sources.
 8. Federation and external providers require explicit authorization.
 
+For Hermes operators, collapse compaction and rehydration into one visible **context risk zone** rule:
+
+```text
+When context enters the risk zone, save/checkpoint/verify before old chat is lost.
+After compaction, reset, resume, or restart, rehydrate only from verified Total Recall.
+```
+
+If the Hermes profile exposes both `compression.threshold` and
+`memory.total-recall.auto_rehydrate.context_threshold`, set them to the same
+number for the simplest mental model. If they differ, the higher rehydrate
+threshold is just an extra high-context safety net; Hermes compaction hooks still
+write pre-compaction continuity.
+
 ## First 10 Minutes
 
 ### 1. Install

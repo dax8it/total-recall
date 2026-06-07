@@ -58,7 +58,9 @@ installs or upgrades `total-recall-core` there when needed, writes
 `~/.hermes/plugins/memory/total-recall`, also writes the flat
 `~/.hermes/plugins/total-recall` compatibility provider path used by Hermes
 v0.15.x, validates the bundle, selects `memory.provider=total-recall` for the
-profile, and checks Hermes memory status.
+profile, writes aligned Context Risk Zone defaults (`compression.threshold=0.55`,
+`auto_rehydrate.enabled=true`, `auto_rehydrate.context_threshold=0.55`), and
+checks Hermes memory status.
 
 Check readiness at any time:
 
@@ -227,12 +229,23 @@ lexical authority-artifact scan
 ```
 
 QMD is optional and is discovered from `TOTAL_RECALL_QMD_BIN` or `PATH`.
+For portable installs, do not require `/usr/local/bin`: link qmd into the first
+writable PATH directory, or fall back to `~/.local/bin` and add that directory to
+PATH.
+
+```bash
+# after `npm install -g @tobilu/qmd` or `bun install -g @tobilu/qmd`
+total-recall qmd link
+# explicit fallback if no writable PATH entry exists
+total-recall qmd link --bin-dir ~/.local/bin
+```
 
 Useful environment flags:
 
 ```bash
 TOTAL_RECALL_ENABLE_LANCEDB=0
 TOTAL_RECALL_ENABLE_QMD=0
+TOTAL_RECALL_QMD_BIN=/path/to/qmd
 TOTAL_RECALL_QMD_EMBED=1
 ```
 
@@ -314,12 +327,45 @@ while keeping profile-local ledgers and indexes isolated.
 
 ## Hermes Compaction And Rehydration
 
-Hermes Agent owns context compaction thresholds. Total Recall does not decide
-when compaction happens.
+Use one operator model:
 
-When Hermes approaches the threshold, it calls the active memory provider's
-`on_pre_compress(messages)` hook before summarizing and discarding older context.
-The Total Recall Hermes provider responds by:
+```text
+save completed turns -> checkpoint -> verify -> rehydrate cited context
+```
+
+![Hermes compaction and Total Recall rehydration](docs/assets/hermes-compaction-rehydrate.svg)
+
+Hermes Agent owns when old chat is compacted. Total Recall owns whether prior
+memory is safe to reuse. The easiest profile policy is to treat compaction and
+auto-rehydrate as the same visible **context risk zone**: when Hermes is close to
+compaction, Total Recall should already have saved the recent turn state,
+checkpointed/verified the ledger point, and be ready to rehydrate after the
+context changes.
+
+A practical Hermes profile can align the two numbers so operators do not have to
+think about separate gates:
+
+```yaml
+compression:
+  enabled: true
+  threshold: 0.55      # Hermes starts compacting old context here
+  target_ratio: 0.20
+
+memory:
+  provider: total-recall
+  total-recall:
+    auto_rehydrate:
+      enabled: true
+      context_threshold: 0.55  # same visible risk zone
+```
+
+If `auto_rehydrate.context_threshold` is higher than `compression.threshold`, it
+is only an additional high-context safety net. It is not a second source of
+truth. Total Recall still receives Hermes compaction lifecycle hooks.
+
+When Hermes approaches the compaction threshold, it calls the active memory
+provider's `on_pre_compress(messages)` hook before summarizing and discarding
+older context. The Total Recall Hermes provider responds by:
 
 1. ingesting a `pre_compress` event into the authoritative ledger
 2. building a source-cited context plan from the local store
@@ -342,6 +388,24 @@ anchor fails validation, Total Recall refuses to produce a context block.
 `trust verify` is stricter: it requires the latest checkpoint to pin the current
 ledger, proves export/import persistence, runs isolated source/freshness/timeline
 vault/learning-review/federation fixtures, and verifies the Hermes plugin bundle surface.
+
+### Search Later By Use Case
+
+After Total Recall has synced/checkpointed the session, search or rehydrate by
+what you are trying to recover:
+
+```bash
+# What were we doing before compaction?
+total-recall rehydrate --session-id main --query "active work before compaction"
+
+total-recall search "Total Recall dashboard backup panel"
+total-recall knowledge query --query "What was the last verified state before rehydrate?" --format text
+total-recall knowledge query --query "What decisions did we make about backup freshness?" --format text
+```
+
+Use `search` for raw cited hits. Use `knowledge query` for a synthesized cited
+answer. Use `rehydrate` when an agent needs a compact context block to continue
+work after compaction, reset, resume, or restart.
 
 ## Nightly Learning Review
 

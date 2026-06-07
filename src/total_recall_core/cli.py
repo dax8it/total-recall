@@ -279,6 +279,56 @@ def build_parser() -> argparse.ArgumentParser:
     ext_reject.add_argument("external_id")
     ext_reject.add_argument("--reason", default="")
 
+    portable = sub.add_parser("portable-clone", aliases=["clone"])
+    portable_sub = portable.add_subparsers(dest="portable_command")
+    portable_export = portable_sub.add_parser("export")
+    portable_export.add_argument("--out-dir", default="~/total-recall-portable-clones")
+    portable_export.add_argument("--provider", default="huggingface")
+    portable_export.add_argument("--repo-id", default="")
+    portable_export.add_argument("--passphrase", default="", help="Prefer TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE; CLI value is for tests/manual local use.")
+    portable_export.add_argument("--upload", action="store_true")
+    portable_export.add_argument("--include-index", action="store_true")
+    portable_export.add_argument("--format", choices=["json", "text"], default="json")
+    portable_restore = portable_sub.add_parser("restore")
+    portable_restore.add_argument("bundle")
+    portable_restore.add_argument("--passphrase", default="", help="Prefer TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE; CLI value is for tests/manual local use.")
+    portable_restore.add_argument("--replace", action="store_true")
+    portable_restore.add_argument("--format", choices=["json", "text"], default="json")
+
+    loop = sub.add_parser("loop")
+    loop_sub = loop.add_subparsers(dest="loop_command")
+    loop_start = loop_sub.add_parser("start")
+    loop_start.add_argument("--goal", required=True)
+    loop_start.add_argument("--project", default="")
+    loop_start.add_argument("--agent", default="")
+    loop_start.add_argument("--worktree", default="")
+    loop_start.add_argument("--phase", default="discovery")
+    loop_start.add_argument("--evidence", action="append", default=[])
+    loop_start.add_argument("--format", choices=["json", "text"], default="text")
+    loop_note = loop_sub.add_parser("note")
+    loop_note.add_argument("loop_id")
+    loop_note.add_argument("--text", required=True)
+    loop_note.add_argument("--phase", default="progress")
+    loop_note.add_argument("--evidence", action="append", default=[])
+    loop_note.add_argument("--format", choices=["json", "text"], default="text")
+    loop_verify = loop_sub.add_parser("verify")
+    loop_verify.add_argument("loop_id")
+    loop_verify.add_argument("--status", required=True)
+    loop_verify.add_argument("--summary", default="")
+    loop_verify.add_argument("--evidence", action="append", default=[])
+    loop_verify.add_argument("--format", choices=["json", "text"], default="text")
+    loop_complete = loop_sub.add_parser("complete")
+    loop_complete.add_argument("loop_id")
+    loop_complete.add_argument("--status", default="DONE")
+    loop_complete.add_argument("--summary", default="")
+    loop_complete.add_argument("--evidence", action="append", default=[])
+    loop_complete.add_argument("--format", choices=["json", "text"], default="text")
+    loop_inbox = loop_sub.add_parser("inbox")
+    loop_inbox.add_argument("--include-completed", action="store_true")
+    loop_inbox.add_argument("--agent", default="")
+    loop_inbox.add_argument("--project", default="")
+    loop_inbox.add_argument("--format", choices=["json", "text"], default="text")
+
     export = sub.add_parser("export")
     export.add_argument("--out", required=True)
     export.add_argument("--include-index", action="store_true")
@@ -343,6 +393,19 @@ def build_parser() -> argparse.ArgumentParser:
     hermes_bundle = hermes_sub.add_parser("bundle")
     hermes_bundle.add_argument("--out", required=True, help="Output .tar.gz path for a distributable Hermes plugin bundle.")
     hermes_bundle.add_argument("--force", action="store_true")
+
+    qmd = sub.add_parser("qmd", help="Manage the optional qmd binary used for derived semantic recall.")
+    qmd_sub = qmd.add_subparsers(dest="qmd_command")
+    qmd_status = qmd_sub.add_parser("status")
+    qmd_status.add_argument("--source", default="", help="Explicit qmd executable path to inspect.")
+    qmd_status.add_argument("--bin-dir", default="", help="Directory where the qmd command should be linked.")
+    qmd_status.add_argument("--format", choices=["json", "text"], default="text")
+    qmd_link = qmd_sub.add_parser("link")
+    qmd_link.add_argument("--source", default="", help="Explicit qmd executable path. Defaults to $TOTAL_RECALL_QMD_BIN, PATH, then common Bun/npm locations.")
+    qmd_link.add_argument("--bin-dir", default="", help="Writable bin directory for the qmd symlink. Defaults to the first writable PATH entry, then ~/.local/bin.")
+    qmd_link.add_argument("--force", action="store_true", help="Replace an existing qmd file/symlink at the destination.")
+    qmd_link.add_argument("--dry-run", action="store_true")
+    qmd_link.add_argument("--format", choices=["json", "text"], default="text")
 
     return parser
 
@@ -630,12 +693,35 @@ def _print_knowledge_truth(payload: dict, *, fmt: str) -> int:
     return 0 if payload.get("ok", True) else 1
 
 
+def _print_qmd(payload: dict, *, fmt: str) -> int:
+    if fmt == "json":
+        return _print(payload)
+    state = "ready" if payload.get("ok") else "needs attention"
+    print(f"Total Recall qmd link: {state}")
+    source = payload.get("source") or {}
+    if source.get("path"):
+        print(f"Source: {source.get('path')}")
+    else:
+        print(source.get("message") or source.get("status") or "qmd source not found")
+    if payload.get("destination"):
+        print(f"Symlink: {payload.get('destination')}")
+    if payload.get("status"):
+        print(f"Status: {payload.get('status')}")
+    if payload.get("message"):
+        print(payload.get("message"))
+    if payload.get("pathHint"):
+        print(payload.get("pathHint"))
+    return 0 if payload.get("ok", True) else 1
+
+
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     command = args.command or "health"
     if command == "hermes":
         return _handle_hermes(args)
+    if command == "qmd":
+        return _handle_qmd(args)
     core = _core(args)
 
     if command == "health":
@@ -878,6 +964,42 @@ def main() -> int:
             return _print(core.external_promote(args.external_id, session_id=args.session_id))
         if sub == "reject":
             return _print(core.external_reject(args.external_id, reason=args.reason))
+    if command in {"portable-clone", "clone"}:
+        sub = args.portable_command or "export"
+        if sub == "export":
+            return _print(
+                core.portable_clone_export(
+                    out_dir=args.out_dir,
+                    passphrase=args.passphrase,
+                    provider=args.provider,
+                    repo_id=args.repo_id,
+                    upload=args.upload,
+                    include_index=args.include_index,
+                )
+            )
+        if sub == "restore":
+            return _print(core.portable_clone_restore(args.bundle, passphrase=args.passphrase, replace=args.replace))
+    if command == "loop":
+        sub = args.loop_command or "inbox"
+        if sub == "start":
+            return _print(
+                core.loop_start(
+                    goal=args.goal,
+                    project=args.project,
+                    agent=args.agent,
+                    worktree=args.worktree,
+                    phase=args.phase,
+                    evidence=args.evidence,
+                )
+            )
+        if sub == "note":
+            return _print(core.loop_note(args.loop_id, text=args.text, phase=args.phase, evidence=args.evidence))
+        if sub == "verify":
+            return _print(core.loop_verify(args.loop_id, status=args.status, summary=args.summary, evidence=args.evidence))
+        if sub == "complete":
+            return _print(core.loop_complete(args.loop_id, status=args.status, summary=args.summary, evidence=args.evidence))
+        if sub == "inbox":
+            return _print(core.loop_inbox(include_completed=args.include_completed, agent=args.agent, project=args.project))
     if command == "export":
         return _print(core.export_bundle(args.out, include_index=args.include_index))
     if command == "import":
@@ -966,6 +1088,23 @@ def _handle_hermes(args: argparse.Namespace) -> int:
     if sub == "bundle":
         return _print(hermes_installer.bundle_plugin(out=args.out, force=args.force))
     return _print({"ok": False, "error": f"hermes command not implemented: {sub}"})
+
+
+def _handle_qmd(args: argparse.Namespace) -> int:
+    if __package__ in {None, ""}:
+        from total_recall_core import qmd_installer
+    else:
+        from . import qmd_installer
+
+    sub = args.qmd_command or "status"
+    if sub == "status":
+        return _print_qmd(qmd_installer.qmd_link_status(source=args.source, bin_dir=args.bin_dir), fmt=args.format)
+    if sub == "link":
+        return _print_qmd(
+            qmd_installer.link_qmd(source=args.source, bin_dir=args.bin_dir, force=args.force, dry_run=args.dry_run),
+            fmt=args.format,
+        )
+    return _print({"ok": False, "error": f"qmd command not implemented: {sub}"})
 
 
 if __name__ == "__main__":

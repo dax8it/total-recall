@@ -49,11 +49,18 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         with urlopen(base_url + "/", timeout=10) as response:
             html = response.read().decode("utf-8")
 
-        assert "Remote MCP Admin Control Center" in html
-        assert "Trust Spine" in html
-        assert "Knowledge Engine" in html
-        assert "Operator Workbench" in html
-        assert "Remote MCP Readiness" in html
+        assert "Memory Control Center" in html
+        assert "Memory is protected" in html
+        assert "Fix All" in html
+        assert "Save Restore Point" in html
+        assert "It can be stale even when the restore point is current" in html
+        assert "Run the quality/release gate" in html
+        assert "Safety Check" in html
+        assert "Search Catalog" in html
+        assert "Memory Protection" in html
+        assert "Save before long sessions; restore only after verify" in html
+        assert "Ask Memory" in html
+        assert "Connection Readiness" in html
         assert "Obsidian Vault Export" in html
         assert "runVaultExport" in html
         assert "runSourceIngest" in html
@@ -64,7 +71,13 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert status["ok"] is True
         assert "knowledge" in status
         assert "mcp" in status
+        assert "backupReadiness" in status
+        assert status["backupReadiness"]["status"] == "NO_BACKUP"
+        assert "Backups protect recovery" in status["backupReadiness"]["compactionRule"]
         assert status["mcp"]["surface"] == "local-admin-http"
+        hf_provider = next(provider for provider in status["providers"] if provider["id"] == "huggingface")
+        assert hf_provider["status"] == "available encrypted"
+        assert "Portable agent clone storage" in hf_provider["note"]
         assert status["policy"]["defaultVaultDir"].endswith("TotalRecallVault")
 
         rebuilt = _post_json(base_url + "/api/knowledge/index/rebuild")
@@ -130,8 +143,21 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert promoted["ok"] is True
         assert promoted["eventCount"] == 1
 
-        checkpoint = _post_json(base_url + "/api/checkpoint")
-        assert checkpoint["ok"] is True
+        fix_all = _post_json(base_url + "/api/protection/fix-all")
+        assert fix_all["ok"] is True
+        assert [step["name"] for step in fix_all["steps"]] == [
+            "save_restore_point",
+            "rebuild_search_catalog",
+            "rebuild_graph",
+            "build_compiled_truth",
+            "run_release_gate",
+            "write_latest_backup",
+        ]
+        assert fix_all["knowledge"]["index"]["fresh"] is True
+        backup_status = _get_json(base_url + "/api/status")
+        assert backup_status["backupReadiness"]["status"] == "CURRENT"
+        assert backup_status["backupReadiness"]["relation"] == "in_sync"
+        assert backup_status["backupReadiness"]["rehydrateReady"] is True
         trust = _post_json(base_url + "/api/trust/verify")
         assert trust["ok"] is True
         assert trust["summary"]["failedRequired"] == 0

@@ -52,6 +52,150 @@ def test_ingest_search_checkpoint_verify_rehydrate(tmp_path):
     assert "smoke test memory" in rehydrated["context_block"]
 
 
+def test_portable_clone_export_encrypts_and_restore_bootstrap_verifies(tmp_path):
+    source_home = tmp_path / "source"
+    core = TotalRecallCore(TotalRecallConfig(home=source_home, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Portable clone secret continuity fact.", session_id="clone")
+    core.checkpoint(session_id="clone", label="portable_clone_source")
+
+    exported = core.portable_clone_export(
+        out_dir=tmp_path / "hf-staging",
+        passphrase="correct horse battery staple",
+        provider="huggingface",
+        repo_id="alex/total-recall-portable-clone",
+        upload=False,
+    )
+
+    assert exported["ok"] is True
+    assert exported["schema"] == "total-recall-portable-clone-v1"
+    assert exported["provider"]["id"] == "huggingface"
+    assert exported["status"] == "READY_FOR_UPLOAD"
+    encrypted_bundle = Path(exported["encryptedBundle"])
+    manifest = Path(exported["manifestFile"])
+    assert encrypted_bundle.exists()
+    assert manifest.exists()
+    assert encrypted_bundle.suffix == ".enc"
+    assert b"Portable clone secret continuity fact" not in encrypted_bundle.read_bytes()
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    assert manifest_payload["encryption"]["algorithm"] == "AES-256-GCM/PBKDF2-SHA256"
+    assert manifest_payload["ledger"]["eventCount"] == 1
+
+    restored = TotalRecallCore(TotalRecallConfig(home=tmp_path / "restored", enable_lancedb=False, enable_qmd=False))
+    result = restored.portable_clone_restore(
+        encrypted_bundle,
+        passphrase="correct horse battery staple",
+        replace=True,
+    )
+
+    assert result["ok"] is True
+    assert result["status"] == "PASS"
+    assert result["verification"]["ok"] is True
+    assert restored.search("secret continuity fact")["count"] == 1
+
+
+def test_portable_clone_restore_rejects_wrong_passphrase(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Wrong passphrase should not restore.", session_id="clone")
+    core.checkpoint(session_id="clone")
+    exported = core.portable_clone_export(
+        out_dir=tmp_path / "staging",
+        passphrase="right-passphrase",
+        provider="huggingface",
+        upload=False,
+    )
+
+    restored = TotalRecallCore(TotalRecallConfig(home=tmp_path / "target", enable_lancedb=False, enable_qmd=False))
+    result = restored.portable_clone_restore(exported["encryptedBundle"], passphrase="wrong-passphrase", replace=True)
+
+    assert result["ok"] is False
+    assert result["error"] == "decrypt_failed"
+    assert restored.health()["eventCount"] == 0
+
+
+def test_loop_event_lifecycle_and_inbox(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+
+    started = core.loop_start(
+        goal="Keep Total Recall release-ready",
+        project="/repo/total-recall",
+        agent="sparky",
+        worktree="/repo/.worktrees/release-loop",
+    )
+    loop_id = started["loop"]["loop_id"]
+    assert started["ok"] is True
+    assert started["loop"]["status"] == "active"
+
+    core.loop_note(loop_id, text="Discovery found stale docs.", phase="discovery", evidence=["docs/hermes.md"])
+    verified = core.loop_verify(loop_id, status="PASS", summary="Tests passed", evidence=["pytest -q"])
+
+    inbox = core.loop_inbox()
+    assert inbox["ok"] is True
+    assert inbox["count"] == 1
+    assert inbox["loops"][0]["loop_id"] == loop_id
+    assert inbox["loops"][0]["lastEvent"] == "verify"
+    assert inbox["loops"][0]["lastVerification"]["status"] == "PASS"
+    assert verified["loop"]["phase"] == "verified"
+
+    completed = core.loop_complete(loop_id, status="DONE", summary="Release-readiness loop completed.")
+    assert completed["loop"]["status"] == "completed"
+    assert core.loop_inbox()["count"] == 0
+    assert core.loop_inbox(include_completed=True)["loops"][0]["status"] == "completed"
+
+
+def test_loop_cli_start_and_inbox_json(tmp_path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src"
+    start = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(tmp_path),
+            "loop",
+            "start",
+            "--goal",
+            "Daily repo triage",
+            "--project",
+            "/repo/total-recall",
+            "--agent",
+            "smarty",
+            "--format",
+            "json",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    payload = json.loads(start.stdout)
+    assert payload["ok"] is True
+    assert payload["loop"]["goal"] == "Daily repo triage"
+
+    inbox = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(tmp_path),
+            "loop",
+            "inbox",
+            "--format",
+            "json",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    inbox_payload = json.loads(inbox.stdout)
+    assert inbox_payload["count"] == 1
+    assert inbox_payload["loops"][0]["agent"] == "smarty"
+
+
 def test_verify_fails_closed_when_anchor_is_tampered(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     core.ingest(kind="note", text="Important continuity fact.", session_id="s1")

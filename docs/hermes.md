@@ -34,11 +34,14 @@ general-plugin `kind` so Hermes auto-detects it as an exclusive memory provider
 instead of loading it as a normal tool plugin.
 
 It validates the bundle and, when `--profile <profile> --activate` is present,
-runs:
+runs the profile-scoped activation sequence with aligned Context Risk Zone defaults:
 
 ```bash
 <hermes-python> -m pip install --upgrade <this-checkout-or-total-recall-core-version>
 hermes -p <profile> config set memory.provider total-recall
+hermes -p <profile> config set compression.threshold 0.55
+hermes -p <profile> config set memory.total-recall.auto_rehydrate.enabled true
+hermes -p <profile> config set memory.total-recall.auto_rehydrate.context_threshold 0.55
 hermes -p <profile> memory status
 ```
 
@@ -73,6 +76,26 @@ nonstandard homes, pass `--hermes-home /path/to/hermes-home`. If auto-detection
 cannot find Hermes' Python, pass `--hermes-python /path/to/hermes/venv/bin/python`.
 For offline installs, pass `--core-source /path/to/total_recall_core.whl` or a
 checkout path.
+
+## Optional QMD Symlink
+
+QMD is a derived semantic-search backend, not continuity authority. Total Recall
+discovers it from `TOTAL_RECALL_QMD_BIN` or `PATH`. For portable setup, avoid
+hard-coding `/usr/local/bin` because it is often root-owned on macOS. Instead:
+
+```bash
+npm install -g @tobilu/qmd   # or: bun install -g @tobilu/qmd
+total-recall qmd link
+qmd --version
+```
+
+`total-recall qmd link` picks the first writable PATH directory and otherwise
+falls back to `~/.local/bin`; if the fallback is not on PATH, it prints the exact
+PATH line to add. You can force a known user bin with:
+
+```bash
+total-recall qmd link --bin-dir ~/.local/bin
+```
 
 ## Distributable Plugin Bundle
 
@@ -231,16 +254,71 @@ into the current profile.
 
 ## Automatic Rehydration
 
-Hermes owns compaction thresholds. Total Recall adds provider policy that can
-inject a verified rehydrate block when continuity risk rises.
+Hermes owns compaction thresholds. Total Recall owns whether memory is safe to
+reuse after context changes. For humans, manage both with one visible concept:
 
-Default triggers include startup or gateway restart, `/new`, `/resume`, session
-id changes, compaction, repeated compactions, context usage crossing the
+```text
+Context Risk Zone = start saving/checkpointing/verifying before old chat is lost
+```
+
+Recommended simple profile policy:
+
+```yaml
+compression:
+  enabled: true
+  threshold: 0.55
+
+memory:
+  provider: total-recall
+  total-recall:
+    auto_rehydrate:
+      enabled: true
+      context_threshold: 0.55
+```
+
+That alignment makes the operator story simple: when Hermes gets close enough to
+compact, Total Recall is also allowed to prepare verified rehydrate context. A
+higher `auto_rehydrate.context_threshold` is just an emergency/high-context
+safety net; compaction hooks still fire at Hermes' own threshold.
+
+![Hermes compaction and Total Recall rehydration](assets/hermes-compaction-rehydrate.svg)
+
+Default provider triggers include startup or gateway restart, `/new`, `/resume`,
+session id changes, compaction, repeated compactions, context usage crossing the
 configured threshold, stale checkpoint detection, and low local continuity
 confidence during prefetch.
 
 Automatic rehydration is still verified. If verification fails, the plugin
 returns a fail-closed warning instead of prior-memory content.
+
+### What Gets Saved, When
+
+- Completed Hermes turns are written through `sync_turn()`.
+- Before compaction, Hermes calls `on_pre_compress(messages)` and Total Recall
+  writes a `pre_compress` event with recent decisions, blockers, file paths,
+  approvals, and next actions.
+- Session switches/resets/resumes are written as session lifecycle events.
+- Session end writes a `session_end` event and creates a checkpoint.
+- Manual `total_recall_checkpoint` / `total-recall checkpoint` creates a fresh
+  checkpoint when a handoff or risky operation needs a hard boundary.
+
+### Search And Rehydrate Use Cases
+
+```bash
+# What were we doing before compaction?
+total-recall rehydrate --session-id main --query "active work before compaction"
+
+# Find the session/context where a dashboard panel was discussed.
+total-recall search "Total Recall dashboard backup panel"
+
+# Ask for a cited answer instead of raw hits.
+total-recall knowledge query --query "What was the last verified state before rehydrate?" --format text
+total-recall knowledge query --query "What decisions did we make about backup freshness?" --format text
+```
+
+Use `search` for raw cited hits, `knowledge query` for synthesized cited answers,
+and `rehydrate` when Hermes needs a compact context block after compaction,
+reset, resume, or restart.
 
 ## Backup And Recovery
 
