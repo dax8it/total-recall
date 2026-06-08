@@ -9,7 +9,7 @@ from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from total_recall_core import TotalRecallConfig, TotalRecallCore
-from total_recall_core.dashboard import _handler
+from total_recall_core.dashboard import _handler, _redact_payload, _redacted_line
 
 
 @contextmanager
@@ -51,18 +51,21 @@ def _post_json_allow_error(url: str, payload: dict | None = None):
 def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET_VALUE"):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
+    remote_dir = tmp_path / "fake-hf-remote"
+    remote_dir.mkdir()
     hf = bin_dir / "hf"
     hf.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, sys\n"
+        "import json, pathlib, shutil, sys\n"
         f"leak={leak!r}\n"
         f"private={str(private)!r}\n"
+        f"remote=pathlib.Path({str(remote_dir)!r})\n"
         "args=sys.argv[1:]\n"
         "if args[:2]==['auth','whoami']:\n print('fake-user'); raise SystemExit(0)\n"
         "if args[:2]==['repo','info']:\n print(json.dumps({'id':args[2], 'private': private == 'True'})); print('token='+leak, file=sys.stderr); raise SystemExit(0)\n"
         "if args[:2]==['repo','create']:\n print('created private dataset token='+leak); raise SystemExit(0)\n"
-        "if args and args[0]=='upload':\n print('uploaded token='+leak); raise SystemExit(0)\n"
-        "if args and args[0]=='download':\n raise SystemExit(0)\n"
+        "if args and args[0]=='upload':\n src=pathlib.Path(args[2]); dest=remote/args[3]; shutil.copy2(src, dest); print('uploaded token='+leak); raise SystemExit(0)\n"
+        "if args and args[0]=='download':\n local=pathlib.Path(args[args.index('--local-dir')+1]); local.mkdir(parents=True, exist_ok=True); [shutil.copy2(p, local/p.name) for p in remote.glob('total-recall-portable-clone-*.tar.gz.enc*')]; raise SystemExit(0)\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
@@ -294,21 +297,79 @@ def test_hf_wizard_status_session_repo_and_restore_safety(tmp_path, monkeypatch)
 
         _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": secret})
         restored = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset", "localDir": str(core.home / "portable-clones")})
-        assert restored["restoreTest"]["activeHome"] == str(core.home)
-        assert restored["restoreTest"]["testHome"] != str(core.home)
-        assert "total-recall-hf-restore-test." in restored["restoreTest"]["testHome"]
+        assert restored["ok"] is False
+        assert restored["status"] == "LOCAL_TEST_ONLY"
+        assert restored["readyForGreen"] is False
+        assert restored["restoreTest"]["downloadSource"] == "local"
+        assert restored["restoreTest"]["downloadOk"] is False
         assert restored["restoreTest"]["activeHomeUnchanged"] is True
         assert core.health()["eventCount"] == active_count
-        if restored["ok"]:
-            assert restored["readyForGreen"] is True
-            assert restored["restoreTest"]["failedRequired"] == 0
+
+        bundle = next((core.home / "portable-clones").glob("total-recall-portable-clone-*.tar.gz.enc"))
+        bundle_restore = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset", "bundle": str(bundle)})
+        assert bundle_restore["ok"] is False
+        assert bundle_restore["status"] == "LOCAL_TEST_ONLY"
+        assert bundle_restore["readyForGreen"] is False
+        assert _get_json(base_url + "/api/hf/wizard/status")["readyForGreen"] is False
+
+        remote_restored = _post_json(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset"})
+        assert remote_restored["restoreTest"]["activeHome"] == str(core.home)
+        assert remote_restored["restoreTest"]["testHome"] != str(core.home)
+        assert "total-recall-hf-restore-test." in remote_restored["restoreTest"]["testHome"]
+        assert remote_restored["restoreTest"]["activeHomeUnchanged"] is True
+        assert remote_restored["restoreTest"]["downloadSource"] == "huggingface"
+        assert remote_restored["restoreTest"]["downloadOk"] is True
+        assert remote_restored["readyForGreen"] is True
+        assert remote_restored["restoreTest"]["failedRequired"] == 0
+        wizard_status = _get_json(base_url + "/api/hf/wizard/status")
+        assert wizard_status["readyForGreen"] is True
+        assert wizard_status["lastRestoreTest"]["downloadSource"] == "huggingface"
+        assert core.health()["eventCount"] == active_count
 
 
 def test_hf_wizard_public_or_unknown_visibility_not_green(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(_install_fake_hf(tmp_path, private=False)) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", "secret")
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "home", enable_lancedb=False, enable_qmd=False))
     with _dashboard(core, tmp_path / "backups") as base_url:
         public = _post_json_allow_error(base_url + "/api/hf/repo/validate", {"repoId": "owner/public-dataset"})
         assert public["ok"] is False
         assert public["private"] is False
         assert public["green"] is False
+
+        _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": "secret"})
+        restore = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/public-dataset"})
+        assert restore["ok"] is False
+        assert restore["readyForGreen"] is False
+        assert restore["status"] == "REPO_NOT_PRIVATE"
+
+
+def test_hf_wizard_redacts_colon_and_bearer_secrets():
+    secret_terms = {
+        "tok": "token",
+        "access": "access_token",
+        "api_dash": "api-key",
+        "api_under": "api_key",
+        "auth": "Authorization",
+        "phrase": "passphrase",
+        "pwd": "password",
+        "secret": "secret",
+    }
+    detail = " ".join([
+        f"{secret_terms['tok']}: SECRET1",
+        f"{secret_terms['access']}: SECRET2",
+        f"{secret_terms['api_dash']}: SECRET3",
+        f"{secret_terms['api_under']}: SECRET4",
+        f"{secret_terms['auth']}: Bearer SECRET5",
+        f"{secret_terms['phrase']}: SECRET6",
+        f"{secret_terms['pwd']}: SECRET7",
+        f"{secret_terms['secret']}: SECRET8",
+        "hf_abcdef123456",
+    ])
+    payload = {"detail": detail, "api_key": "SECRET9", "nested": {"password": "SECRET10"}}
+    redacted = json.dumps(_redact_payload(payload))
+    for secret in ["SECRET1", "SECRET2", "SECRET3", "SECRET4", "SECRET5", "SECRET6", "SECRET7", "SECRET8", "SECRET9", "SECRET10", "hf_abcdef123456"]:
+        assert secret not in redacted
+    assert "[redacted]" in redacted
+    assert "BEARER_LEAK" not in _redacted_line(f"{secret_terms['auth']}: Bearer BEARER_LEAK")
+    assert "PASSPHRASE_LEAK" not in _redacted_line(f"{secret_terms['phrase']}: PASSPHRASE_LEAK")

@@ -508,7 +508,7 @@ def _hf_wizard_status(core: TotalRecallCore, session: Dict[str, Any]) -> Dict[st
     if not repo.get("repoId"):
         repo["repoId"] = _hf_status(core).get("repoId")
     last_restore = session.get("lastRestoreTest")
-    ready = bool(last_restore and last_restore.get("ok") is True and last_restore.get("failedRequired") == 0)
+    ready = _hf_restore_ready_for_green(repo, last_restore)
     return {
         "ok": True,
         "schema": "total-recall-hf-wizard-v1",
@@ -527,6 +527,21 @@ def _hf_wizard_status(core: TotalRecallCore, session: Dict[str, Any]) -> Dict[st
         "readyForGreen": ready,
         "activeRestore": {"enabled": False, "reason": "v1 only restores into a fresh temporary test home; active memory replacement is not exposed."},
     }
+
+
+def _hf_restore_ready_for_green(repo: Dict[str, Any], last_restore: Any) -> bool:
+    if not isinstance(last_restore, dict):
+        return False
+    return all([
+        repo.get("private") is True,
+        last_restore.get("downloadSource") == "huggingface",
+        last_restore.get("downloadOk") is True,
+        last_restore.get("verifyOk") is True,
+        last_restore.get("trustOk") is True,
+        int(last_restore.get("failedRequired") or 0) == 0,
+        last_restore.get("activeHomeUnchanged") is True,
+        last_restore.get("ledgerMatch") is True,
+    ])
 
 
 def _valid_hf_repo_id(repo_id: str) -> bool:
@@ -635,19 +650,32 @@ def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id:
         return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "passphrase_required"}
     if not _valid_hf_repo_id(repo_id):
         return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "invalid_repo_id", "repoId": repo_id}
+    repo = _hf_repo_validate(repo_id)
+    session["repo"] = {key: repo.get(key) for key in ["repoId", "exists", "private", "status"]}
+    if repo.get("private") is not True:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "status": "REPO_NOT_PRIVATE", "error": "repo_not_private", "repo": repo, "readyForGreen": False, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
+    if local_dir or bundle:
+        summary = {
+            "ok": False,
+            "status": "LOCAL_TEST_ONLY",
+            "downloadSource": "local",
+            "downloadOk": False,
+            "activeHomeUnchanged": True,
+            "verifyOk": False,
+            "trustOk": False,
+            "failedRequired": 0,
+            "ledgerMatch": False,
+        }
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "status": "LOCAL_TEST_ONLY", "restoreTest": summary, "readyForGreen": False, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
     before = _summary(core)
     try:
         with tempfile.TemporaryDirectory(prefix="total-recall-hf-download.") as staging:
             staging_path = Path(staging)
-            if bundle:
-                bundle_path = Path(bundle).expanduser()
-            elif local_dir:
-                bundle_path = _latest_clone_bundle(Path(local_dir).expanduser())
-            else:
-                dl = _hf_download_latest(repo_id, staging_path)
-                if not dl.get("ok"):
-                    return dl
-                bundle_path = _latest_clone_bundle(staging_path)
+            dl = _hf_download_latest(repo_id, staging_path)
+            if not dl.get("ok"):
+                dl["readyForGreen"] = False
+                return dl
+            bundle_path = _latest_clone_bundle(staging_path)
             test_home = Path(tempfile.mkdtemp(prefix="total-recall-hf-restore-test."))
             test_core = TotalRecallCore(TotalRecallConfig(home=test_home, enable_lancedb=False, enable_qmd=False))
             restored = test_core.portable_clone_restore(str(bundle_path), passphrase=secret, replace=True)
@@ -662,13 +690,15 @@ def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id:
                 ledger_match = int(source_ledger.get("eventCount") or 0) == int(restored_state.get("event_count") or 0)
             if manifest_ledger.get("stateHash"):
                 ledger_match = ledger_match and manifest_ledger.get("stateHash") == restored_state.get("state_hash")
-            ok = bool(restored.get("ok")) and bool(verified.get("ok")) and bool(trust.get("ok")) and failed_required == 0 and ledger_match
             active_unchanged = int(before.get("eventCount") or 0) == int(_summary(core).get("eventCount") or 0)
+            ok = bool(restored.get("ok")) and bool(verified.get("ok")) and bool(trust.get("ok")) and failed_required == 0 and ledger_match and active_unchanged
             summary = {
                 "ok": ok,
                 "status": "GREEN" if ok else "FAIL_CLOSED",
                 "cloneId": (restored.get("manifest") or {}).get("cloneId"),
                 "bundle": Path(str(bundle_path)).name,
+                "downloadSource": "huggingface",
+                "downloadOk": True,
                 "testHome": str(test_home),
                 "activeHome": str(core.home),
                 "activeHomeUnchanged": active_unchanged,
@@ -678,7 +708,8 @@ def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id:
                 "ledgerMatch": ledger_match,
                 "eventCount": int(restored_state.get("event_count") or 0),
             }
-            return {"ok": ok, "schema": "total-recall-hf-wizard-v1", "status": summary["status"], "restoreTest": summary, "readyForGreen": ok, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
+            ready = _hf_restore_ready_for_green(session.get("repo") or {}, summary)
+            return {"ok": ok, "schema": "total-recall-hf-wizard-v1", "status": summary["status"], "restoreTest": summary, "readyForGreen": ready, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
     except Exception as exc:
         return {"ok": False, "schema": "total-recall-hf-wizard-v1", "status": "FAIL_CLOSED", "error": _redacted_line(str(exc)), "readyForGreen": False, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
 
@@ -719,7 +750,7 @@ def _redact_payload(value: Any) -> Any:
     if isinstance(value, dict):
         out = {}
         for key, item in value.items():
-            if str(key).lower() in {"passphrase", "token", "authorization", "hf_token"}:
+            if re.search(r"(passphrase|password|secret|token|authorization|api[-_]?key)", str(key), re.IGNORECASE):
                 out[key] = "[redacted]"
             else:
                 out[key] = _redact_payload(item)
@@ -1019,9 +1050,20 @@ def _safe_hf_username(value: str) -> str:
 def _redacted_line(value: str) -> str:
     raw = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", str(value or ""))
     text = " ".join(raw.split())[:240]
-    for marker in ["hf_", "api_token", "token=", "authorization"]:
-        if marker in text.lower():
-            return "Redacted authentication detail."
+    secret_patterns = [
+        r"(?i)\b(authorization)\s*:\s*bearer\s+\S+",
+        r"(?i)\b(token|access_token|api[-_]?key|passphrase|password|secret)\s*[:=]\s*\S+",
+        r"(?i)\bhf_[A-Za-z0-9_\-]{6,}\b",
+    ]
+    redacted = text
+    for pattern in secret_patterns:
+        def _replace_secret(match: re.Match[str]) -> str:
+            label = match.group(1) if match.lastindex else "secret"
+            return f"{label}: [redacted]"
+
+        redacted = re.sub(pattern, _replace_secret, redacted)
+    if redacted != text:
+        return redacted
     return text
 
 
