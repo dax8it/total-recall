@@ -48,21 +48,22 @@ def _post_json_allow_error(url: str, payload: dict | None = None):
         return json.loads(exc.read().decode("utf-8"))
 
 
-def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET_VALUE"):
+def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET_VALUE", no_repo_info: bool = False, shebang: str = "#!/usr/bin/env python3"):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     remote_dir = tmp_path / "fake-hf-remote"
     remote_dir.mkdir()
     hf = bin_dir / "hf"
     hf.write_text(
-        "#!/usr/bin/env python3\n"
+        f"{shebang}\n"
         "import json, os, pathlib, shutil, sys\n"
         f"leak={leak!r}\n"
         f"private={str(private)!r}\n"
+        f"no_repo_info={str(no_repo_info)!r}\n"
         f"remote=pathlib.Path({str(remote_dir)!r})\n"
         "args=sys.argv[1:]\n"
         "if args[:2]==['auth','whoami']:\n print('fake-user'); raise SystemExit(0)\n"
-        "if args[:2]==['repo','info']:\n print(json.dumps({'id':args[2], 'private': private == 'True'})); print('token='+leak, file=sys.stderr); raise SystemExit(0)\n"
+        "if args[:2]==['repo','info']:\n\n if no_repo_info == 'True': print(\"Error: No such command 'info'.\", file=sys.stderr); raise SystemExit(2)\n print(json.dumps({'id':args[2], 'private': private == 'True'})); print('token='+leak, file=sys.stderr); raise SystemExit(0)\n"
         "if args[:2]==['repo','create']:\n print('created private dataset token='+leak); raise SystemExit(0)\n"
         "if args and args[0]=='upload':\n src=pathlib.Path(args[2]); dest=remote/args[3]; shutil.copy2(src, dest); print('uploaded token='+leak); raise SystemExit(0)\n"
         "if args and args[0]=='download':\n local=pathlib.Path(args[args.index('--local-dir')+1]); local.mkdir(parents=True, exist_ok=True);\n if os.environ.get('TOTAL_RECALL_FAKE_HF_DOWNLOAD_FAIL')=='1': print('download failed token='+leak, file=sys.stderr); raise SystemExit(7)\n [shutil.copy2(p, local/p.name) for p in remote.glob('total-recall-portable-clone-*.tar.gz.enc*')]; raise SystemExit(0)\n"
@@ -355,6 +356,28 @@ def test_hf_wizard_public_or_unknown_visibility_not_green(tmp_path, monkeypatch)
         assert restore["ok"] is False
         assert restore["readyForGreen"] is False
         assert restore["status"] == "REPO_NOT_PRIVATE"
+
+
+def test_hf_wizard_validate_uses_hf_bundled_python_when_repo_info_missing(tmp_path, monkeypatch):
+    hf_python = tmp_path / "hf-python"
+    hf_python.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        "print(json.dumps({'exists': True, 'private': True, 'id': sys.argv[-1]}))\n",
+        encoding="utf-8",
+    )
+    hf_python.chmod(0o755)
+    monkeypatch.setenv(
+        "PATH",
+        str(_install_fake_hf(tmp_path, no_repo_info=True, shebang=f"#!{hf_python}")) + os.pathsep + os.environ.get("PATH", ""),
+    )
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "home", enable_lancedb=False, enable_qmd=False))
+    with _dashboard(core, tmp_path / "backups") as base_url:
+        validated = _post_json(base_url + "/api/hf/repo/validate", {"repoId": "owner/private-dataset"})
+        assert validated["ok"] is True
+        assert validated["exists"] is True
+        assert validated["private"] is True
+        assert validated["status"] == "private"
 
 
 def test_hf_wizard_redacts_colon_and_bearer_secrets():

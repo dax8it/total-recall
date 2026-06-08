@@ -598,7 +598,58 @@ def _hf_repo_validate(repo_id: str) -> Dict[str, Any]:
         private = _parse_hf_private(run.stdout, run.stderr)
         status = "private" if private is True else "public" if private is False else "visibility_unknown"
         return {"ok": private is True, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": True, "private": private, "status": status, "green": private is True, "detail": out}
-    return {"ok": False, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": False, "private": None, "status": "not_found_or_unknown", "green": False, "detail": (last or {}).get("detail")}
+    api_info = _hf_repo_info_via_hf_python(hf_bin, repo_id)
+    if api_info.get("exists"):
+        private = api_info.get("private")
+        status = "private" if private is True else "public" if private is False else "visibility_unknown"
+        return {"ok": private is True, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": True, "private": private, "status": status, "green": private is True, "detail": api_info.get("detail")}
+    return {"ok": False, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": False, "private": None, "status": "not_found_or_unknown", "green": False, "detail": api_info.get("detail") or (last or {}).get("detail")}
+
+
+def _hf_python_from_cli(hf_bin: str) -> str | None:
+    try:
+        first = Path(hf_bin).read_text(encoding="utf-8", errors="ignore").splitlines()[0]
+    except Exception:
+        return None
+    if not first.startswith("#!"):
+        return None
+    command = first[2:].strip()
+    if not command or "python" not in command:
+        return None
+    parts = command.split()
+    if not parts:
+        return None
+    if Path(parts[0]).name == "env" and len(parts) > 1:
+        return shutil.which(parts[1])
+    return parts[0] if Path(parts[0]).exists() else shutil.which(Path(parts[0]).name)
+
+
+def _hf_repo_info_via_hf_python(hf_bin: str, repo_id: str) -> Dict[str, Any]:
+    """Query repo metadata using the Python bundled with `hf` when CLI lacks `repo info`."""
+    py_bin = _hf_python_from_cli(hf_bin)
+    if not py_bin:
+        return {"exists": False, "detail": "hf_python_unavailable"}
+    script = """
+import json, sys
+from huggingface_hub import HfApi
+try:
+    info = HfApi().repo_info(sys.argv[1], repo_type='dataset')
+    print(json.dumps({'exists': True, 'private': getattr(info, 'private', None), 'id': getattr(info, 'id', sys.argv[1])}))
+except Exception as exc:
+    print(json.dumps({'exists': False, 'error': exc.__class__.__name__, 'detail': str(exc)[:240]}))
+"""
+    try:
+        run = subprocess.run([py_bin, "-c", script, repo_id], capture_output=True, text=True, timeout=20, check=False)
+    except Exception as exc:
+        return {"exists": False, "detail": exc.__class__.__name__}
+    try:
+        payload = json.loads(run.stdout or "{}")
+    except Exception:
+        payload = {"exists": False, "detail": _redacted_line((run.stderr or run.stdout)[-500:])}
+    if run.returncode != 0 and not payload.get("exists"):
+        payload.setdefault("detail", _redacted_line((run.stderr or run.stdout)[-500:]))
+    payload["detail"] = _redacted_line(str(payload.get("detail") or "hf api metadata lookup"))
+    return payload
 
 
 def _parse_hf_private(stdout: str, stderr: str = "") -> bool | None:
@@ -2257,7 +2308,12 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
 
     async function runActionPayload(url, label, payload) {
       try {
-        const result = await postJson(url, payload || {});
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload || {}),
+        });
+        const result = await response.json();
         renderRaw(label, result);
         await refresh();
       } catch (error) {
