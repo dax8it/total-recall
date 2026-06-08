@@ -56,7 +56,7 @@ def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET
     hf = bin_dir / "hf"
     hf.write_text(
         "#!/usr/bin/env python3\n"
-        "import json, pathlib, shutil, sys\n"
+        "import json, os, pathlib, shutil, sys\n"
         f"leak={leak!r}\n"
         f"private={str(private)!r}\n"
         f"remote=pathlib.Path({str(remote_dir)!r})\n"
@@ -65,7 +65,7 @@ def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET
         "if args[:2]==['repo','info']:\n print(json.dumps({'id':args[2], 'private': private == 'True'})); print('token='+leak, file=sys.stderr); raise SystemExit(0)\n"
         "if args[:2]==['repo','create']:\n print('created private dataset token='+leak); raise SystemExit(0)\n"
         "if args and args[0]=='upload':\n src=pathlib.Path(args[2]); dest=remote/args[3]; shutil.copy2(src, dest); print('uploaded token='+leak); raise SystemExit(0)\n"
-        "if args and args[0]=='download':\n local=pathlib.Path(args[args.index('--local-dir')+1]); local.mkdir(parents=True, exist_ok=True); [shutil.copy2(p, local/p.name) for p in remote.glob('total-recall-portable-clone-*.tar.gz.enc*')]; raise SystemExit(0)\n"
+        "if args and args[0]=='download':\n local=pathlib.Path(args[args.index('--local-dir')+1]); local.mkdir(parents=True, exist_ok=True);\n if os.environ.get('TOTAL_RECALL_FAKE_HF_DOWNLOAD_FAIL')=='1': print('download failed token='+leak, file=sys.stderr); raise SystemExit(7)\n [shutil.copy2(p, local/p.name) for p in remote.glob('total-recall-portable-clone-*.tar.gz.enc*')]; raise SystemExit(0)\n"
         "raise SystemExit(1)\n",
         encoding="utf-8",
     )
@@ -324,6 +324,19 @@ def test_hf_wizard_status_session_repo_and_restore_safety(tmp_path, monkeypatch)
         wizard_status = _get_json(base_url + "/api/hf/wizard/status")
         assert wizard_status["readyForGreen"] is True
         assert wizard_status["lastRestoreTest"]["downloadSource"] == "huggingface"
+
+        monkeypatch.setenv("TOTAL_RECALL_FAKE_HF_DOWNLOAD_FAIL", "1")
+        failed_remote_restore = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset"})
+        assert failed_remote_restore["ok"] is False
+        assert failed_remote_restore["error"] == "hf_download_failed"
+        assert failed_remote_restore["readyForGreen"] is False
+        stale_guard_status = _get_json(base_url + "/api/hf/wizard/status")
+        assert stale_guard_status["readyForGreen"] is False
+        assert stale_guard_status["lastRestoreTest"]["ok"] is False
+        assert stale_guard_status["lastRestoreTest"]["status"] == "HF_DOWNLOAD_FAILED"
+        assert stale_guard_status["lastRestoreTest"]["downloadSource"] == "huggingface"
+        assert stale_guard_status["lastRestoreTest"]["downloadOk"] is False
+        assert stale_guard_status["lastRestoreTest"]["activeHomeUnchanged"] is True
         assert core.health()["eventCount"] == active_count
 
 

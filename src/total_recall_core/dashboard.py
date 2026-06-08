@@ -268,7 +268,7 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
             if parsed.path == "/api/hf/restore-test":
                 payload = self._read_body_json()
                 result = _hf_restore_test(core, wizard_session, repo_id=str(payload.get("repoId") or ""), local_dir=str(payload.get("localDir") or ""), bundle=str(payload.get("bundle") or ""))
-                wizard_session["lastRestoreTest"] = result.get("restoreTest") if result.get("restoreTest") else wizard_session.get("lastRestoreTest")
+                wizard_session["lastRestoreTest"] = result.get("restoreTest") if result.get("restoreTest") else _hf_restore_failure_summary(result)
                 self._send_json(result, status=200 if result.get("ok") else 400)
                 return
             if parsed.path == "/api/checkpoint":
@@ -544,6 +544,26 @@ def _hf_restore_ready_for_green(repo: Dict[str, Any], last_restore: Any) -> bool
     ])
 
 
+def _hf_restore_failure_summary(result: Dict[str, Any]) -> Dict[str, Any]:
+    error = str(result.get("error") or "").strip().lower()
+    status = "HF_DOWNLOAD_FAILED" if error == "hf_download_failed" else str(result.get("status") or "").strip().upper()
+    if not status:
+        status = "RESTORE_TEST_FAILED"
+    source = "local" if status == "LOCAL_TEST_ONLY" else "huggingface"
+    return {
+        "ok": False,
+        "status": status,
+        "downloadSource": source,
+        "downloadOk": False,
+        "verifyOk": False,
+        "trustOk": False,
+        "failedRequired": None,
+        "activeHomeUnchanged": bool(result.get("activeHomeUnchanged")),
+        "ledgerMatch": False,
+        "readyForGreen": False,
+    }
+
+
 def _valid_hf_repo_id(repo_id: str) -> bool:
     return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", repo_id or ""))
 
@@ -674,6 +694,7 @@ def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id:
             dl = _hf_download_latest(repo_id, staging_path)
             if not dl.get("ok"):
                 dl["readyForGreen"] = False
+                dl["activeHomeUnchanged"] = True
                 return dl
             bundle_path = _latest_clone_bundle(staging_path)
             test_home = Path(tempfile.mkdtemp(prefix="total-recall-hf-restore-test."))
@@ -1053,7 +1074,7 @@ def _redacted_line(value: str) -> str:
     secret_patterns = [
         r"(?i)\b(authorization)\s*:\s*bearer\s+\S+",
         r"(?i)\b(token|access_token|api[-_]?key|passphrase|password|secret)\s*[:=]\s*\S+",
-        r"(?i)\bhf_[A-Za-z0-9_\-]{6,}\b",
+        r"\bhf_[A-Za-z0-9_\-]{6,}\b",
     ]
     redacted = text
     for pattern in secret_patterns:
