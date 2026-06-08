@@ -61,6 +61,13 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert "Save before long sessions; restore only after verify" in html
         assert "Ask Memory" in html
         assert "Connection Readiness" in html
+        assert "Continue on another machine" in html
+        assert "Hugging Face process" in html
+        assert "Context Risk Zone" in html
+        assert "Agent work inbox" in html
+        assert "First-run checklist" in html
+        assert "Click any ? mark to see what that selected item means" in html
+        assert "data-help-title" in html
         assert "Obsidian Vault Export" in html
         assert "runVaultExport" in html
         assert "runSourceIngest" in html
@@ -72,6 +79,16 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert "knowledge" in status
         assert "mcp" in status
         assert "backupReadiness" in status
+        assert "hf" in status
+        assert "portable" in status
+        assert "loops" in status
+        assert "contextRisk" in status
+        assert "setupChecklist" in status
+        assert status["hf"]["tokenValueVisible"] is False
+        assert "hf_" not in json.dumps(status["hf"])
+        assert status["portable"]["restoreDefaults"]["testHome"] == "~/total-recall-restored-test"
+        assert status["loops"]["mode"] == "read-only-review"
+        assert status["setupChecklist"]["items"]
         assert status["backupReadiness"]["status"] == "NO_BACKUP"
         assert "Backups protect recovery" in status["backupReadiness"]["compactionRule"]
         assert status["mcp"]["surface"] == "local-admin-http"
@@ -79,6 +96,18 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert hf_provider["status"] == "available encrypted"
         assert "Portable agent clone storage" in hf_provider["note"]
         assert status["policy"]["defaultVaultDir"].endswith("TotalRecallVault")
+
+        hf_status = _get_json(base_url + "/api/hf/status")
+        portable_status = _get_json(base_url + "/api/portable/status")
+        loops_status = _get_json(base_url + "/api/loops/inbox")
+        context_risk = _get_json(base_url + "/api/context-risk")
+        setup_checklist = _get_json(base_url + "/api/setup/checklist")
+        assert hf_status["schema"] == "total-recall-hf-status-v1"
+        assert hf_status["tokenValueVisible"] is False
+        assert portable_status["schema"] == "total-recall-portable-status-v1"
+        assert loops_status["mode"] == "read-only-review"
+        assert context_risk["schema"] == "total-recall-context-risk-v1"
+        assert setup_checklist["schema"] == "total-recall-setup-checklist-v1"
 
         rebuilt = _post_json(base_url + "/api/knowledge/index/rebuild")
         assert rebuilt["ok"] is True

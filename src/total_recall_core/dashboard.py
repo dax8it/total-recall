@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shlex
+import shutil
+import subprocess
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -48,7 +52,12 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                     "trustGate": _trust_gate_summary(core),
                     "knowledge": _knowledge_summary(core),
                     "mcp": _mcp_summary(core),
+                    "hf": _hf_status(core),
+                    "portable": _portable_status(core),
+                    "loops": _loop_inbox_summary(core),
                     "providers": _providers(),
+                    "contextRisk": _context_risk(core, backup_dir=backup_dir, backup=backup),
+                    "setupChecklist": _setup_checklist(core, backup_dir=backup_dir, backup=backup),
                     "policy": {
                         "backupDir": str(backup_dir.expanduser()),
                         "keep": keep,
@@ -57,6 +66,23 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                         "defaultVaultDir": str(Path.home() / "TotalRecallVault"),
                     },
                 })
+                return
+            if parsed.path == "/api/hf/status":
+                self._send_json(_hf_status(core))
+                return
+            if parsed.path == "/api/portable/status":
+                self._send_json(_portable_status(core))
+                return
+            if parsed.path == "/api/loops/inbox":
+                self._send_json(_loop_inbox_summary(core))
+                return
+            if parsed.path == "/api/context-risk":
+                backup = core.backup_status(str(backup_dir))
+                self._send_json(_context_risk(core, backup_dir=backup_dir, backup=backup))
+                return
+            if parsed.path == "/api/setup/checklist":
+                backup = core.backup_status(str(backup_dir))
+                self._send_json(_setup_checklist(core, backup_dir=backup_dir, backup=backup))
                 return
             if parsed.path == "/api/backups/download":
                 query = parse_qs(parsed.query)
@@ -486,6 +512,245 @@ def _mcp_summary(core: TotalRecallCore) -> Dict[str, Any]:
     }
 
 
+def _hf_status(core: TotalRecallCore) -> Dict[str, Any]:
+    """Return Hugging Face transport readiness without exposing secrets."""
+    hf_bin = shutil.which("hf")
+    repo_id = (
+        os.getenv("TOTAL_RECALL_HF_REPO_ID")
+        or os.getenv("TOTAL_RECALL_PORTABLE_CLONE_REPO_ID")
+        or os.getenv("HF_REPO_ID")
+        or ""
+    )
+    token_env_names = ["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
+    token_env_present = any(bool(os.getenv(name)) for name in token_env_names)
+    passphrase_present = bool(os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE"))
+    logged_in = False
+    username = ""
+    auth_detail = "HF CLI not found. Install/login before using Hugging Face transport."
+    if hf_bin:
+        try:
+            result = subprocess.run(
+                [hf_bin, "auth", "whoami"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            if result.returncode == 0:
+                logged_in = True
+                lines = [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+                username = _safe_hf_username(lines[0]) if lines else "logged-in"
+                auth_detail = "HF CLI is logged in. Token value is intentionally hidden."
+            else:
+                auth_detail = _redacted_line(result.stderr or result.stdout or "HF CLI is installed but not logged in.")
+        except Exception as exc:
+            auth_detail = f"HF CLI status check failed: {exc.__class__.__name__}"
+    if token_env_present:
+        token_source = "env-present"
+    elif logged_in:
+        token_source = "cli-cache"
+    else:
+        token_source = "missing"
+    if not hf_bin:
+        status = "HF_CLI_MISSING"
+    elif logged_in and repo_id and passphrase_present:
+        status = "READY"
+    elif logged_in:
+        status = "NEEDS_REPO_OR_PASSPHRASE"
+    else:
+        status = "LOGIN_REQUIRED"
+    return {
+        "ok": bool(hf_bin and logged_in),
+        "schema": "total-recall-hf-status-v1",
+        "status": status,
+        "hfCliFound": bool(hf_bin),
+        "hfCliPath": hf_bin or None,
+        "loggedIn": logged_in,
+        "username": username or None,
+        "repoId": repo_id or None,
+        "repoType": "dataset",
+        "repoVisibility": "unknown" if repo_id else None,
+        "tokenSource": token_source,
+        "tokenValueVisible": False,
+        "passphrasePresent": passphrase_present,
+        "detail": auth_detail,
+        "home": str(core.home),
+        "instructions": _hf_instructions(repo_id or "USER/total-recall-portable-clones"),
+    }
+
+
+def _portable_status(core: TotalRecallCore) -> Dict[str, Any]:
+    clone_dirs = [
+        Path(os.getenv("TOTAL_RECALL_PORTABLE_CLONE_DIR") or "~/total-recall-portable-clones").expanduser(),
+        core.home / "portable-clones",
+    ]
+    manifests: list[Dict[str, Any]] = []
+    for clone_dir in clone_dirs:
+        if not clone_dir.exists():
+            continue
+        for manifest_path in clone_dir.glob("total-recall-portable-clone-*.manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            manifests.append({
+                "path": str(manifest_path),
+                "createdAt": manifest.get("createdAt"),
+                "cloneId": manifest.get("cloneId"),
+                "provider": manifest.get("provider") or {},
+                "ledger": manifest.get("ledger") or {},
+                "encrypted": manifest.get("encrypted") or {},
+            })
+    manifests.sort(key=lambda item: item.get("createdAt") or item.get("path") or "", reverse=True)
+    latest = manifests[0] if manifests else None
+    repo_id = ((latest or {}).get("provider") or {}).get("repoId") or _hf_status(core).get("repoId") or "USER/total-recall-portable-clones"
+    return {
+        "ok": True,
+        "schema": "total-recall-portable-status-v1",
+        "status": "CLONE_AVAILABLE" if latest else "NO_CLONE_FOUND",
+        "cloneDirs": [str(path) for path in clone_dirs],
+        "cloneCount": len(manifests),
+        "latestClone": latest,
+        "restoreDefaults": {
+            "testHome": "~/total-recall-restored-test",
+            "replaceActiveAllowedAfter": ["restore-test", "verify", "trust-gate"],
+            "destructiveConfirmation": "REPLACE ACTIVE MEMORY",
+        },
+        "restoreCommand": _restore_command(str(repo_id)),
+    }
+
+
+def _loop_inbox_summary(core: TotalRecallCore) -> Dict[str, Any]:
+    payload = _guarded_call(lambda: core.loop_inbox(include_completed=False))
+    loops = payload.get("loops") or []
+    return {
+        "ok": payload.get("ok") is not False,
+        "schema": "total-recall-loop-inbox-dashboard-v1",
+        "count": len(loops),
+        "loops": loops,
+        "mode": "read-only-review",
+        "detail": "Shows loop evidence and phase only. It does not run agents or merge work.",
+    }
+
+
+def _context_risk(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    summary = _summary(core)
+    backup_ready = _backup_readiness(core, backup_dir=backup_dir, backup=backup)
+    trust = _trust_gate_summary(core)
+    lag = int(summary.get("checkpointLagEvents") or 0)
+    open_incidents = int(summary.get("openIncidents") or 0)
+    checkpoint_current = summary.get("checkpointStatus") == "current"
+    trust_ok = trust.get("ok") is True
+    backup_ok = backup_ready.get("ok") is True
+    safe_restart = checkpoint_current and open_incidents == 0
+    safe_compact = safe_restart and trust_ok
+    safe_restore = safe_compact and backup_ok
+    if safe_restore:
+        verdict = "Ready"
+        next_action = "Safe to restart or compact. Restore still requires verify after import."
+        tone = "ok"
+    elif safe_restart:
+        verdict = "Needs safety check"
+        next_action = "Run Trust Gate and confirm backup coverage before treating restore as safe."
+        tone = "warn"
+    elif lag:
+        verdict = "Save first"
+        next_action = f"Save a restore point: {lag} new memor{'y' if lag == 1 else 'ies'} are not checkpointed."
+        tone = "warn"
+    elif open_incidents:
+        verdict = "Resolve incidents"
+        next_action = f"Resolve {open_incidents} open safety incident(s) before restart/restore confidence."
+        tone = "bad"
+    else:
+        verdict = "Check memory"
+        next_action = "Run Fix All, then refresh this panel."
+        tone = "warn"
+    return {
+        "ok": safe_restore,
+        "schema": "total-recall-context-risk-v1",
+        "verdict": verdict,
+        "tone": tone,
+        "nextAction": next_action,
+        "safeToRestart": safe_restart,
+        "safeToCompact": safe_compact,
+        "safeToRestore": safe_restore,
+        "rows": [
+            {"name": "Restart readiness", "status": "Ready" if safe_restart else "Save first", "detail": next_action if not safe_restart else "Restore point is current and no open incidents are reported.", "ok": safe_restart},
+            {"name": "Compaction readiness", "status": "Ready" if safe_compact else "Run Trust Gate", "detail": "Compaction should have a current restore point and a passing Trust Gate.", "ok": safe_compact},
+            {"name": "Restore readiness", "status": "Ready" if safe_restore else "Test-home only", "detail": "Remote backups are transport. Restore into a test home, verify, then run Trust Gate before replacing active memory.", "ok": safe_restore},
+            {"name": "Backup coverage", "status": title_case_readiness(backup_ready.get("status")), "detail": backup_ready.get("nextAction") or backup_ready.get("message") or "Backup status unavailable.", "ok": backup_ok},
+        ],
+    }
+
+
+def _setup_checklist(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, Any] | None = None) -> Dict[str, Any]:
+    summary = _summary(core)
+    knowledge = _knowledge_summary(core)
+    backup_ready = _backup_readiness(core, backup_dir=backup_dir, backup=backup)
+    hf = _hf_status(core)
+    trust = _trust_gate_summary(core)
+    items = [
+        _check_item("Total Recall store", core.home.exists(), "Configured", f"Local home: {core.home}"),
+        _check_item("Restore point", summary.get("checkpointStatus") == "current", "Configured", "Save a restore point before long work or machine moves."),
+        _check_item("Trust Gate", trust.get("ok") is True, "Configured", "Run Trust Gate after major repairs/restores."),
+        _check_item("Search Catalog", knowledge.get("ok") is True, "Configured", "Fix All rebuilds searchable/cited derived views."),
+        _check_item("Backups", backup_ready.get("backupCount", 0) > 0, "Configured", "Create at least one backup before relying on restore."),
+        _check_item("HF CLI", hf.get("hfCliFound") is True, "Configured", "Install Hugging Face CLI for cloud transport."),
+        _check_item("HF login", hf.get("loggedIn") is True, "Configured", "Run hf auth login. Token values stay hidden."),
+        _check_item("Private HF dataset", bool(hf.get("repoId")), "Configured", "Set TOTAL_RECALL_HF_REPO_ID to a private dataset id."),
+        _check_item("Clone passphrase", hf.get("passphrasePresent") is True, "Configured", "Set TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE outside repo/docs/memory."),
+        {"name": "Remote MCP", "status": "Planned", "detail": "Keep remote admin disabled until OAuth/scoped serving is implemented.", "ok": False, "tone": "warn"},
+    ]
+    configured = sum(1 for item in items if item.get("status") == "Configured")
+    return {"ok": configured == len(items) - 1, "schema": "total-recall-setup-checklist-v1", "configured": configured, "total": len(items), "items": items}
+
+
+def _check_item(name: str, ok: bool, good: str, detail: str) -> Dict[str, Any]:
+    return {"name": name, "status": good if ok else "Missing", "detail": detail, "ok": ok, "tone": "ok" if ok else "warn"}
+
+
+def _safe_hf_username(value: str) -> str:
+    value = _redacted_line(value).strip()
+    if value.lower().startswith("token"):
+        return "logged-in"
+    return value[:80]
+
+
+def _redacted_line(value: str) -> str:
+    raw = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", str(value or ""))
+    text = " ".join(raw.split())[:240]
+    for marker in ["hf_", "api_token", "token=", "authorization"]:
+        if marker in text.lower():
+            return "Redacted authentication detail."
+    return text
+
+
+def _hf_instructions(repo_id: str) -> list[Dict[str, str]]:
+    return [
+        {"step": "1", "title": "Login", "command": "hf auth login", "detail": "Authenticates the HF CLI. The dashboard never shows the token."},
+        {"step": "2", "title": "Create private dataset", "command": f"hf repo create {repo_id} --type dataset --private --exist-ok", "detail": "Use a private dataset. HF is only encrypted transport, not memory authority."},
+        {"step": "3", "title": "Set local passphrase", "command": "export TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE='long-secret-kept-outside-repo'", "detail": "Use the same passphrase on the restore machine. Do not commit or ledger this value."},
+        {"step": "4", "title": "Export and upload clone", "command": f"PYTHONPATH=src .venv/bin/python -m total_recall_core.cli portable-clone export --out-dir ~/total-recall-portable-clones --provider huggingface --repo-id {repo_id} --upload --format json", "detail": "Uploads only encrypted bundle + manifest."},
+        {"step": "5", "title": "Restore on test home first", "command": _restore_command(repo_id), "detail": "Verify and Trust Gate must pass before replacing active memory."},
+    ]
+
+
+def _restore_command(repo_id: str) -> str:
+    return (
+        f"hf download {repo_id} --repo-type dataset --include 'total-recall-portable-clone-*.tar.gz.enc*' "
+        "--local-dir ~/total-recall-portable-clones && "
+        "export TOTAL_RECALL_HOME=~/total-recall-restored-test && "
+        "PYTHONPATH=src .venv/bin/python -m total_recall_core.cli portable-clone restore "
+        "~/total-recall-portable-clones/total-recall-portable-clone-*.tar.gz.enc --replace --format json && "
+        "PYTHONPATH=src .venv/bin/python -m total_recall_core.cli verify && "
+        "PYTHONPATH=src .venv/bin/python -m total_recall_core.cli trust verify --format text"
+    )
+
+
+def title_case_readiness(value: Any) -> str:
+    return str(value or "unknown").lower().replace("_", " ").title()
+
+
 def _safe_backup_path(path: Path, backup_dir: Path) -> bool:
     try:
         resolved = path.resolve()
@@ -784,7 +1049,8 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     .panel.knowledge { grid-column: span 5; }
     .panel.workbench { grid-column: span 7; }
     .panel.remote { grid-column: span 5; }
-    .panel.vault, .panel.backups, .panel.providers { grid-column: 1 / -1; }
+    .panel.context-risk, .panel.loop-inbox { grid-column: span 6; }
+    .panel.vault, .panel.backups, .panel.providers, .panel.hf, .panel.hf-process, .panel.setup-checklist { grid-column: 1 / -1; }
     .panel-header {
       padding: 15px 16px 13px;
       border-bottom: 1px solid var(--line);
@@ -826,6 +1092,41 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       flex: 0 0 auto;
     }
     .help-mark:hover, .help-mark:focus { color: var(--teal-ink); border-color: #86d6cc; background: var(--teal-soft); outline: none; }
+    .help-panel {
+      margin: 12px 24px 0;
+      border: 1px solid #bfd7ff;
+      background: var(--blue-soft);
+      color: var(--blue);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      display: grid;
+      gap: 3px;
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .help-panel strong { color: #123e8a; }
+    .process-steps { display: grid; gap: 9px; }
+    .process-step {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: #fff;
+      padding: 10px 11px;
+      display: grid;
+      gap: 5px;
+    }
+    .process-step code, .command-line {
+      display: block;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      border-radius: 6px;
+      padding: 8px;
+      background: #0b1220;
+      color: #e4e7ec;
+      font-size: 11px;
+      line-height: 1.45;
+    }
+    .two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .detail { margin-top: 3px; color: var(--muted); font-size: 12px; line-height: 1.35; overflow-wrap: anywhere; }
     .badge {
       border-radius: 999px;
@@ -977,7 +1278,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       .memory-hero { grid-template-columns: 1fr; }
       .memory-hero .hero-actions { justify-content: flex-start; }
       .status-cell { border-bottom: 1px solid var(--line); }
-      .panel.trust, .panel.knowledge, .panel.workbench, .panel.remote { grid-column: 1 / -1; }
+      .panel.trust, .panel.knowledge, .panel.workbench, .panel.remote, .panel.context-risk, .panel.loop-inbox { grid-column: 1 / -1; }
     }
     @media (max-width: 760px) {
       .topbar { position: relative; grid-template-columns: 1fr; padding: 16px; }
@@ -990,6 +1291,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       .action-grid { grid-template-columns: 1fr; }
       .gate, .data-row, .provider-row { grid-template-columns: 1fr; }
       .split-actions { justify-content: flex-start; }
+      .two-col { grid-template-columns: 1fr; }
       table { font-size: 12px; }
       th:nth-child(3), td:nth-child(3) { display: none; }
     }
@@ -1010,7 +1312,10 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <a href="#trust"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 3l7 3v5c0 4.5-2.8 8.5-7 10-4.2-1.5-7-5.5-7-10V6l7-3z"/><path d="M9 12l2 2 4-5"/></svg>Safety Check</a>
         <a href="#knowledge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 6h16M4 12h16M4 18h10"/><path d="M17 15l3 3-3 3"/></svg>Search Catalog</a>
         <a href="#remote"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M5 12a7 7 0 0 1 14 0"/><path d="M12 12v8"/><path d="M8 16l4 4 4-4"/></svg>Connections</a>
+        <a href="#hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 15a4 4 0 0 0 4 4h9a4 4 0 0 0 1-7.9A6 6 0 0 0 7.2 8"/><path d="M12 12v7"/><path d="M9 16l3 3 3-3"/></svg>Continue Elsewhere</a>
+        <a href="#context-risk"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 4.3L2.6 18a2 2 0 0 0 1.7 3h15.4a2 2 0 0 0 1.7-3L13.7 4.3a2 2 0 0 0-3.4 0z"/></svg>Risk Zone</a>
         <a href="#workbench"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg>Ask Memory</a>
+        <a href="#loop-inbox"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M5 7h14M5 12h10M5 17h14"/><path d="M17 10l3 2-3 2"/></svg>Agent Inbox</a>
         <a href="#vault"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 5h7l2 3h9v11H3z"/><path d="M8 13h8"/><path d="M13 10l3 3-3 3"/></svg>Vault</a>
         <a href="#backups"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M4 7h16v12H4z"/><path d="M8 7V5h8v2"/><path d="M8 12h8"/></svg>Backups</a>
       </nav>
@@ -1054,7 +1359,75 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         </div>
       </section>
 
+      <section class="help-panel" aria-live="polite">
+        <strong id="selected-help-title">Help</strong>
+        <span id="selected-help-text">Click any ? mark to see what that selected item means.</span>
+      </section>
+
       <main class="workspace">
+        <section class="panel hf" id="hf">
+          <div class="panel-header">
+            <div>
+              <h2>Continue on another machine</h2>
+              <p>Encrypted Hugging Face transport status. Trust still comes from restore → verify → Trust Gate.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="two-col">
+              <div class="row-list" id="hf-rows"></div>
+              <div class="row-list" id="portable-rows"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel hf-process" id="hf-process">
+          <div class="panel-header">
+            <div>
+              <h2>Hugging Face process</h2>
+              <p>Separate implementation recipe for cloud continuity. Commands are copyable, but destructive restore stays test-home first.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="process-steps" id="hf-process-steps"></div>
+          </div>
+        </section>
+
+        <section class="panel context-risk" id="context-risk">
+          <div class="panel-header">
+            <div>
+              <h2>Context Risk Zone</h2>
+              <p>Plain-English restart, compact, and restore readiness.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="context-risk-rows"></div>
+          </div>
+        </section>
+
+        <section class="panel loop-inbox" id="loop-inbox">
+          <div class="panel-header">
+            <div>
+              <h2>Agent work inbox</h2>
+              <p>Read-only loop status and evidence. This panel does not run agents.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="loop-rows"></div>
+          </div>
+        </section>
+
+        <section class="panel setup-checklist" id="setup-checklist">
+          <div class="panel-header">
+            <div>
+              <h2>First-run checklist</h2>
+              <p>Configured / missing / planned setup items for safe continuity.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="setup-rows"></div>
+          </div>
+        </section>
+
         <section class="panel trust" id="trust">
           <div class="panel-header">
             <div>
@@ -1276,6 +1649,11 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         renderMcp(data.mcp || {});
         renderProtection(data);
         renderProviders(data.providers || []);
+        renderHf(data.hf || {}, data.portable || {});
+        renderHfProcess(data.hf || {});
+        renderContextRisk(data.contextRisk || {});
+        renderLoopInbox(data.loops || {});
+        renderSetupChecklist(data.setupChecklist || {});
         renderBackups((data.backup || {}).backups || []);
         renderVaultPolicy(data.policy || {});
       } catch (error) {
@@ -1422,6 +1800,63 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
           ${badge(escapeHtml(provider.status), providerTone(provider.status))}
         </label>
       `).join('');
+    }
+
+    function renderHf(hf, portable) {
+      const user = hf.loggedIn ? (hf.username || 'Logged in') : 'Not logged in';
+      const repo = hf.repoId || 'Not selected';
+      const token = hf.tokenSource === 'missing' ? 'Missing' : hf.tokenSource;
+      const passphrase = hf.passphrasePresent ? 'Present' : 'Missing';
+      $('hf-rows').innerHTML = [
+        dataRow('HF CLI', hf.hfCliFound ? 'Configured' : 'Missing', hf.hfCliPath || 'Install Hugging Face CLI to use encrypted cloud transport.', !!hf.hfCliFound, hf.hfCliFound ? 'ok' : 'warn'),
+        dataRow('HF login', user, hf.detail || 'Token values are never shown here.', !!hf.loggedIn, hf.loggedIn ? 'ok' : 'warn'),
+        dataRow('HF dataset', repo, 'Use a private dataset for encrypted clone bundles and manifests.', !!hf.repoId, hf.repoId ? 'ok' : 'warn'),
+        dataRow('HF token visibility', 'Hidden', `Auth source: ${token}. Values are never returned by the API or rendered in the UI.`, true, 'info'),
+        dataRow('Clone passphrase', passphrase, 'Only presence is shown. The passphrase must stay outside repo, docs, ledger, and reports.', !!hf.passphrasePresent, hf.passphrasePresent ? 'ok' : 'warn'),
+      ].join('');
+      const latest = portable.latestClone || {};
+      const ledger = latest.ledger || {};
+      $('portable-rows').innerHTML = [
+        dataRow('Latest encrypted clone', latest.cloneId || 'None found', latest.createdAt || 'Create an encrypted clone before moving machines.', !!latest.cloneId, latest.cloneId ? 'ok' : 'warn'),
+        dataRow('Clone ledger point', ledger.eventCount == null ? 'Unknown' : `${ledger.eventCount} events`, ledger.lastEventHash || 'No clone manifest loaded.', ledger.eventCount != null, ledger.eventCount != null ? 'ok' : 'warn'),
+        dataRow('Restore default', 'Test home first', 'Restore into ~/total-recall-restored-test, then verify and Trust Gate before replacing active memory.', true, 'info'),
+      ].join('');
+    }
+
+    function renderHfProcess(hf) {
+      const steps = hf.instructions || [];
+      $('hf-process-steps').innerHTML = steps.length ? steps.map(step => `
+        <div class="process-step">
+          <strong>${escapeHtml(step.step)}. ${escapeHtml(step.title)}</strong>
+          <span class="detail">${escapeHtml(step.detail)}</span>
+          <code>${escapeHtml(step.command)}</code>
+        </div>
+      `).join('') : '<div class="detail">Hugging Face instructions unavailable.</div>';
+    }
+
+    function renderContextRisk(risk) {
+      const rows = (risk.rows || []).map(row => dataRow(row.name, row.status, row.detail, !!row.ok, row.ok ? 'ok' : 'warn'));
+      rows.unshift(dataRow('Overall context risk', risk.verdict || 'Checking', risk.nextAction || 'Run Fix All, then refresh.', risk.ok === true, risk.tone || 'warn'));
+      $('context-risk-rows').innerHTML = rows.join('');
+    }
+
+    function renderLoopInbox(inbox) {
+      const loops = inbox.loops || [];
+      if (!loops.length) {
+        $('loop-rows').innerHTML = dataRow('Active loops', 'None', inbox.detail || 'No active evidence loops found.', true, 'ok');
+        return;
+      }
+      $('loop-rows').innerHTML = loops.slice(0, 8).map(loop => {
+        const detail = [loop.agent || 'unknown agent', loop.project || 'no project', loop.updated_at || loop.created_at || 'unknown time'].join(' · ');
+        const phase = loop.phase || loop.status || 'active';
+        const goal = `${loop.goal || loop.loop_id || 'Loop'} — ${detail}`;
+        return dataRow('Loop evidence', phase, goal, loop.status === 'active', loop.status === 'active' ? 'info' : 'neutral');
+      }).join('');
+    }
+
+    function renderSetupChecklist(checklist) {
+      const items = checklist.items || [];
+      $('setup-rows').innerHTML = items.length ? items.map(item => dataRow(item.name, item.status, item.detail, item.ok === true, item.tone || (item.ok ? 'ok' : 'warn'))).join('') : dataRow('Setup checklist', 'Unavailable', 'Refresh after the local store is ready.', false, 'warn');
     }
 
     function renderBackups(backups) {
@@ -1786,7 +2221,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       const help = helpText(name);
       const label = escapeHtml(name);
       if (!help) return label;
-      return `<span class="row-title">${label}<span class="help-mark" tabindex="0" title="${escapeHtml(help)}" aria-label="${escapeHtml(help)}">?</span></span>`;
+      return `<span class="row-title">${label}<span class="help-mark" tabindex="0" role="button" title="${escapeHtml(help)}" data-help-title="${label}" data-help="${escapeHtml(help)}" aria-label="Help for ${label}">?</span></span>`;
     }
 
     function helpText(name) {
@@ -1794,6 +2229,25 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         'Memory Vault': 'The append-only Total Recall ledger. This is the authority for saved memory.',
         'Restore Point': 'The latest signed checkpoint and anchor. Saving a restore point protects the current ledger position, but does not rebuild derived search or quality views.',
         'Search Catalog': 'A rebuildable index/graph/compiled-truth layer used for fast cited answers. It can be stale even when the restore point is current.',
+        'HF CLI': 'Whether the Hugging Face command-line tool is installed on this machine.',
+        'HF login': 'Whether the local HF CLI has an authenticated session. Token values are never shown.',
+        'HF dataset': 'The private Hugging Face dataset id used for encrypted clone transport.',
+        'HF token visibility': 'The dashboard reports only the auth source, never the token string.',
+        'Clone passphrase': 'Whether the local clone encryption passphrase is present in the environment. The passphrase value is never displayed.',
+        'Latest encrypted clone': 'Most recent encrypted portable clone manifest found locally.',
+        'Clone ledger point': 'The ledger event/hash captured by the encrypted clone manifest.',
+        'Restore default': 'Restores should go to a test home first, then verify and Trust Gate before active replacement.',
+        'Overall context risk': 'Plain-English summary of restart, compaction, and restore readiness.',
+        'Restart readiness': 'Whether the latest restore point is current enough to restart safely.',
+        'Compaction readiness': 'Whether a compact/restart handoff has a current restore point and passing Trust Gate.',
+        'Restore readiness': 'Whether restored memory can be trusted after test restore, verify, and Trust Gate.',
+        'Loop evidence': 'Read-only status from an agent/work loop. It is evidence, not execution authority.',
+        'Active loops': 'Open agent/work loops awaiting evidence, review, verification, or completion.',
+        'Total Recall store': 'Whether the local Total Recall home exists.',
+        'Trust Gate': 'Hard-coded execution verification gate. Passing means required checks actually ran.',
+        'Backups': 'Whether local backup archives exist. Backups are transport/recovery, not authority by themselves.',
+        'Private HF dataset': 'Configured dataset id for encrypted clone transport. It should be private.',
+        'Remote MCP': 'Remote control-plane serving is intentionally planned/guarded until auth and scopes are implemented.',
         'Index': 'Searchable source index rebuilt from the memory vault. If stale, click Rebuild Index or Fix All.',
         'Graph': 'Derived entities and relationships rebuilt from cited ledger evidence.',
         'Compiled Truth': 'Readable projection built from the Search Catalog. It is derived, not authority.',
@@ -1866,6 +2320,31 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     function escapeJs(value) {
       return String(value == null ? '' : value).replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\n/g, '\\n').replace(/\r/g, '');
     }
+
+    function showSelectedHelp(mark) {
+      if (!mark) return;
+      const help = mark.getAttribute('data-help') || mark.getAttribute('title') || mark.getAttribute('aria-label') || '';
+      if (!help) return;
+      const title = mark.getAttribute('data-help-title') || ((mark.closest('.eyeline') || mark.closest('.row-title') || {}).textContent || 'Help').replace('?', '').trim() || 'Help';
+      $('selected-help-title').textContent = title;
+      $('selected-help-text').textContent = help;
+    }
+
+    document.addEventListener('click', event => {
+      const mark = event.target.closest && event.target.closest('.help-mark');
+      if (mark) showSelectedHelp(mark);
+    });
+    document.addEventListener('focusin', event => {
+      const mark = event.target.closest && event.target.closest('.help-mark');
+      if (mark) showSelectedHelp(mark);
+    });
+    document.addEventListener('keydown', event => {
+      const mark = event.target.closest && event.target.closest('.help-mark');
+      if (mark && (event.key === 'Enter' || event.key === ' ')) {
+        event.preventDefault();
+        showSelectedHelp(mark);
+      }
+    });
 
     refresh();
   </script>
