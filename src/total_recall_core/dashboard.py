@@ -6,6 +6,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import tempfile
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,6 +33,14 @@ def run_dashboard(
 
 
 def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: int | None) -> type[BaseHTTPRequestHandler]:
+    wizard_session: Dict[str, Any] = {
+        "passphrase": "",
+        "passphraseExpiresAt": 0.0,
+        "repo": {"repoId": _hf_status(core).get("repoId"), "exists": None, "private": None, "status": "not_validated"},
+        "lastExport": None,
+        "lastRestoreTest": None,
+    }
+
     class TotalRecallDashboardHandler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
             return
@@ -53,6 +63,7 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                     "knowledge": _knowledge_summary(core),
                     "mcp": _mcp_summary(core),
                     "hf": _hf_status(core),
+                    "hfWizard": _hf_wizard_status(core, wizard_session),
                     "portable": _portable_status(core),
                     "loops": _loop_inbox_summary(core),
                     "providers": _providers(),
@@ -69,6 +80,9 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                 return
             if parsed.path == "/api/hf/status":
                 self._send_json(_hf_status(core))
+                return
+            if parsed.path == "/api/hf/wizard/status":
+                self._send_json(_hf_wizard_status(core, wizard_session))
                 return
             if parsed.path == "/api/portable/status":
                 self._send_json(_portable_status(core))
@@ -219,6 +233,43 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                 selected = payload.get("providers") or []
                 backup = core.backup_run(str(backup_dir), keep=keep, keep_days=keep_days)
                 self._send_json(_remote_upload_result(core, backup_dir=backup_dir, selected=selected, backup=backup))
+                return
+            if parsed.path == "/api/hf/session/passphrase":
+                payload = self._read_body_json()
+                passphrase = str(payload.get("passphrase") or "")
+                ttl_seconds = _safe_int(payload.get("ttlSeconds"), 3600)
+                wizard_session["passphrase"] = passphrase
+                wizard_session["passphraseExpiresAt"] = time.time() + max(60, min(ttl_seconds, 24 * 3600)) if passphrase else 0.0
+                self._send_json({"ok": True, "schema": "total-recall-hf-wizard-v1", "passphrasePresent": _wizard_passphrase_present(wizard_session), "tokenValueVisible": False})
+                return
+            if parsed.path == "/api/hf/session/clear":
+                wizard_session["passphrase"] = ""
+                wizard_session["passphraseExpiresAt"] = 0.0
+                self._send_json({"ok": True, "schema": "total-recall-hf-wizard-v1", "passphrasePresent": False, "tokenValueVisible": False})
+                return
+            if parsed.path == "/api/hf/repo/validate":
+                payload = self._read_body_json()
+                result = _hf_repo_validate(str(payload.get("repoId") or ""))
+                wizard_session["repo"] = {key: result.get(key) for key in ["repoId", "exists", "private", "status"]}
+                self._send_json(result, status=200 if result.get("ok") else 400)
+                return
+            if parsed.path == "/api/hf/repo/create":
+                payload = self._read_body_json()
+                result = _hf_repo_create(str(payload.get("repoId") or ""))
+                wizard_session["repo"] = {key: result.get(key) for key in ["repoId", "exists", "private", "status"]}
+                self._send_json(result, status=200 if result.get("ok") else 400)
+                return
+            if parsed.path == "/api/hf/export-upload":
+                payload = self._read_body_json()
+                result = _hf_export_upload(core, wizard_session, repo_id=str(payload.get("repoId") or ""))
+                wizard_session["lastExport"] = result.get("export") if result.get("export") else wizard_session.get("lastExport")
+                self._send_json(result, status=200 if result.get("ok") else 400)
+                return
+            if parsed.path == "/api/hf/restore-test":
+                payload = self._read_body_json()
+                result = _hf_restore_test(core, wizard_session, repo_id=str(payload.get("repoId") or ""), local_dir=str(payload.get("localDir") or ""), bundle=str(payload.get("bundle") or ""))
+                wizard_session["lastRestoreTest"] = result.get("restoreTest") if result.get("restoreTest") else wizard_session.get("lastRestoreTest")
+                self._send_json(result, status=200 if result.get("ok") else 400)
                 return
             if parsed.path == "/api/checkpoint":
                 self._send_json(core.checkpoint(session_id="dashboard", label="manual_dashboard_checkpoint"))
@@ -429,6 +480,255 @@ def _guarded_call(fn: Any) -> Dict[str, Any]:
         return {"ok": True, "result": payload}
     except Exception as exc:
         return {"ok": False, "status": "ERROR", "error": str(exc)}
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _wizard_passphrase_present(session: Dict[str, Any]) -> bool:
+    if not session.get("passphrase"):
+        return False
+    if float(session.get("passphraseExpiresAt") or 0) < time.time():
+        session["passphrase"] = ""
+        session["passphraseExpiresAt"] = 0.0
+        return False
+    return True
+
+
+def _wizard_passphrase(session: Dict[str, Any]) -> str:
+    return str(session.get("passphrase") or "") if _wizard_passphrase_present(session) else ""
+
+
+def _hf_wizard_status(core: TotalRecallCore, session: Dict[str, Any]) -> Dict[str, Any]:
+    repo = dict(session.get("repo") or {})
+    if not repo.get("repoId"):
+        repo["repoId"] = _hf_status(core).get("repoId")
+    last_restore = session.get("lastRestoreTest")
+    ready = bool(last_restore and last_restore.get("ok") is True and last_restore.get("failedRequired") == 0)
+    return {
+        "ok": True,
+        "schema": "total-recall-hf-wizard-v1",
+        "home": str(core.home),
+        "hf": _hf_status(core),
+        "portable": _portable_status(core),
+        "session": {"passphrasePresent": _wizard_passphrase_present(session), "tokenValueVisible": False},
+        "repo": {
+            "repoId": repo.get("repoId") or None,
+            "exists": repo.get("exists"),
+            "private": repo.get("private"),
+            "status": repo.get("status") or "not_validated",
+        },
+        "lastExport": _redact_payload(session.get("lastExport")),
+        "lastRestoreTest": _redact_payload(last_restore),
+        "readyForGreen": ready,
+        "activeRestore": {"enabled": False, "reason": "v1 only restores into a fresh temporary test home; active memory replacement is not exposed."},
+    }
+
+
+def _valid_hf_repo_id(repo_id: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,95}/[A-Za-z0-9][A-Za-z0-9_.-]{0,95}", repo_id or ""))
+
+
+def _hf_cli_bin() -> str | None:
+    return shutil.which("hf") or shutil.which("huggingface-cli")
+
+
+def _hf_repo_validate(repo_id: str) -> Dict[str, Any]:
+    repo_id = (repo_id or "").strip()
+    if not _valid_hf_repo_id(repo_id):
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "invalid_repo_id", "repoId": repo_id, "exists": False, "private": None, "status": "invalid"}
+    hf_bin = _hf_cli_bin()
+    if not hf_bin:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "hf_cli_not_found", "repoId": repo_id, "exists": None, "private": None, "status": "unknown"}
+    commands = [
+        [hf_bin, "repo", "info", repo_id, "--repo-type", "dataset", "--json"],
+        [hf_bin, "repo", "info", repo_id, "--type", "dataset", "--json"],
+        [hf_bin, "repo", "info", repo_id, "--repo-type", "dataset"],
+    ]
+    last = None
+    for command in commands:
+        try:
+            run = subprocess.run(command, capture_output=True, text=True, timeout=20, check=False)
+        except Exception as exc:
+            last = {"returncode": 1, "detail": exc.__class__.__name__}
+            continue
+        out = _redacted_line((run.stdout or "") + " " + (run.stderr or ""))
+        last = {"returncode": run.returncode, "detail": out}
+        if run.returncode != 0:
+            continue
+        private = _parse_hf_private(run.stdout, run.stderr)
+        status = "private" if private is True else "public" if private is False else "visibility_unknown"
+        return {"ok": private is True, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": True, "private": private, "status": status, "green": private is True, "detail": out}
+    return {"ok": False, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": False, "private": None, "status": "not_found_or_unknown", "green": False, "detail": (last or {}).get("detail")}
+
+
+def _parse_hf_private(stdout: str, stderr: str = "") -> bool | None:
+    text = (stdout or "") + "\n" + (stderr or "")
+    try:
+        payload = json.loads(stdout or "{}")
+        if isinstance(payload.get("private"), bool):
+            return bool(payload.get("private"))
+    except Exception:
+        pass
+    lowered = text.lower()
+    if re.search(r"\bprivate\b\s*[:=]\s*(true|yes)", lowered) or "visibility: private" in lowered:
+        return True
+    if re.search(r"\bprivate\b\s*[:=]\s*(false|no)", lowered) or "visibility: public" in lowered or "public" in lowered:
+        return False
+    return None
+
+
+def _hf_repo_create(repo_id: str) -> Dict[str, Any]:
+    repo_id = (repo_id or "").strip()
+    if not _valid_hf_repo_id(repo_id):
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "invalid_repo_id", "repoId": repo_id, "exists": False, "private": None, "status": "invalid"}
+    hf_bin = _hf_cli_bin()
+    if not hf_bin:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "hf_cli_not_found", "repoId": repo_id, "exists": None, "private": None, "status": "unknown"}
+    command = [hf_bin, "repo", "create", repo_id, "--type", "dataset", "--private", "--exist-ok"]
+    run = subprocess.run(command, capture_output=True, text=True, timeout=60, check=False)
+    if run.returncode != 0:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "repoId": repo_id, "exists": None, "private": None, "status": "create_failed", "detail": _redacted_line(run.stderr or run.stdout)}
+    validated = _hf_repo_validate(repo_id)
+    if validated.get("private") is not True:
+        validated["ok"] = False
+        validated["status"] = validated.get("status") or "visibility_unknown"
+    return validated
+
+
+def _hf_export_upload(core: TotalRecallCore, session: Dict[str, Any], *, repo_id: str) -> Dict[str, Any]:
+    repo_id = (repo_id or ((session.get("repo") or {}).get("repoId") or "")).strip()
+    secret = _wizard_passphrase(session)
+    if not secret:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "passphrase_required"}
+    if not _valid_hf_repo_id(repo_id):
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "invalid_repo_id", "repoId": repo_id}
+    repo = _hf_repo_validate(repo_id)
+    session["repo"] = {key: repo.get(key) for key in ["repoId", "exists", "private", "status"]}
+    if repo.get("private") is False:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "repo_not_private", "repo": repo}
+    result = core.portable_clone_export(out_dir=core.home / "portable-clones", provider="huggingface", upload=True, repo_id=repo_id, passphrase=secret)
+    redacted = _redact_export_summary(result)
+    return {
+        "ok": bool(result.get("ok")),
+        "schema": "total-recall-hf-wizard-v1",
+        "status": result.get("status") or ("UPLOADED" if result.get("ok") else "FAILED"),
+        "eventCount": ((result.get("ledger") or {}).get("eventCount")),
+        "cloneId": result.get("cloneId"),
+        "bundle": Path(str(result.get("encryptedBundle") or "")).name or None,
+        "manifest": Path(str(result.get("manifestFile") or "")).name or None,
+        "upload": {"ok": bool((result.get("upload") or {}).get("ok"))},
+        "repo": repo,
+        "export": redacted,
+        "readyForGreen": False,
+    }
+
+
+def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id: str, local_dir: str = "", bundle: str = "") -> Dict[str, Any]:
+    repo_id = (repo_id or ((session.get("repo") or {}).get("repoId") or "")).strip()
+    secret = _wizard_passphrase(session)
+    if not secret:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "passphrase_required"}
+    if not _valid_hf_repo_id(repo_id):
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "invalid_repo_id", "repoId": repo_id}
+    before = _summary(core)
+    try:
+        with tempfile.TemporaryDirectory(prefix="total-recall-hf-download.") as staging:
+            staging_path = Path(staging)
+            if bundle:
+                bundle_path = Path(bundle).expanduser()
+            elif local_dir:
+                bundle_path = _latest_clone_bundle(Path(local_dir).expanduser())
+            else:
+                dl = _hf_download_latest(repo_id, staging_path)
+                if not dl.get("ok"):
+                    return dl
+                bundle_path = _latest_clone_bundle(staging_path)
+            test_home = Path(tempfile.mkdtemp(prefix="total-recall-hf-restore-test."))
+            test_core = TotalRecallCore(TotalRecallConfig(home=test_home, enable_lancedb=False, enable_qmd=False))
+            restored = test_core.portable_clone_restore(str(bundle_path), passphrase=secret, replace=True)
+            verified = test_core.verify()
+            trust = test_core.trust_gate_run(persist=True)
+            failed_required = int(((trust.get("summary") or {}).get("failedRequired") or 0))
+            source_ledger = ((session.get("lastExport") or {}).get("ledger") or {})
+            manifest_ledger = ((restored.get("manifest") or {}).get("ledger") or {})
+            restored_state = test_core.reduce_state(write=False)
+            ledger_match = True
+            if source_ledger.get("eventCount") is not None:
+                ledger_match = int(source_ledger.get("eventCount") or 0) == int(restored_state.get("event_count") or 0)
+            if manifest_ledger.get("stateHash"):
+                ledger_match = ledger_match and manifest_ledger.get("stateHash") == restored_state.get("state_hash")
+            ok = bool(restored.get("ok")) and bool(verified.get("ok")) and bool(trust.get("ok")) and failed_required == 0 and ledger_match
+            active_unchanged = int(before.get("eventCount") or 0) == int(_summary(core).get("eventCount") or 0)
+            summary = {
+                "ok": ok,
+                "status": "GREEN" if ok else "FAIL_CLOSED",
+                "cloneId": (restored.get("manifest") or {}).get("cloneId"),
+                "bundle": Path(str(bundle_path)).name,
+                "testHome": str(test_home),
+                "activeHome": str(core.home),
+                "activeHomeUnchanged": active_unchanged,
+                "verifyOk": bool(verified.get("ok")),
+                "trustOk": bool(trust.get("ok")),
+                "failedRequired": failed_required,
+                "ledgerMatch": ledger_match,
+                "eventCount": int(restored_state.get("event_count") or 0),
+            }
+            return {"ok": ok, "schema": "total-recall-hf-wizard-v1", "status": summary["status"], "restoreTest": summary, "readyForGreen": ok, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
+    except Exception as exc:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "status": "FAIL_CLOSED", "error": _redacted_line(str(exc)), "readyForGreen": False, "activeRestore": {"enabled": False, "reason": "Active memory was not replaced."}}
+
+
+def _hf_download_latest(repo_id: str, staging_path: Path) -> Dict[str, Any]:
+    hf_bin = _hf_cli_bin()
+    if not hf_bin:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "hf_cli_not_found"}
+    command = [hf_bin, "download", repo_id, "--repo-type", "dataset", "--include", "total-recall-portable-clone-*.tar.gz.enc*", "--local-dir", str(staging_path)]
+    run = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
+    if run.returncode != 0:
+        return {"ok": False, "schema": "total-recall-hf-wizard-v1", "error": "hf_download_failed", "detail": _redacted_line(run.stderr or run.stdout)}
+    return {"ok": True, "schema": "total-recall-hf-wizard-v1", "status": "DOWNLOADED"}
+
+
+def _latest_clone_bundle(path: Path) -> Path:
+    candidates = sorted(path.glob("**/total-recall-portable-clone-*.tar.gz.enc"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if not candidates:
+        raise FileNotFoundError("encrypted_clone_not_found")
+    return candidates[0]
+
+
+def _redact_export_summary(result: Dict[str, Any]) -> Dict[str, Any] | None:
+    if not result:
+        return None
+    return _redact_payload({
+        "ok": result.get("ok"),
+        "status": result.get("status"),
+        "cloneId": result.get("cloneId"),
+        "bundle": Path(str(result.get("encryptedBundle") or "")).name or None,
+        "manifest": Path(str(result.get("manifestFile") or "")).name or None,
+        "ledger": result.get("ledger") or {},
+        "upload": {"ok": bool((result.get("upload") or {}).get("ok"))},
+    })
+
+
+def _redact_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            if str(key).lower() in {"passphrase", "token", "authorization", "hf_token"}:
+                out[key] = "[redacted]"
+            else:
+                out[key] = _redact_payload(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redacted_line(value)
+    return value
 
 
 def _fix_all(core: TotalRecallCore, *, backup_dir: Path, keep: int, keep_days: int | None) -> Dict[str, Any]:
@@ -1050,7 +1350,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
     .panel.workbench { grid-column: span 7; }
     .panel.remote { grid-column: span 5; }
     .panel.context-risk, .panel.loop-inbox { grid-column: span 6; }
-    .panel.vault, .panel.backups, .panel.providers, .panel.hf, .panel.hf-process, .panel.setup-checklist { grid-column: 1 / -1; }
+    .panel.vault, .panel.backups, .panel.providers, .panel.hf, .panel.hf-wizard, .panel.hf-process, .panel.setup-checklist { grid-column: 1 / -1; }
     .panel-header {
       padding: 15px 16px 13px;
       border-bottom: 1px solid var(--line);
@@ -1171,7 +1471,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       font-size: 12px;
       font-weight: 720;
     }
-    .field select, .field input[type="text"] {
+    .field select, .field input[type="text"], .field input[type="password"] {
       border: 0;
       outline: 0;
       color: var(--ink);
@@ -1180,7 +1480,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
       min-width: 88px;
     }
     .field.grow { flex: 1 1 340px; justify-content: flex-start; }
-    .field.grow input[type="text"] { width: 100%; min-width: 220px; }
+    .field.grow input[type="text"], .field.grow input[type="password"] { width: 100%; min-width: 220px; }
     .field input[type="checkbox"] { width: 15px; height: 15px; accent-color: var(--teal); }
     .tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
     .tabs button[aria-selected="true"] { background: var(--teal-soft); border-color: #86d6cc; color: var(--teal-ink); }
@@ -1376,6 +1676,35 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
             <div class="two-col">
               <div class="row-list" id="hf-rows"></div>
               <div class="row-list" id="portable-rows"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel hf-wizard" id="hf-wizard">
+          <div class="panel-header">
+            <div>
+              <h2>Hugging Face Backup Wizard</h2>
+              <p>Uploaded is not green. Restorable + verified + trust-gated is green. Active memory was not replaced.</p>
+            </div>
+            <div class="split-actions">
+              <button onclick="refresh()">Refresh status</button>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="hf-wizard-rows"></div>
+            <div class="form-row" style="margin-top: 10px;">
+              <label class="field grow">Repo <input id="hf-wizard-repo" type="text" value=""></label>
+              <button onclick="runHfWizardAction('/api/hf/repo/validate', 'Validate private dataset')">Validate private dataset</button>
+              <button onclick="runHfWizardAction('/api/hf/repo/create', 'Create private dataset')">Create private dataset</button>
+            </div>
+            <div class="form-row" style="margin-top: 8px;">
+              <label class="field grow">Passphrase <input id="hf-wizard-passphrase" type="password" autocomplete="off" value=""></label>
+              <button onclick="saveHfPassphrase()">Save passphrase for this session</button>
+              <button onclick="runHfWizardAction('/api/hf/session/clear', 'Clear passphrase')">Clear passphrase</button>
+            </div>
+            <div class="form-row" style="margin-top: 8px;">
+              <button class="primary" onclick="runHfWizardAction('/api/hf/export-upload', 'Export encrypted clone and upload')">Export encrypted clone and upload</button>
+              <button onclick="runHfWizardAction('/api/hf/restore-test', 'Restore into temporary test home')">Restore into temporary test home</button>
             </div>
           </div>
         </section>
@@ -1650,6 +1979,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         renderProtection(data);
         renderProviders(data.providers || []);
         renderHf(data.hf || {}, data.portable || {});
+        renderHfWizard(data.hfWizard || {});
         renderHfProcess(data.hf || {});
         renderContextRisk(data.contextRisk || {});
         renderLoopInbox(data.loops || {});
@@ -1832,6 +2162,44 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
           <code>${escapeHtml(step.command)}</code>
         </div>
       `).join('') : '<div class="detail">Hugging Face instructions unavailable.</div>';
+    }
+
+    function renderHfWizard(wizard) {
+      const repo = wizard.repo || {};
+      const session = wizard.session || {};
+      const lastExport = wizard.lastExport || {};
+      const lastRestore = wizard.lastRestoreTest || {};
+      if ($('hf-wizard-repo') && !$('hf-wizard-repo').value && repo.repoId) $('hf-wizard-repo').value = repo.repoId;
+      const finalStatus = wizard.readyForGreen ? 'Remote Backup Verified' : 'not green yet';
+      $('hf-wizard-rows').innerHTML = [
+        dataRow('Step 1: HF Auth', ((wizard.hf || {}).loggedIn ? 'Logged in' : 'Needs login'), 'Token values are hidden; HF remote is encrypted transport only, not authority.', !!((wizard.hf || {}).loggedIn), ((wizard.hf || {}).loggedIn ? 'ok' : 'warn')),
+        dataRow('Step 2: Private Dataset', repo.status || 'not_validated', repo.private === true ? 'Repo verified private.' : 'Repo must be private before upload can be green.', repo.private === true, repo.private === true ? 'ok' : 'warn'),
+        dataRow('Step 3: Encryption Passphrase', session.passphrasePresent ? 'Present' : 'Missing', 'Stored in this dashboard process only; never echoed.', !!session.passphrasePresent, session.passphrasePresent ? 'ok' : 'warn'),
+        dataRow('Step 4: Export + Upload', lastExport.status || 'Not run', lastExport.cloneId || 'Upload success alone does not make this green.', !!lastExport.ok, lastExport.ok ? 'info' : 'warn'),
+        dataRow('Step 5: Restore Test', lastRestore.status || 'Not run', lastRestore.testHome ? `Restored copy: ${lastRestore.testHome}` : 'Fresh remote download + temp restore + verify + trust gate required.', !!lastRestore.ok, lastRestore.ok ? 'ok' : 'warn'),
+        dataRow('Final', finalStatus, (wizard.activeRestore || {}).reason || 'Active memory was not replaced.', wizard.readyForGreen === true, wizard.readyForGreen ? 'ok' : 'warn'),
+      ].join('');
+    }
+
+    async function saveHfPassphrase() {
+      const passphrase = $('hf-wizard-passphrase').value || '';
+      $('hf-wizard-passphrase').value = '';
+      await runActionPayload('/api/hf/session/passphrase', 'Save passphrase for this session', {passphrase});
+    }
+
+    async function runHfWizardAction(url, label) {
+      const repoId = $('hf-wizard-repo') ? $('hf-wizard-repo').value : '';
+      await runActionPayload(url, label, {repoId});
+    }
+
+    async function runActionPayload(url, label, payload) {
+      try {
+        const result = await postJson(url, payload || {});
+        renderRaw(label, result);
+        await refresh();
+      } catch (error) {
+        renderRaw(label, {ok: false, error: String(error.message || error)});
+      }
     }
 
     function renderContextRisk(risk) {

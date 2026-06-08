@@ -128,6 +128,13 @@ def _safe_id(value: str) -> str:
     return cleaned.strip("._") or "default"
 
 
+def _redact_secret_text(value: str) -> str:
+    text = str(value or "")
+    text = re.sub(r"hf_[A-Za-z0-9_\-]{12,}", "[redacted-hf-token]", text)
+    text = re.sub(r"(?i)(token|authorization|api[_-]?key)\s*[:=]\s*\S+", r"\1=[redacted]", text)
+    return text
+
+
 def _normalize_extensions(values: Iterable[str]) -> set[str]:
     normalized = set()
     for value in values:
@@ -4461,8 +4468,8 @@ class TotalRecallCore:
                 {
                     "command": " ".join(command[:3] + ["<file>", command[4], "--repo-type", "dataset"]),
                     "returncode": run.returncode,
-                    "stdout": run.stdout[-1000:],
-                    "stderr": run.stderr[-1000:],
+                    "stdout": _redact_secret_text(run.stdout[-1000:]),
+                    "stderr": _redact_secret_text(run.stderr[-1000:]),
                 }
             )
             if run.returncode != 0:

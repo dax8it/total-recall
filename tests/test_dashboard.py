@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from contextlib import contextmanager
 from http.server import ThreadingHTTPServer
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from total_recall_core import TotalRecallConfig, TotalRecallCore
@@ -37,6 +39,35 @@ def _post_json(url: str, payload: dict | None = None):
     )
     with urlopen(request, timeout=20) as response:
         return json.loads(response.read().decode("utf-8"))
+
+
+def _post_json_allow_error(url: str, payload: dict | None = None):
+    try:
+        return _post_json(url, payload)
+    except HTTPError as exc:
+        return json.loads(exc.read().decode("utf-8"))
+
+
+def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET_VALUE"):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    hf = bin_dir / "hf"
+    hf.write_text(
+        "#!/usr/bin/env python3\n"
+        "import json, sys\n"
+        f"leak={leak!r}\n"
+        f"private={str(private)!r}\n"
+        "args=sys.argv[1:]\n"
+        "if args[:2]==['auth','whoami']:\n print('fake-user'); raise SystemExit(0)\n"
+        "if args[:2]==['repo','info']:\n print(json.dumps({'id':args[2], 'private': private == 'True'})); print('token='+leak, file=sys.stderr); raise SystemExit(0)\n"
+        "if args[:2]==['repo','create']:\n print('created private dataset token='+leak); raise SystemExit(0)\n"
+        "if args and args[0]=='upload':\n print('uploaded token='+leak); raise SystemExit(0)\n"
+        "if args and args[0]=='download':\n raise SystemExit(0)\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    hf.chmod(0o755)
+    return bin_dir
 
 
 def test_dashboard_remote_mcp_admin_routes(tmp_path):
@@ -194,3 +225,90 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         blocked = _post_json(base_url + "/api/vault/export", {"path": str(tmp_path / "vault")})
         assert blocked["ok"] is False
         assert blocked["status"] == "EXISTS"
+
+
+def test_hf_wizard_status_session_repo_and_restore_safety(tmp_path, monkeypatch):
+    secret = "correct horse battery staple"
+    token = "FAKE_SECRET_VALUE"
+    monkeypatch.setenv("PATH", str(_install_fake_hf(tmp_path, leak=token)) + os.pathsep + os.environ.get("PATH", ""))
+    monkeypatch.setenv("HF_TOKEN", token)
+    monkeypatch.setenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", secret)
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "home", enable_lancedb=False, enable_qmd=False))
+    backup_dir = tmp_path / "backups"
+    core.ingest(kind="note", text="HF wizard restore safety proof.", session_id="wizard", scope="private")
+    active_count = core.health()["eventCount"]
+
+    with _dashboard(core, backup_dir) as base_url:
+        with urlopen(base_url + "/", timeout=10) as response:
+            html = response.read().decode("utf-8")
+        assert "Hugging Face Backup Wizard" in html
+        assert "Refresh status" in html
+        assert "Validate private dataset" in html
+        assert "Create private dataset" in html
+        assert "Save passphrase for this session" in html
+        assert "Clear passphrase" in html
+        assert "Export encrypted clone and upload" in html
+        assert "Restore into temporary test home" in html
+        assert "Uploaded is not green. Restorable + verified + trust-gated is green." in html
+        assert "Active memory was not replaced." in html
+
+        status = _get_json(base_url + "/api/hf/wizard/status")
+        assert status["schema"] == "total-recall-hf-wizard-v1"
+        assert status["session"]["tokenValueVisible"] is False
+        assert status["activeRestore"]["enabled"] is False
+        assert token not in json.dumps(status)
+        assert secret not in json.dumps(status)
+
+        posted = _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": secret})
+        assert posted["passphrasePresent"] is True
+        assert secret not in json.dumps(posted)
+        status = _get_json(base_url + "/api/hf/wizard/status")
+        assert status["session"]["passphrasePresent"] is True
+        assert secret not in json.dumps(status)
+        cleared = _post_json(base_url + "/api/hf/session/clear")
+        assert cleared["passphrasePresent"] is False
+        assert _get_json(base_url + "/api/hf/wizard/status")["session"]["passphrasePresent"] is False
+
+        invalid = _post_json_allow_error(base_url + "/api/hf/repo/validate", {"repoId": "not-a-repo"})
+        assert invalid["ok"] is False
+        assert invalid["error"] == "invalid_repo_id"
+        valid = _post_json(base_url + "/api/hf/repo/validate", {"repoId": "owner/private-dataset"})
+        assert valid["ok"] is True
+        assert valid["private"] is True
+        assert token not in json.dumps(valid)
+
+        _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": secret})
+        upload = _post_json(base_url + "/api/hf/export-upload", {"repoId": "owner/private-dataset"})
+        assert upload["status"] == "UPLOADED"
+        assert upload["eventCount"] >= active_count
+        assert upload["upload"]["ok"] is True
+        assert upload["readyForGreen"] is False
+        assert secret not in json.dumps(upload)
+        assert token not in json.dumps(upload)
+
+        _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": "wrong passphrase"})
+        failed = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset", "localDir": str(core.home / "portable-clones")})
+        assert failed["ok"] is False
+        assert failed["readyForGreen"] is False
+        assert core.health()["eventCount"] == active_count
+
+        _post_json(base_url + "/api/hf/session/passphrase", {"passphrase": secret})
+        restored = _post_json_allow_error(base_url + "/api/hf/restore-test", {"repoId": "owner/private-dataset", "localDir": str(core.home / "portable-clones")})
+        assert restored["restoreTest"]["activeHome"] == str(core.home)
+        assert restored["restoreTest"]["testHome"] != str(core.home)
+        assert "total-recall-hf-restore-test." in restored["restoreTest"]["testHome"]
+        assert restored["restoreTest"]["activeHomeUnchanged"] is True
+        assert core.health()["eventCount"] == active_count
+        if restored["ok"]:
+            assert restored["readyForGreen"] is True
+            assert restored["restoreTest"]["failedRequired"] == 0
+
+
+def test_hf_wizard_public_or_unknown_visibility_not_green(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", str(_install_fake_hf(tmp_path, private=False)) + os.pathsep + os.environ.get("PATH", ""))
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "home", enable_lancedb=False, enable_qmd=False))
+    with _dashboard(core, tmp_path / "backups") as base_url:
+        public = _post_json_allow_error(base_url + "/api/hf/repo/validate", {"repoId": "owner/public-dataset"})
+        assert public["ok"] is False
+        assert public["private"] is False
+        assert public["green"] is False
