@@ -99,6 +99,9 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert "Continue on another machine" in html
         assert "Hugging Face process" in html
         assert "Context Risk Zone" in html
+        assert "Agent Fleet" in html
+        assert "Protected action ladder" in html
+        assert "Cross-agent memory stays isolated unless explicitly authorized" in html
         assert "Agent work inbox" in html
         assert "First-run checklist" in html
         assert "Click any ? mark to see what that selected item means" in html
@@ -142,6 +145,26 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         assert portable_status["schema"] == "total-recall-portable-status-v1"
         assert loops_status["mode"] == "read-only-review"
         assert context_risk["schema"] == "total-recall-context-risk-v1"
+        assert status["contextRisk"]["schema"] == "total-recall-context-risk-v1"
+        assert status["contextRisk"]["checkpointLagEvents"] == 0
+        assert status["contextRisk"]["riskZone"] in {"READY", "TRUST_GATE_NEEDED", "BACKUP_NEEDED", "SAVE_FIRST"}
+        assert status["contextRisk"]["rehydratePreview"]["readOnly"] is True
+        assert "Total Recall Rehydrate Preview" in status["contextRisk"]["rehydratePreview"]["text"]
+        assert [step["name"] for step in status["contextRisk"]["actionLadder"]] == [
+            "Save Restore Point",
+            "Verify",
+            "Trust Gate",
+            "Backup",
+            "Rehydrate Preview",
+            "Start fresh hydrated Hermes session",
+        ]
+        assert status["contextRisk"]["actionLadder"][-1]["enabled"] is False
+        assert status["agentFleet"]["schema"] == "total-recall-agent-fleet-v1"
+        assert status["agentFleet"]["isolation"]["default"] == "profile-local"
+        assert status["agentFleet"]["isolation"]["silentSharedMemory"] is False
+        assert isinstance(status["agentFleet"]["profiles"], list)
+        assert status["agentFleet"]["federation"]["requiresExplicitAuthorization"] is True
+        assert "hf_" not in json.dumps(status["agentFleet"])
         assert setup_checklist["schema"] == "total-recall-setup-checklist-v1"
 
         rebuilt = _post_json(base_url + "/api/knowledge/index/rebuild")
@@ -229,6 +252,59 @@ def test_dashboard_remote_mcp_admin_routes(tmp_path):
         blocked = _post_json(base_url + "/api/vault/export", {"path": str(tmp_path / "vault")})
         assert blocked["ok"] is False
         assert blocked["status"] == "EXISTS"
+
+
+def test_dashboard_agent_fleet_reads_profile_boundaries(tmp_path, monkeypatch):
+    hermes_home = tmp_path / ".hermes"
+    profile_home = hermes_home / "profiles" / "sparky"
+    profile_tr_home = profile_home / "total-recall"
+    profile_tr_home.joinpath("checkpoints").mkdir(parents=True)
+    profile_tr_home.joinpath("incidents").mkdir(parents=True)
+    profile_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "config.yaml").write_text(
+        "memory:\n  memory_enabled: true\n  provider: builtin\ncompression:\n  enabled: true\n  threshold: 0.5\n",
+        encoding="utf-8",
+    )
+    (profile_home / "config.yaml").write_text(
+        "memory:\n  memory_enabled: true\n  provider: total-recall\n  total-recall:\n    auto_rehydrate:\n      enabled: true\n      context_threshold: 0.55\ncompression:\n  enabled: true\n  threshold: 0.55\n",
+        encoding="utf-8",
+    )
+    (profile_tr_home / "checkpoints" / "checkpoint_sparky.json").write_text(
+        json.dumps({"event_count": 4, "created_at": "2026-01-01T00:00:00Z", "label": "sparky"}),
+        encoding="utf-8",
+    )
+    (profile_tr_home / "incidents" / "incident_open.json").write_text(
+        json.dumps({"incident_id": "inc_1", "status": "OPEN"}),
+        encoding="utf-8",
+    )
+    (profile_tr_home / "ledger").mkdir()
+    (profile_tr_home / "ledger" / "events.jsonl").write_text("{}\n{}\n{}\n{}\n", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "active-home", enable_lancedb=False, enable_qmd=False))
+    backup_dir = tmp_path / "backups"
+    core.ingest(kind="note", text="Active dashboard memory.", session_id="dashboard", scope="private")
+    core.checkpoint(session_id="dashboard")
+
+    with _dashboard(core, backup_dir) as base_url:
+        fleet = _get_json(base_url + "/api/agent-fleet")
+        assert fleet["schema"] == "total-recall-agent-fleet-v1"
+        names = {profile["profile"] for profile in fleet["profiles"]}
+        assert {"default", "sparky"}.issubset(names)
+        sparky = next(profile for profile in fleet["profiles"] if profile["profile"] == "sparky")
+        assert sparky["gateway"] in {"running", "stopped"}
+        assert sparky["memoryProvider"] == "total-recall"
+        assert sparky["totalRecallHomeExists"] is True
+        assert sparky["latestCheckpoint"] == "checkpoint_sparky.json"
+        assert sparky["checkpointLagEvents"] == 0
+        assert sparky["openIncidents"] == 1
+        assert sparky["compressionThreshold"] == 0.55
+        assert sparky["autoRehydrateThreshold"] == 0.55
+        assert sparky["verdict"] == "Trust Gate needed"
+        assert sparky["memoryIsolation"] == "profile-local"
+        assert fleet["federation"]["targetCount"] == 0
+        assert fleet["federation"]["status"] == "isolated"
 
 
 def test_hf_wizard_status_session_repo_and_restore_safety(tmp_path, monkeypatch):

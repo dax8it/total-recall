@@ -68,6 +68,7 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
                     "loops": _loop_inbox_summary(core),
                     "providers": _providers(),
                     "contextRisk": _context_risk(core, backup_dir=backup_dir, backup=backup),
+                    "agentFleet": _agent_fleet(core),
                     "setupChecklist": _setup_checklist(core, backup_dir=backup_dir, backup=backup),
                     "policy": {
                         "backupDir": str(backup_dir.expanduser()),
@@ -93,6 +94,14 @@ def _handler(*, core: TotalRecallCore, backup_dir: Path, keep: int, keep_days: i
             if parsed.path == "/api/context-risk":
                 backup = core.backup_status(str(backup_dir))
                 self._send_json(_context_risk(core, backup_dir=backup_dir, backup=backup))
+                return
+            if parsed.path == "/api/rehydrate-preview":
+                backup = core.backup_status(str(backup_dir))
+                risk = _context_risk(core, backup_dir=backup_dir, backup=backup)
+                self._send_json(risk.get("rehydratePreview") or {})
+                return
+            if parsed.path == "/api/agent-fleet":
+                self._send_json(_agent_fleet(core))
                 return
             if parsed.path == "/api/setup/checklist":
                 backup = core.backup_status(str(backup_dir))
@@ -1036,6 +1045,254 @@ def _loop_inbox_summary(core: TotalRecallCore) -> Dict[str, Any]:
     }
 
 
+def _agent_fleet(core: TotalRecallCore) -> Dict[str, Any]:
+    """Read-only Hermes profile continuity summary.
+
+    The fleet panel intentionally inspects each profile's own config and Total Recall
+    home. It does not open another profile's memory provider, query another agent, or
+    merge memory across homes.
+    """
+    hermes_home = Path(os.getenv("HERMES_HOME") or Path.home() / ".hermes").expanduser()
+    profiles = []
+    default_config = _read_config_yaml(hermes_home / "config.yaml")
+    profiles.append(_profile_fleet_row("default", hermes_home, default_config, core=core))
+    profiles_root = hermes_home / "profiles"
+    if profiles_root.exists():
+        for profile_dir in sorted(path for path in profiles_root.iterdir() if path.is_dir()):
+            profiles.append(_profile_fleet_row(profile_dir.name, profile_dir, _read_config_yaml(profile_dir / "config.yaml")))
+    federation = _federation_status(core)
+    return {
+        "ok": True,
+        "schema": "total-recall-agent-fleet-v1",
+        "mode": "read-only",
+        "hermesHome": str(hermes_home),
+        "profiles": profiles,
+        "isolation": {
+            "default": "profile-local",
+            "silentSharedMemory": False,
+            "detail": "Each profile is inspected separately. Cross-agent memory query requires explicit federation authorization.",
+        },
+        "federation": federation,
+    }
+
+
+def _profile_fleet_row(name: str, profile_home: Path, config: Dict[str, Any], *, core: TotalRecallCore | None = None) -> Dict[str, Any]:
+    memory_cfg = _dict_get(config, "memory", default={})
+    provider = str(_config_get(config, "memory", "provider", default="") or "")
+    if not provider:
+        provider = "total-recall" if _dict_get(memory_cfg, "total-recall", default={}) else "builtin"
+    total_cfg = _dict_get(memory_cfg, "total-recall", default={})
+    compression_threshold = _config_get(config, "compression", "threshold", default=None)
+    auto_cfg = _dict_get(total_cfg, "auto_rehydrate", default={})
+    auto_threshold = auto_cfg.get("context_threshold") if isinstance(auto_cfg, dict) else None
+    tr_home = _profile_total_recall_home(name, profile_home, total_cfg, core=core)
+    latest_checkpoint = _latest_checkpoint_summary(tr_home)
+    event_count = _ledger_event_count(tr_home)
+    checkpoint_event_count = int(latest_checkpoint.get("eventCount") or 0) if latest_checkpoint else 0
+    checkpoint_lag = max(0, event_count - checkpoint_event_count) if latest_checkpoint else event_count
+    open_incidents = _open_incident_count(tr_home)
+    trust_passed = _trust_gate_passed(tr_home)
+    verdict = _fleet_verdict(provider, tr_home.exists(), latest_checkpoint, checkpoint_lag, open_incidents, trust_passed)
+    return {
+        "profile": name,
+        "gateway": _gateway_status(name),
+        "memoryProvider": provider or "unknown",
+        "memoryIsolation": "profile-local",
+        "totalRecallHome": str(tr_home),
+        "totalRecallHomeExists": tr_home.exists(),
+        "latestCheckpoint": latest_checkpoint.get("name") if latest_checkpoint else None,
+        "latestCheckpointPath": latest_checkpoint.get("path") if latest_checkpoint else None,
+        "latestCheckpointCreatedAt": latest_checkpoint.get("createdAt") if latest_checkpoint else None,
+        "eventCount": event_count,
+        "checkpointEventCount": checkpoint_event_count,
+        "checkpointLagEvents": checkpoint_lag,
+        "openIncidents": open_incidents,
+        "compressionThreshold": _safe_float_or_none(compression_threshold),
+        "autoRehydrateThreshold": _safe_float_or_none(auto_threshold),
+        "autoRehydrateEnabled": _bool_config(auto_cfg.get("enabled", True) if isinstance(auto_cfg, dict) else True),
+        "verdict": verdict,
+    }
+
+
+def _profile_total_recall_home(name: str, profile_home: Path, total_cfg: Dict[str, Any], *, core: TotalRecallCore | None = None) -> Path:
+    configured = total_cfg.get("home") if isinstance(total_cfg, dict) else None
+    if configured:
+        return Path(str(configured)).expanduser()
+    if core is not None and name == "default" and not (profile_home / "total-recall").exists():
+        return core.home
+    return profile_home / "total-recall"
+
+
+def _latest_checkpoint_summary(home: Path) -> Dict[str, Any]:
+    checkpoints = sorted((home / "checkpoints").glob("*.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0, reverse=True)
+    if not checkpoints:
+        return {}
+    path = checkpoints[0]
+    payload = _read_json_file(path)
+    return {
+        "name": path.name,
+        "path": str(path),
+        "eventCount": _safe_int(payload.get("event_count") or payload.get("eventCount") or 0),
+        "createdAt": payload.get("created_at") or payload.get("createdAt") or payload.get("timestamp"),
+        "label": payload.get("label"),
+    }
+
+
+def _ledger_event_count(home: Path) -> int:
+    path = home / "ledger" / "events.jsonl"
+    if not path.exists():
+        return 0
+    try:
+        return sum(1 for line in path.read_text(encoding="utf-8", errors="ignore").splitlines() if line.strip())
+    except Exception:
+        return 0
+
+
+def _open_incident_count(home: Path) -> int:
+    count = 0
+    for path in (home / "incidents").glob("*.json"):
+        payload = _read_json_file(path)
+        status = str(payload.get("status") or "OPEN").upper()
+        if status not in {"RESOLVED", "CLOSED", "DONE"}:
+            count += 1
+    return count
+
+
+def _trust_gate_passed(home: Path) -> bool:
+    reports = list((home / "reports").glob("*trust*gate*.json")) + list((home / "reports").glob("trust*.json"))
+    for path in sorted(reports, key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True):
+        payload = _read_json_file(path)
+        if payload.get("ok") is True or str(payload.get("status") or "").upper() == "PASS":
+            return True
+    return False
+
+
+def _fleet_verdict(provider: str, home_exists: bool, checkpoint: Dict[str, Any], lag: int, open_incidents: int, trust_passed: bool) -> str:
+    if provider != "total-recall":
+        return "Trust Gate needed"
+    if not home_exists or not checkpoint or lag > 0:
+        return "Save first"
+    if open_incidents > 0 or not trust_passed:
+        return "Trust Gate needed"
+    return "Ready"
+
+
+def _gateway_status(profile: str) -> str:
+    try:
+        run = subprocess.run(["pgrep", "-fl", f"hermes.*({re.escape(profile)}|gateway)|gateway.*{re.escape(profile)}"], capture_output=True, text=True, timeout=1, check=False)
+    except Exception:
+        return "stopped"
+    current_pid = str(os.getpid())
+    lines = [line for line in (run.stdout or "").splitlines() if current_pid not in line]
+    return "running" if lines else "stopped"
+
+
+def _federation_status(core: TotalRecallCore) -> Dict[str, Any]:
+    payload = _guarded_call(core.federation_list)
+    targets = payload.get("targets") if payload.get("ok") else []
+    targets = targets if isinstance(targets, list) else []
+    return {
+        "status": "registered" if targets else "isolated",
+        "targetCount": len(targets),
+        "targets": [{"name": item.get("name"), "role": item.get("role"), "scopes": item.get("scopes") or []} for item in targets],
+        "requiresExplicitAuthorization": True,
+        "silentSharedMemory": False,
+        "detail": "Federation is displayed only as registration metadata. Queries require explicit authorization and return workspace-separated results.",
+    }
+
+
+def _read_config_yaml(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    text = path.read_text(encoding="utf-8")
+    try:
+        import yaml
+
+        loaded = yaml.safe_load(text)
+        return loaded if isinstance(loaded, dict) else {}
+    except Exception:
+        try:
+            loaded = json.loads(text)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return _parse_simple_yaml_mapping(text)
+
+
+def _parse_simple_yaml_mapping(text: str) -> Dict[str, Any]:
+    root: Dict[str, Any] = {}
+    stack: list[tuple[int, Dict[str, Any]]] = [(-1, root)]
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        indent = len(raw_line) - len(raw_line.lstrip(" "))
+        line = raw_line.strip()
+        if ":" not in line or line.startswith("-"):
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().strip("\"'")
+        value = value.strip()
+        while stack and indent <= stack[-1][0]:
+            stack.pop()
+        parent = stack[-1][1] if stack else root
+        if not value:
+            child: Dict[str, Any] = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = _parse_simple_yaml_scalar(value)
+    return root
+
+
+def _parse_simple_yaml_scalar(value: str) -> Any:
+    value = value.split(" #", 1)[0].strip().strip("\"'")
+    lowered = value.lower()
+    if lowered in {"true", "yes", "on"}:
+        return True
+    if lowered in {"false", "no", "off"}:
+        return False
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except Exception:
+        return value
+
+
+def _read_json_file(path: Path) -> Dict[str, Any]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _config_get(config: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    current: Any = config
+    for key in keys:
+        if not isinstance(current, dict) or key not in current:
+            return default
+        current = current[key]
+    return current
+
+
+def _dict_get(config: Dict[str, Any], key: str, *, default: Any) -> Any:
+    value = config.get(key) if isinstance(config, dict) else None
+    return value if isinstance(value, dict) else default
+
+
+def _safe_float_or_none(value: Any) -> float | None:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except Exception:
+        return None
+
+
+def _bool_config(value: Any) -> bool:
+    return str(value).lower() not in {"0", "false", "no", "off"}
+
+
 def _context_risk(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, Any] | None = None) -> Dict[str, Any]:
     summary = _summary(core)
     backup_ready = _backup_readiness(core, backup_dir=backup_dir, backup=backup)
@@ -1049,34 +1306,50 @@ def _context_risk(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, 
     safe_compact = safe_restart and trust_ok
     safe_restore = safe_compact and backup_ok
     if safe_restore:
+        risk_zone = "READY"
         verdict = "Ready"
         next_action = "Safe to restart or compact. Restore still requires verify after import."
         tone = "ok"
-    elif safe_restart:
-        verdict = "Needs safety check"
-        next_action = "Run Trust Gate and confirm backup coverage before treating restore as safe."
-        tone = "warn"
     elif lag:
+        risk_zone = "SAVE_FIRST"
         verdict = "Save first"
         next_action = f"Save a restore point: {lag} new memor{'y' if lag == 1 else 'ies'} are not checkpointed."
         tone = "warn"
     elif open_incidents:
+        risk_zone = "TRUST_GATE_NEEDED"
         verdict = "Resolve incidents"
-        next_action = f"Resolve {open_incidents} open safety incident(s) before restart/restore confidence."
+        next_action = f"Resolve {open_incidents} open safety incident(s) and run Trust Gate before restart/restore confidence."
         tone = "bad"
+    elif not trust_ok:
+        risk_zone = "TRUST_GATE_NEEDED"
+        verdict = "Needs safety check"
+        next_action = "Run Trust Gate before treating compact or restore as safe."
+        tone = "warn"
+    elif not backup_ok:
+        risk_zone = "BACKUP_NEEDED"
+        verdict = "Backup needed"
+        next_action = "Write a backup after verification so restore has a recovery copy."
+        tone = "warn"
     else:
+        risk_zone = "TRUST_GATE_NEEDED"
         verdict = "Check memory"
         next_action = "Run Fix All, then refresh this panel."
         tone = "warn"
     return {
         "ok": safe_restore,
         "schema": "total-recall-context-risk-v1",
+        "riskZone": risk_zone,
         "verdict": verdict,
         "tone": tone,
         "nextAction": next_action,
+        "checkpointLagEvents": lag,
+        "checkpointStatus": summary.get("checkpointStatus"),
+        "openIncidents": open_incidents,
         "safeToRestart": safe_restart,
         "safeToCompact": safe_compact,
         "safeToRestore": safe_restore,
+        "rehydratePreview": _rehydrate_preview(core, summary=summary, trust=trust, backup_ready=backup_ready, risk_zone=risk_zone),
+        "actionLadder": _protected_action_ladder(summary=summary, trust=trust, backup_ready=backup_ready, risk_zone=risk_zone),
         "rows": [
             {"name": "Restart readiness", "status": "Ready" if safe_restart else "Save first", "detail": next_action if not safe_restart else "Restore point is current and no open incidents are reported.", "ok": safe_restart},
             {"name": "Compaction readiness", "status": "Ready" if safe_compact else "Run Trust Gate", "detail": "Compaction should have a current restore point and a passing Trust Gate.", "ok": safe_compact},
@@ -1084,6 +1357,94 @@ def _context_risk(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, 
             {"name": "Backup coverage", "status": title_case_readiness(backup_ready.get("status")), "detail": backup_ready.get("nextAction") or backup_ready.get("message") or "Backup status unavailable.", "ok": backup_ok},
         ],
     }
+
+
+def _rehydrate_preview(
+    core: TotalRecallCore,
+    *,
+    summary: Dict[str, Any],
+    trust: Dict[str, Any],
+    backup_ready: Dict[str, Any],
+    risk_zone: str,
+) -> Dict[str, Any]:
+    checkpoint = summary.get("latestCheckpoint") or "missing"
+    anchor = (trust.get("anchorFile") or trust.get("anchor") or "verify/trust gate not run") if isinstance(trust, dict) else "verify/trust gate not run"
+    lines = [
+        "[Total Recall Rehydrate Preview]",
+        "read_only: true",
+        f"risk_zone: {risk_zone}",
+        f"home: {core.home}",
+        f"checkpoint: {checkpoint}",
+        f"anchor: {anchor}",
+        f"checkpoint_lag_events: {int(summary.get('checkpointLagEvents') or 0)}",
+        f"open_incidents: {int(summary.get('openIncidents') or 0)}",
+        f"backup_status: {backup_ready.get('status') or 'unknown'}",
+        "",
+        "Operator note: this is a preview only. It does not write reports, hydrate another agent, or share memory across profiles.",
+    ]
+    return {
+        "ok": True,
+        "schema": "total-recall-rehydrate-preview-v1",
+        "readOnly": True,
+        "riskZone": risk_zone,
+        "text": "\n".join(lines),
+    }
+
+
+def _protected_action_ladder(*, summary: Dict[str, Any], trust: Dict[str, Any], backup_ready: Dict[str, Any], risk_zone: str) -> List[Dict[str, Any]]:
+    checkpoint_current = summary.get("checkpointStatus") == "current"
+    trust_ok = trust.get("ok") is True
+    backup_ok = backup_ready.get("ok") is True
+    return [
+        {
+            "name": "Save Restore Point",
+            "endpoint": "/api/checkpoint",
+            "method": "POST",
+            "enabled": True,
+            "status": "current" if checkpoint_current else "needed",
+            "detail": "Save the current ledger position before restart or compaction.",
+        },
+        {
+            "name": "Verify",
+            "endpoint": "/api/verify",
+            "method": "POST",
+            "enabled": checkpoint_current,
+            "status": "available" if checkpoint_current else "save_first",
+            "detail": "Verify ledger, checkpoint, and signed anchor before trusting memory.",
+        },
+        {
+            "name": "Trust Gate",
+            "endpoint": "/api/trust/verify",
+            "method": "POST",
+            "enabled": checkpoint_current,
+            "status": "pass" if trust_ok else "needed",
+            "detail": "Run release-grade continuity checks before restore confidence.",
+        },
+        {
+            "name": "Backup",
+            "endpoint": "/api/protection/fix-all",
+            "method": "POST",
+            "enabled": checkpoint_current and trust_ok,
+            "status": "current" if backup_ok else "needed",
+            "detail": "Write recovery transport after the memory authority is saved and verified.",
+        },
+        {
+            "name": "Rehydrate Preview",
+            "endpoint": "/api/rehydrate-preview",
+            "method": "GET",
+            "enabled": True,
+            "status": risk_zone.lower(),
+            "detail": "Generate a read-only context block preview without starting a new session.",
+        },
+        {
+            "name": "Start fresh hydrated Hermes session",
+            "endpoint": None,
+            "method": None,
+            "enabled": False,
+            "status": "later",
+            "detail": "Intentionally disabled in this read-only panel; add only after explicit approval.",
+        },
+    ]
 
 
 def _setup_checklist(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -1838,12 +2199,40 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         <section class="panel context-risk" id="context-risk">
           <div class="panel-header">
             <div>
-              <h2>Context Risk Zone</h2>
-              <p>Plain-English restart, compact, and restore readiness.</p>
+              <h2>Context / Hydration</h2>
+              <p>Current Context Risk Zone, checkpoint lag, restart/compact/restore safety, and read-only rehydrate preview.</p>
             </div>
+            <button onclick="showRehydratePreview()">Rehydrate Preview</button>
           </div>
           <div class="panel-body">
             <div class="row-list" id="context-risk-rows"></div>
+            <pre class="workbench-output" id="rehydrate-preview">Rehydrate preview will appear here after refresh.</pre>
+          </div>
+        </section>
+
+        <section class="panel agent-fleet" id="agent-fleet">
+          <div class="panel-header">
+            <div>
+              <h2>Agent Fleet</h2>
+              <p>Read-only per-profile continuity state. Cross-agent memory stays isolated unless explicitly authorized.</p>
+            </div>
+            <button onclick="refresh()">Refresh fleet</button>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="agent-fleet-rows"></div>
+            <div class="detail" id="agent-federation-note">No silent shared memory. Federation metadata only.</div>
+          </div>
+        </section>
+
+        <section class="panel protected-ladder" id="protected-ladder">
+          <div class="panel-header">
+            <div>
+              <h2>Protected action ladder</h2>
+              <p>Guarded sequence: save, verify, trust gate, backup, preview. Fresh hydrated session remains disabled for now.</p>
+            </div>
+          </div>
+          <div class="panel-body">
+            <div class="row-list" id="protected-ladder-rows"></div>
           </div>
         </section>
 
@@ -2096,6 +2485,8 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         renderHfWizard(data.hfWizard || {});
         renderHfProcess(data.hf || {});
         renderContextRisk(data.contextRisk || {});
+        renderAgentFleet(data.agentFleet || {});
+        renderProtectedLadder((data.contextRisk || {}).actionLadder || []);
         renderLoopInbox(data.loops || {});
         renderSetupChecklist(data.setupChecklist || {});
         renderBackups((data.backup || {}).backups || []);
@@ -2323,8 +2714,52 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
 
     function renderContextRisk(risk) {
       const rows = (risk.rows || []).map(row => dataRow(row.name, row.status, row.detail, !!row.ok, row.ok ? 'ok' : 'warn'));
-      rows.unshift(dataRow('Overall context risk', risk.verdict || 'Checking', risk.nextAction || 'Run Fix All, then refresh.', risk.ok === true, risk.tone || 'warn'));
+      rows.unshift(dataRow('Current Context Risk Zone', risk.riskZone || risk.verdict || 'Checking', risk.nextAction || 'Run Fix All, then refresh.', risk.ok === true, risk.tone || 'warn'));
+      rows.push(dataRow('Checkpoint lag', `${risk.checkpointLagEvents || 0} event(s)`, risk.checkpointStatus || 'unknown', Number(risk.checkpointLagEvents || 0) === 0, Number(risk.checkpointLagEvents || 0) === 0 ? 'ok' : 'warn'));
+      rows.push(dataRow('Safe to restart?', risk.safeToRestart ? 'Yes' : 'No', risk.safeToRestart ? 'Restore point is current and no incidents are open.' : 'Save/verify first.', !!risk.safeToRestart, risk.safeToRestart ? 'ok' : 'warn'));
+      rows.push(dataRow('Safe to compact?', risk.safeToCompact ? 'Yes' : 'No', risk.safeToCompact ? 'Trust Gate passed.' : 'Run Trust Gate before compaction.', !!risk.safeToCompact, risk.safeToCompact ? 'ok' : 'warn'));
+      rows.push(dataRow('Safe to restore?', risk.safeToRestore ? 'Yes' : 'No', risk.safeToRestore ? 'Backup coverage is current.' : 'Restore only into a test home until backup/verify/trust are green.', !!risk.safeToRestore, risk.safeToRestore ? 'ok' : 'warn'));
       $('context-risk-rows').innerHTML = rows.join('');
+      $('rehydrate-preview').textContent = ((risk.rehydratePreview || {}).text) || 'No rehydrate preview available yet.';
+    }
+
+    function renderAgentFleet(fleet) {
+      const profiles = fleet.profiles || [];
+      const rows = profiles.map(profile => {
+        const detail = [
+          `gateway ${profile.gateway || 'unknown'}`,
+          `provider ${profile.memoryProvider || 'unknown'}`,
+          `TR home ${profile.totalRecallHomeExists ? 'exists' : 'missing'}`,
+          `checkpoint ${profile.latestCheckpoint || 'none'}`,
+          `lag ${profile.checkpointLagEvents || 0}`,
+          `incidents ${profile.openIncidents || 0}`,
+          `compression ${profile.compressionThreshold == null ? '-' : profile.compressionThreshold}`,
+          `auto-rehydrate ${profile.autoRehydrateThreshold == null ? '-' : profile.autoRehydrateThreshold}`,
+        ].join(' · ');
+        const ready = profile.verdict === 'Ready';
+        const tone = ready ? 'ok' : profile.verdict === 'Save first' ? 'warn' : 'info';
+        return dataRow(`Profile: ${profile.profile || 'unknown'}`, profile.verdict || 'Check', detail, ready, tone);
+      });
+      $('agent-fleet-rows').innerHTML = rows.length ? rows.join('') : dataRow('Agent Fleet', 'No profiles', 'No Hermes profiles discovered.', false, 'warn');
+      const federation = fleet.federation || {};
+      $('agent-federation-note').textContent = federation.detail || 'No silent shared memory; federation requires explicit authorization.';
+    }
+
+    function renderProtectedLadder(steps) {
+      $('protected-ladder-rows').innerHTML = (steps || []).map(step => {
+        const label = step.enabled === false ? `${step.status || 'disabled'} · disabled` : (step.status || 'ready');
+        return dataRow(step.name, label, step.detail || '', step.enabled !== false, step.enabled === false ? 'neutral' : 'info');
+      }).join('') || dataRow('Protected action ladder', 'Unavailable', 'Refresh status first.', false, 'warn');
+    }
+
+    async function showRehydratePreview() {
+      try {
+        const data = await getJson('/api/rehydrate-preview');
+        $('rehydrate-preview').textContent = data.text || JSON.stringify(data, null, 2);
+        renderRaw('Rehydrate Preview', data);
+      } catch (error) {
+        renderRaw('Rehydrate Preview failed', {ok: false, error: String(error.message || error)});
+      }
     }
 
     function renderLoopInbox(inbox) {
@@ -2725,6 +3160,15 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         'Clone ledger point': 'The ledger event/hash captured by the encrypted clone manifest.',
         'Restore default': 'Restores should go to a test home first, then verify and Trust Gate before active replacement.',
         'Overall context risk': 'Plain-English summary of restart, compaction, and restore readiness.',
+        'Current Context Risk Zone': 'Current safety zone for restart, compaction, and restore decisions.',
+        'Checkpoint lag': 'How many memory events exist after the latest restore point. Non-zero means save first.',
+        'Safe to restart?': 'Whether the current restore point and incident state are safe enough for process restart.',
+        'Safe to compact?': 'Whether compaction has a current restore point and passing Trust Gate.',
+        'Safe to restore?': 'Whether restore has passed the save, verify, trust, and backup checks.',
+        'Profile: default': 'Default Hermes profile continuity status. Other profile rows stay isolated by profile.',
+        'Agent Fleet': 'Read-only overview of Hermes profiles and their local continuity safety state.',
+        'Protected action ladder': 'Ordered safety ladder before any future fresh hydrated session action.',
+        'Rehydrate Preview': 'Read-only generated context preview. It does not start a new session or write memory.',
         'Restart readiness': 'Whether the latest restore point is current enough to restart safely.',
         'Compaction readiness': 'Whether a compact/restart handoff has a current restore point and passing Trust Gate.',
         'Restore readiness': 'Whether restored memory can be trusted after test restore, verify, and Trust Gate.',
