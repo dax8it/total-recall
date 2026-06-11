@@ -126,11 +126,14 @@ def build_parser() -> argparse.ArgumentParser:
     verify = sub.add_parser("verify")
     verify.add_argument("--session-id")
     verify.add_argument("--checkpoint-file")
+    verify.add_argument("--receipts", action="store_true")
 
     rehydrate = sub.add_parser("rehydrate")
     rehydrate.add_argument("--session-id", default="default")
     rehydrate.add_argument("--query", default="")
     rehydrate.add_argument("--max-results", type=int, default=8)
+    rehydrate.add_argument("--mode", choices=["keyword", "resume"], default="keyword")
+    rehydrate.add_argument("--char-budget", type=int, default=8000)
 
     reh_status = sub.add_parser("rehydrate-status")
     reh_status.add_argument("--session-key")
@@ -329,9 +332,45 @@ def build_parser() -> argparse.ArgumentParser:
     loop_inbox.add_argument("--project", default="")
     loop_inbox.add_argument("--format", choices=["json", "text"], default="text")
 
+    handoff = sub.add_parser("handoff")
+    handoff_sub = handoff.add_subparsers(dest="handoff_command")
+    handoff_export = handoff_sub.add_parser("export")
+    handoff_export.add_argument("--session-id", default="default")
+    handoff_export.add_argument("--turns", type=int)
+    handoff_export.add_argument("--format", choices=["json", "text"], default="json")
+    handoff_issue = handoff_sub.add_parser("issue")
+    handoff_issue.add_argument("--target", required=True)
+    handoff_issue.add_argument("--session-id", default="default")
+    handoff_issue.add_argument("--turns", type=int)
+    handoff_issue.add_argument("--ttl", type=int, default=3600)
+    handoff_issue.add_argument("--format", choices=["json", "text"], default="json")
+    handoff_accept = handoff_sub.add_parser("accept")
+    handoff_accept.add_argument("handoff_file")
+    handoff_accept.add_argument("--ttl", type=int, default=3600)
+    handoff_accept.add_argument("--char-budget", type=int, default=12000)
+    handoff_accept.add_argument("--format", choices=["json", "text"], default="json")
+
+    device = sub.add_parser("device")
+    device_sub = device.add_subparsers(dest="device_command")
+    device_init = device_sub.add_parser("init")
+    device_init.add_argument("--label", default="")
+    device_init.add_argument("--format", choices=["json", "text"], default="json")
+    device_list = device_sub.add_parser("list")
+    device_list.add_argument("--format", choices=["json", "text"], default="json")
+    device_approve = device_sub.add_parser("approve")
+    device_approve.add_argument("device_id", nargs="?", default="")
+    device_approve.add_argument("--public-key", default="")
+    device_approve.add_argument("--x25519-public-key", default="")
+    device_approve.add_argument("--label", default="")
+    device_approve.add_argument("--format", choices=["json", "text"], default="json")
+    device_revoke = device_sub.add_parser("revoke")
+    device_revoke.add_argument("device_id")
+    device_revoke.add_argument("--format", choices=["json", "text"], default="json")
+
     export = sub.add_parser("export")
     export.add_argument("--out", required=True)
     export.add_argument("--include-index", action="store_true")
+    export.add_argument("--include-keys", action="store_true", help="Explicitly include private keys in a plaintext export. Default is safer: keys excluded.")
 
     import_cmd = sub.add_parser("import")
     import_cmd.add_argument("bundle")
@@ -345,10 +384,40 @@ def build_parser() -> argparse.ArgumentParser:
     backup_run.add_argument("--keep-days", type=int)
     backup_run.add_argument("--include-index", action="store_true")
     backup_run.add_argument("--no-checkpoint", action="store_true")
+    backup_run.add_argument("--plaintext", action="store_true", help="Write a plaintext backup tarball with keys excluded. Default is encrypted.")
     backup_status = backup_sub.add_parser("status")
     backup_status.add_argument("--out-dir", default="~/total-recall-backups")
     backup_sync = backup_sub.add_parser("sync-status")
     backup_sync.add_argument("--out-dir", default="~/total-recall-backups")
+    backup_restore = backup_sub.add_parser("restore")
+    backup_restore.add_argument("bundle")
+    backup_restore.add_argument("--replace", action="store_true")
+    backup_push = backup_sub.add_parser("push")
+    backup_push.add_argument("--target", required=True)
+    backup_pull = backup_sub.add_parser("pull")
+    backup_pull.add_argument("--target", required=True)
+    backup_pull.add_argument("--no-replace", action="store_true")
+
+    sync = sub.add_parser("sync")
+    sync_sub = sync.add_subparsers(dest="sync_command")
+    sync_check = sync_sub.add_parser("check")
+    sync_check.add_argument("--target", required=True)
+    sync_fork = sync_sub.add_parser("fork-import")
+    sync_fork.add_argument("source")
+
+    lease = sub.add_parser("lease")
+    lease_sub = lease.add_subparsers(dest="lease_command")
+    lease_acquire = lease_sub.add_parser("acquire")
+    lease_acquire.add_argument("--target", required=True)
+    lease_acquire.add_argument("--ttl", type=int, default=3600)
+    lease_release = lease_sub.add_parser("release")
+    lease_release.add_argument("--target", required=True)
+    lease_status = lease_sub.add_parser("status")
+    lease_status.add_argument("--target", required=True)
+    lease_steal = lease_sub.add_parser("steal")
+    lease_steal.add_argument("--target", required=True)
+    lease_steal.add_argument("--ttl", type=int, default=3600)
+    lease_steal.add_argument("--force", action="store_true")
 
     dashboard = sub.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
@@ -824,9 +893,9 @@ def main() -> int:
     if command == "checkpoint":
         return _print(core.checkpoint(session_id=args.session_id, label=args.label))
     if command == "verify":
-        return _print(core.verify(session_id=args.session_id, checkpoint_file=args.checkpoint_file))
+        return _print(core.verify(session_id=args.session_id, checkpoint_file=args.checkpoint_file, receipts=args.receipts))
     if command == "rehydrate":
-        return _print(core.rehydrate(session_id=args.session_id, query=args.query, max_results=args.max_results))
+        return _print(core.rehydrate(session_id=args.session_id, query=args.query, max_results=args.max_results, mode=args.mode, char_budget=args.char_budget))
     if command == "rehydrate-status":
         return _print(core.rehydrate_status(session_key=args.session_key, agent=args.agent))
     if command == "context":
@@ -1000,8 +1069,26 @@ def main() -> int:
             return _print(core.loop_complete(args.loop_id, status=args.status, summary=args.summary, evidence=args.evidence))
         if sub == "inbox":
             return _print(core.loop_inbox(include_completed=args.include_completed, agent=args.agent, project=args.project))
+    if command == "handoff":
+        sub = args.handoff_command or "export"
+        if sub == "export":
+            return _print(core.handoff_export(session_id=args.session_id, turns=args.turns))
+        if sub == "issue":
+            return _print(core.handoff_issue(target=args.target, session_id=args.session_id, turns=args.turns, ttl_seconds=args.ttl))
+        if sub == "accept":
+            return _print(core.handoff_accept(args.handoff_file, ttl_seconds=args.ttl, char_budget=args.char_budget))
+    if command == "device":
+        sub = args.device_command or "list"
+        if sub == "init":
+            return _print(core.device_init(label=args.label))
+        if sub == "list":
+            return _print(core.device_list())
+        if sub == "approve":
+            return _print(core.device_approve(args.device_id, public_key=args.public_key, x25519_public_key=args.x25519_public_key, label=args.label))
+        if sub == "revoke":
+            return _print(core.device_revoke(args.device_id))
     if command == "export":
-        return _print(core.export_bundle(args.out, include_index=args.include_index))
+        return _print(core.export_bundle(args.out, include_index=args.include_index, include_keys=args.include_keys))
     if command == "import":
         return _print(core.import_bundle(args.bundle, replace=args.replace))
     if command == "backup":
@@ -1014,12 +1101,35 @@ def main() -> int:
                     keep_days=args.keep_days,
                     include_index=args.include_index,
                     checkpoint=not args.no_checkpoint,
+                    encrypt=not args.plaintext,
                 )
             )
         if sub == "status":
             return _print(core.backup_status(args.out_dir))
         if sub == "sync-status":
             return _print(core.sync_status(args.out_dir))
+        if sub == "restore":
+            return _print(core.backup_restore(args.bundle, replace=args.replace))
+        if sub == "push":
+            return _print(core.backup_push(target=args.target))
+        if sub == "pull":
+            return _print(core.backup_pull(target=args.target, replace=not args.no_replace))
+    if command == "sync":
+        sub = args.sync_command or "check"
+        if sub == "check":
+            return _print(core.sync_check(target=args.target))
+        if sub == "fork-import":
+            return _print(core.sync_fork_import(args.source))
+    if command == "lease":
+        sub = args.lease_command or "status"
+        if sub == "acquire":
+            return _print(core.lease_acquire(target=args.target, ttl_seconds=args.ttl))
+        if sub == "release":
+            return _print(core.lease_release(target=args.target))
+        if sub == "status":
+            return _print(core.lease_status(target=args.target))
+        if sub == "steal":
+            return _print(core.lease_steal(target=args.target, ttl_seconds=args.ttl, force=args.force))
     if command == "dashboard":
         if __package__ in {None, ""}:
             from total_recall_core.dashboard import run_dashboard

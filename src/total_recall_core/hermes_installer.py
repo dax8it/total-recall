@@ -43,6 +43,7 @@ from total_recall_core.hermes_provider import (  # noqa: E402,F401
     ALL_SCHEMAS,
     CHECKPOINT_SCHEMA,
     FEDERATION_QUERY_SCHEMA,
+    HANDOFF_EXPORT_SCHEMA,
     INCIDENTS_SCHEMA,
     KNOWLEDGE_COMPILED_TRUTH_SCHEMA,
     KNOWLEDGE_FRESHNESS_SCHEMA,
@@ -200,6 +201,7 @@ def plugin_yaml() -> str:
         "  - total_recall_loop_note\n"
         "  - total_recall_loop_verify\n"
         "  - total_recall_loop_complete\n"
+        "  - total_recall_handoff_export\n"
     )
 
 

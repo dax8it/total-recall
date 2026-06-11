@@ -77,6 +77,7 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
         "total_recall_loop_note",
         "total_recall_loop_verify",
         "total_recall_loop_complete",
+        "total_recall_handoff_export",
     }
 
     provider.sync_turn("remember plugin lifecycle", "stored", session_id="s1")
@@ -110,6 +111,9 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     rehydrated = json.loads(provider.handle_tool_call("total_recall_rehydrate", {"session_id": "s1", "query": "plugin lifecycle"}))
     assert rehydrated["ok"] is True
     assert "Total Recall Rehydrate Authority" in rehydrated["context_block"]
+    handoff = json.loads(provider.handle_tool_call("total_recall_handoff_export", {"session_id": "s1", "turns": 5}))
+    assert handoff["ok"] is True
+    assert handoff["packetFile"]
 
     knowledge = json.loads(
         provider.handle_tool_call(
@@ -231,3 +235,30 @@ def test_plugin_auto_rehydrate_fails_closed_on_tampered_anchor(tmp_path, monkeyp
     auto = provider.prefetch("tamper protected memory", session_id="s2")
     assert "status: FAIL_CLOSED" in auto
     assert "anchor_signature_mismatch" in auto
+
+
+def test_plugin_queues_writes_when_remote_lease_held_by_other_device(tmp_path, monkeypatch):
+    from total_recall_core import TotalRecallConfig, TotalRecallCore
+
+    module = _load_plugin(monkeypatch)
+    remote = tmp_path / "remote"
+    owner = TotalRecallCore(TotalRecallConfig(home=tmp_path / "owner", enable_lancedb=False, enable_qmd=False))
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "lease-passphrase")
+    owner.ingest(kind="note", text="Lease holder memory.", session_id="lease")
+    owner.backup_push(target=str(remote))
+    owner.lease_acquire(target=str(remote), ttl_seconds=3600)
+    monkeypatch.setenv("TOTAL_RECALL_REMOTE_TARGET", str(remote))
+
+    provider = module.TotalRecallMemoryProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path / "hermes"))
+    provider.sync_turn("queued because lease is held", "not written", session_id="s1")
+
+    pending = tmp_path / "hermes" / "total-recall" / "state" / "pending_events.jsonl"
+    assert pending.exists()
+    queued = json.loads(pending.read_text(encoding="utf-8").splitlines()[-1])
+    assert queued["kind"] == "turn"
+    assert "queued because lease is held" in queued["text"]
+    assert TotalRecallCore(TotalRecallConfig(home=tmp_path / "hermes" / "total-recall", enable_lancedb=False, enable_qmd=False)).health()["eventCount"] == 0
+
+    warning = provider.prefetch("anything", session_id="s1")
+    assert "status: READ_ONLY" in warning

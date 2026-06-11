@@ -1,30 +1,55 @@
 # Remote Backup Design
 
-Remote backup is a transport layer for Total Recall archives. It must not
-replace the local trust model: the ledger, checkpoints, Ed25519 anchors, and
-verification remain the continuity authority.
+Remote backup is a transport layer for Total Recall archives. It does not
+replace the local trust model: the ledger, checkpoints, Ed25519 anchors,
+device-signed receipts, and verification remain the continuity authority.
+
+## Current Status
+
+Implemented now:
+
+- encrypted `total-recall-encrypted-backup-v1` backups by default
+- approved-device registry with distinct device signing and X25519 wrapping keys
+- local-folder remote target with encrypted push/pull and device-signed `HEAD.json`
+- Hugging Face upload/download plumbing through the `hf` CLI
+- single-writer leases in `HEAD.json`
+- divergence refusal plus `sync fork-import` quarantine/promote recovery
+- re-anchor events and checkpoint receipts on import/restore/pull
+- `handoff issue` / `handoff accept` bootstrap artifacts for CLI-capable harnesses
+
+Still planned:
+
+- OAuth/API-native providers such as Google Drive, Dropbox, S3, Arweave, GitHub
+  releases, and Pinata/IPFS
+- remote MCP/dashboard serving; v1 handoff is CLI/bootstrap-script based
+- the larger write-path scalability rewrite from the continuity handoff Step 9
 
 ## Provider Order
 
-1. Local folder: already works. Best default for external drives and manually
-   managed archives.
-2. iCloud Drive folder: already works through the local backup directory. Good
-   first sync path on Apple devices.
-3. Google Drive: first direct cloud API candidate. Use OAuth or a local Drive
+1. Local folder: implemented for `backup push`, `backup pull`, leases, and
+   handoff bootstrap. Best default for external drives and manually managed
+   archives.
+2. iCloud Drive folder: works through the local-folder target when pointed at an
+   iCloud-synced directory.
+3. Hugging Face: implemented through the local `hf` CLI for encrypted artifact
+   upload/download.
+4. Google Drive: first direct cloud API candidate. Use OAuth or a local Drive
    Desktop folder, with direct API upload gated behind encryption.
-4. Arweave: durable long-term archive candidate. Upload encrypted bundles only,
+5. Arweave: durable long-term archive candidate. Upload encrypted bundles only,
    and require explicit approval because writes are permanent and may cost AR.
-5. GitHub: useful for private release assets, metadata, manifests, and receipts.
+6. GitHub: useful for private release assets, metadata, manifests, and receipts.
    It is not a primary memory store because repository history and file-size
    limits are a poor fit for frequent private archives.
-6. Dropbox, S3-compatible storage, Pinata/IPFS, and Arweave gateways: useful
+7. Dropbox, S3-compatible storage, Pinata/IPFS, and Arweave gateways: useful
    second-wave adapters once the encrypted bundle format is stable.
 
 ## Bundle Format
 
-The current backup bundle is a `total-recall-backup-*.tar.gz` archive. Remote
-upload should wrap that archive in an encrypted envelope before it leaves the
-machine:
+The current default backup artifact is a JSON `.tar.gz.enc` envelope containing
+AES-256-GCM ciphertext and a clear sidecar `.manifest.json`. Plain tarball
+export is still available only through explicit commands and excludes private
+keys unless `--include-keys` is passed. Remote upload wraps the export bundle
+before it leaves the machine:
 
 ```text
 backup.tar.gz
@@ -33,7 +58,7 @@ backup.tar.gz
 -> provider receipt stored locally as non-authoritative metadata
 ```
 
-Recommended envelope metadata:
+Envelope metadata:
 
 - `schema`: `total-recall-encrypted-backup-v1`
 - `bundle_sha256`: hash of the plaintext bundle before encryption
@@ -48,19 +73,20 @@ Recommended envelope metadata:
 
 ## Encryption
 
-Use envelope encryption:
+Implemented envelope encryption:
 
 - Generate a random data key per backup.
-- Encrypt the backup with an authenticated cipher such as XChaCha20-Poly1305
-  or AES-256-GCM.
-- Encrypt the data key to each approved device public key.
+- Encrypt the backup with AES-256-GCM.
+- Wrap the data key to each approved, non-revoked device X25519 public key.
+- Include a passphrase fallback recipient from `TOTAL_RECALL_BACKUP_PASSPHRASE`
+  or the API call when supplied.
 - Store provider API tokens in the OS credential store, such as macOS Keychain.
 - Never store provider tokens in the Total Recall ledger, checkpoints, reports,
   or Git history.
 
 `age` is also a good portable candidate because it already has a simple
 recipient model and supports file encryption well. A later implementation can
-support either a native Python envelope or an `age` adapter.
+add an `age` adapter beside the native Python envelope.
 
 ## Approved Devices
 
@@ -82,7 +108,7 @@ Suggested fields:
 - `approved_at`
 - `revoked_at`
 - `last_seen_at`
-- `last_restored_checkpoint_id`
+- `x25519_public_key`
 
 Flow:
 
@@ -94,7 +120,8 @@ Flow:
 
 ## Sync Semantics
 
-The dashboard and CLI compare the current local state to the latest archive.
+The dashboard and CLI compare the current local state to the latest archive or
+remote `HEAD.json`.
 
 States:
 
@@ -104,7 +131,7 @@ States:
 - `archive_ahead`: latest archive has newer events. Download and import before
   continuing on this machine.
 - `diverged`: event counts match but hashes differ, or the archive is missing
-  checkpoint metadata. Do not auto-merge.
+  checkpoint metadata. Do not auto-merge; use `sync fork-import`.
 
 The index layer is never used as authority. Verification can rebuild derived
 indexes from the ledger after import.
@@ -113,27 +140,31 @@ indexes from the ledger after import.
 
 Machine A before leaving:
 
-```text
-Backup + Doctor + Verify
-Sync Check
-Upload Selected
-Confirm in_sync for the selected local/synced-folder target
+```bash
+total-recall backup push --target ~/total-recall-remote
+total-recall lease release --target ~/total-recall-remote
 ```
 
 Machine B at the new location:
 
-```text
-Sync Check
-If archive_ahead: download/decrypt/import latest archive
-total-recall doctor
-total-recall verify
-Start Hermes Agent with memory.provider total-recall
+```bash
+total-recall backup pull --target ~/total-recall-remote
+total-recall verify --receipts
+total-recall trust verify --format text
+total-recall lease acquire --target ~/total-recall-remote
 ```
 
 If offline, Machine B can keep working from the last restored archive. When it
-goes online again, run `Sync Check`. If both machines wrote new events from the
-same base, Total Recall should show a non-automatic conflict path instead of
-silently merging.
+goes online again, run `sync check`. If both machines wrote new events from the
+same base, Total Recall refuses pull as diverged; use `sync fork-import` to
+quarantine the archive suffix and promote selected content as new local events.
+
+For a one-shot agent handoff:
+
+```bash
+total-recall handoff issue --target ~/total-recall-remote --session-id main
+total-recall handoff accept ~/.total-recall/handoff/<handoff-id>.json
+```
 
 ## Provider Notes
 

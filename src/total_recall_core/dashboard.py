@@ -425,7 +425,7 @@ def _backup_readiness(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[s
     elif relation == "diverged":
         status = "DIVERGED"
         tone = "bad"
-        next_action = "Do not auto-merge. Inspect local and archive hashes."
+        next_action = f"Do not auto-merge. Use sync fork-import {latest_path or '<bundle>'} to quarantine the archive-only suffix."
     else:
         status = "CHECK"
         tone = "warn"
@@ -454,6 +454,7 @@ def _backup_readiness(core: TotalRecallCore, *, backup_dir: Path, backup: Dict[s
         "rehydrateReady": rehydrate_ready,
         "compactionRule": "Before a long session compresses: save and verify a restore point. After restart: restore only from verified Total Recall. Backups protect recovery; they are not memory authority by themselves.",
         "nextAction": next_action,
+        "forkImportAction": f"total-recall sync fork-import {latest_path}" if relation == "diverged" and latest_path else "",
         "sync": sync,
     }
 
@@ -767,10 +768,14 @@ def _hf_restore_test(core: TotalRecallCore, session: Dict[str, Any], *, repo_id:
             manifest_ledger = ((restored.get("manifest") or {}).get("ledger") or {})
             restored_state = test_core.reduce_state(write=False)
             ledger_match = True
-            if source_ledger.get("eventCount") is not None:
-                ledger_match = int(source_ledger.get("eventCount") or 0) == int(restored_state.get("event_count") or 0)
-            if manifest_ledger.get("stateHash"):
-                ledger_match = ledger_match and manifest_ledger.get("stateHash") == restored_state.get("state_hash")
+            expected_count = source_ledger.get("eventCount") if source_ledger.get("eventCount") is not None else manifest_ledger.get("eventCount")
+            restored_events = test_core._read_events(verify_chain=True)
+            last_event = restored_events[-1] if restored_events else {}
+            last_metadata = last_event.get("metadata") or {}
+            if expected_count is not None:
+                ledger_match = int(restored_state.get("event_count") or 0) == int(expected_count or 0) + 1
+            if manifest_ledger.get("lastEventHash"):
+                ledger_match = ledger_match and last_event.get("kind") == "re_anchor" and last_metadata.get("restored_last_event_hash") == manifest_ledger.get("lastEventHash")
             active_unchanged = int(before.get("eventCount") or 0) == int(_summary(core).get("eventCount") or 0)
             ok = bool(restored.get("ok")) and bool(verified.get("ok")) and bool(trust.get("ok")) and failed_required == 0 and ledger_match and active_unchanged
             summary = {
@@ -1533,7 +1538,7 @@ def _safe_backup_path(path: Path, backup_dir: Path) -> bool:
         resolved.relative_to(root)
     except Exception:
         return False
-    return resolved.is_file() and resolved.name.startswith("total-recall-backup-") and resolved.name.endswith(".tar.gz")
+    return resolved.is_file() and resolved.name.startswith("total-recall-backup-") and (resolved.name.endswith(".tar.gz") or resolved.name.endswith(".tar.gz.enc"))
 
 
 def _providers() -> list[Dict[str, Any]]:

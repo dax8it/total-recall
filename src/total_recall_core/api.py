@@ -6,13 +6,16 @@ import hashlib
 import hmac
 import json
 import os
+import platform
 import re
 import secrets
+import shlex
 import shutil
 import sqlite3
 import subprocess
 import tarfile
 import tempfile
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,7 +42,10 @@ OBSIDIAN_IMPORT_SCHEMA_VERSION = "total-recall-obsidian-import-review-v1"
 LEARNING_REVIEW_SCHEMA_VERSION = "total-recall-learning-review-v1"
 FEDERATION_SCHEMA_VERSION = "total-recall-federation-registry-v1"
 PORTABLE_CLONE_SCHEMA_VERSION = "total-recall-portable-clone-v1"
+ENCRYPTED_BACKUP_SCHEMA_VERSION = "total-recall-encrypted-backup-v1"
 LOOP_EVENT_SCHEMA_VERSION = "total-recall-loop-event-v1"
+RESUME_PACKET_SCHEMA_VERSION = "total-recall-resume-packet-v1"
+HANDOFF_BOOTSTRAP_SCHEMA_VERSION = "total-recall-handoff-bootstrap-v1"
 TRUST_GATE_SCHEMA_VERSION = "total-recall-trust-gate-v1"
 TRUST_GATE_REQUIRED_HERMES_TOOLS = {
     "total_recall_search",
@@ -64,6 +70,7 @@ TRUST_GATE_REQUIRED_HERMES_TOOLS = {
     "total_recall_loop_note",
     "total_recall_loop_verify",
     "total_recall_loop_complete",
+    "total_recall_handoff_export",
 }
 DEFAULT_DOCUMENT_EXTENSIONS = {
     ".adoc",
@@ -429,6 +436,22 @@ class TotalRecallCore:
         return self.home / "keys" / "anchor.ed25519.pub"
 
     @property
+    def device_private_key_file(self) -> Path:
+        return self.home / "keys" / "device.ed25519"
+
+    @property
+    def device_public_key_file(self) -> Path:
+        return self.home / "keys" / "device.ed25519.pub"
+
+    @property
+    def device_x25519_private_key_file(self) -> Path:
+        return self.home / "keys" / "device.x25519"
+
+    @property
+    def device_x25519_public_key_file(self) -> Path:
+        return self.home / "keys" / "device.x25519.pub"
+
+    @property
     def lock_file(self) -> Path:
         return self.home / ".total-recall.lock"
 
@@ -616,6 +639,7 @@ class TotalRecallCore:
                 "source": source,
                 "text": text,
                 "metadata": metadata or {},
+                "origin": self._event_origin(source=source),
                 "prev_hash": previous_hash,
             }
             event_hash = sha256_json(base)
@@ -688,7 +712,11 @@ class TotalRecallCore:
             previous_hash = self._last_event_hash()
             written_events = []
             for event_base in events:
-                base = {**event_base, "prev_hash": previous_hash}
+                base = {
+                    **event_base,
+                    "origin": self._event_origin(source=str(event_base.get("source") or "")),
+                    "prev_hash": previous_hash,
+                }
                 event_hash = sha256_json(base)
                 event = {**base, "hash": event_hash}
                 with self.ledger_file.open("a", encoding="utf-8") as fh:
@@ -1944,6 +1972,7 @@ class TotalRecallCore:
                 "source": event.get("source"),
                 "text": event.get("text"),
                 "metadata": event.get("metadata") or {},
+                "origin": event.get("origin") or {},
                 "hash": event.get("hash"),
             }
             memories.append(memory)
@@ -1965,7 +1994,18 @@ class TotalRecallCore:
 
     def checkpoint(self, *, session_id: str = "default", label: str = "") -> Dict[str, Any]:
         with self._locked():
-            return self._checkpoint_locked(session_id=session_id, label=label)
+            payload = self._checkpoint_locked(session_id=session_id, label=label)
+        if _safe_id(label) == "session_end" and payload.get("ok"):
+            try:
+                payload["resumePacket"] = self.write_resume_packet(
+                    session_id=session_id,
+                    checkpoint=payload.get("checkpoint") or {},
+                    checkpoint_file=str(payload.get("checkpointFile") or ""),
+                    anchor=payload.get("anchor") or {},
+                )
+            except Exception as exc:
+                payload["resumePacket"] = {"ok": False, "error": str(exc)}
+        return payload
 
     def _checkpoint_locked(self, *, session_id: str = "default", label: str = "") -> Dict[str, Any]:
         state = self.reduce_state(write=True)
@@ -1989,6 +2029,7 @@ class TotalRecallCore:
         checkpoint_path = self.home / "checkpoints" / f"{checkpoint_id}.json"
         self._write_json(checkpoint_path, checkpoint)
         anchor = self._write_anchor(checkpoint_path, checkpoint)
+        receipt = self._append_checkpoint_receipt(checkpoint)
         report = self._write_report(
             "checkpoint",
             checkpoint_id,
@@ -1997,21 +2038,24 @@ class TotalRecallCore:
                 "checkpoint": checkpoint,
                 "checkpointFile": str(checkpoint_path),
                 "anchor": anchor,
+                "receipt": receipt,
             },
         )
-        return {
+        payload = {
             "ok": True,
             "checkpoint": checkpoint,
             "checkpointFile": str(checkpoint_path),
             "anchor": anchor,
+            "receipt": receipt,
             "report": report,
         }
+        return payload
 
-    def verify(self, *, session_id: Optional[str] = None, checkpoint_file: Optional[str] = None) -> Dict[str, Any]:
+    def verify(self, *, session_id: Optional[str] = None, checkpoint_file: Optional[str] = None, receipts: bool = False) -> Dict[str, Any]:
         with self._locked():
-            return self._verify_locked(session_id=session_id, checkpoint_file=checkpoint_file)
+            return self._verify_locked(session_id=session_id, checkpoint_file=checkpoint_file, receipts=receipts)
 
-    def _verify_locked(self, *, session_id: Optional[str] = None, checkpoint_file: Optional[str] = None) -> Dict[str, Any]:
+    def _verify_locked(self, *, session_id: Optional[str] = None, checkpoint_file: Optional[str] = None, receipts: bool = False) -> Dict[str, Any]:
         checkpoint_path = Path(checkpoint_file).expanduser() if checkpoint_file else self._select_checkpoint(session_id)
         failures: List[str] = []
         details: Dict[str, Any] = {"checkpointFile": str(checkpoint_path) if checkpoint_path else None}
@@ -2081,6 +2125,11 @@ class TotalRecallCore:
                 details["indexRebuild"] = self._rebuild_index_locked(state=current_state or state)
             except Exception as exc:
                 details.setdefault("warnings", []).append(f"index_rebuild_failed:{exc}")
+        if receipts:
+            receipt_check = self._verify_receipts_against_events(current_state or state)
+            details["receipts"] = receipt_check
+            if not receipt_check.get("ok"):
+                failures.append("receipt_lineage_mismatch")
 
         return self._verification_result(not failures, failures, details, session_id=session_id)
 
@@ -2090,6 +2139,8 @@ class TotalRecallCore:
         session_id: str = "default",
         query: str = "",
         max_results: int = 8,
+        mode: str = "keyword",
+        char_budget: int = 8000,
     ) -> Dict[str, Any]:
         verification = self.verify(session_id=session_id)
         if not verification.get("ok"):
@@ -2099,6 +2150,16 @@ class TotalRecallCore:
                 "error": "verification failed; refusing rehydrate",
                 "verification": verification,
             }
+        if mode == "resume":
+            resume = self._rehydrate_resume(
+                session_id=session_id,
+                verification=verification,
+                char_budget=char_budget,
+            )
+            if resume.get("ok"):
+                return resume
+            if resume.get("status") == "FAIL_CLOSED":
+                return resume
         search_query = query or session_id or "recent continuity"
         search = self.search(search_query, max_results=max_results, session_id=session_id)
         lines = [
@@ -2122,6 +2183,7 @@ class TotalRecallCore:
             "ok": True,
             "status": "PASS",
             "session_id": session_id,
+            "mode": "keyword",
             "query": search_query,
             "context_block": context_block,
             "verification": verification,
@@ -2129,6 +2191,466 @@ class TotalRecallCore:
         }
         payload["report"] = self._write_report("rehydrate", _safe_id(session_id), payload)
         return payload
+
+    def handoff_export(self, *, session_id: str = "default", turns: Optional[int] = None) -> Dict[str, Any]:
+        checkpoint = self.checkpoint(session_id=session_id, label="handoff_export")
+        if not checkpoint.get("ok"):
+            return {"ok": False, "error": "checkpoint_failed", "checkpoint": checkpoint}
+        packet = self.write_resume_packet(
+            session_id=session_id,
+            turns=turns,
+            checkpoint=checkpoint.get("checkpoint") or {},
+            checkpoint_file=str(checkpoint.get("checkpointFile") or ""),
+            anchor=checkpoint.get("anchor") or {},
+        )
+        return {
+            "ok": bool(packet.get("ok")),
+            "schema": RESUME_PACKET_SCHEMA_VERSION,
+            "session_id": session_id,
+            "checkpoint": checkpoint,
+            "packet": packet,
+            "packetFile": packet.get("packetFile"),
+        }
+
+    def handoff_issue(
+        self,
+        *,
+        target: str,
+        session_id: str = "default",
+        turns: Optional[int] = None,
+        ttl_seconds: int = 3600,
+        passphrase: str = "",
+    ) -> Dict[str, Any]:
+        if not str(target or "").strip():
+            return {"ok": False, "error": "target_required"}
+        release_before = self.lease_release(target=target)
+        if not self._handoff_release_allowed(release_before):
+            return {"ok": False, "error": "lease_release_failed", "release": release_before}
+
+        handoff_export = self.handoff_export(session_id=session_id, turns=turns)
+        if not handoff_export.get("ok"):
+            return {"ok": False, "error": "resume_packet_failed", "handoffExport": handoff_export}
+
+        pushed = self.backup_push(target=target, passphrase=passphrase)
+        if not pushed.get("ok"):
+            return {"ok": False, "error": "push_failed", "release": release_before, "handoffExport": handoff_export, "push": pushed}
+
+        release_after = self.lease_release(target=target)
+        if not release_after.get("ok"):
+            return {
+                "ok": False,
+                "error": "lease_release_after_push_failed",
+                "release": release_before,
+                "handoffExport": handoff_export,
+                "push": pushed,
+                "releaseAfterPush": release_after,
+            }
+
+        handoff_id = self._new_id("handoff")
+        handoff_dir = self.home / "handoff"
+        json_path = handoff_dir / f"{handoff_id}.json"
+        script_path = handoff_dir / f"{handoff_id}.sh"
+        packet_file = Path(str(handoff_export.get("packetFile") or ""))
+        latest = (pushed.get("head") or {}).get("latest") or {}
+        issued_at = utc_now()
+        payload = {
+            "ok": True,
+            "schema": HANDOFF_BOOTSTRAP_SCHEMA_VERSION,
+            "handoff_id": handoff_id,
+            "created_at": issued_at,
+            "session_id": session_id,
+            "turns": turns,
+            "target": target,
+            "remote": pushed.get("target"),
+            "store_id": self.store_id(),
+            "issued_by_device_id": self.device_id(),
+            "lease": {
+                "releaseBeforePush": self._summarize_operation(release_before),
+                "releaseAfterPush": self._summarize_operation(release_after),
+            },
+            "bundle": {
+                "name": latest.get("bundle"),
+                "manifest": latest.get("manifest"),
+                "sha256": latest.get("bundle_sha256"),
+                "checkpoint_id": latest.get("checkpoint_id"),
+                "event_count": latest.get("event_count"),
+                "last_event_hash": latest.get("last_event_hash"),
+                "device_id": latest.get("device_id"),
+            },
+            "packet": {
+                "path": str(packet_file) if str(packet_file) else "",
+                "relative_path": self._home_relative(packet_file),
+                "packet_id": ((handoff_export.get("packet") or {}).get("packet") or {}).get("packet_id"),
+            },
+            "commands": [
+                f"total-recall backup pull --target {shlex.quote(target)}",
+                "total-recall verify --receipts",
+                "total-recall trust verify --format text",
+                f"total-recall lease acquire --target {shlex.quote(target)} --ttl {max(1, int(ttl_seconds or 3600))}",
+                f"total-recall rehydrate --session-id {shlex.quote(session_id)} --mode resume --char-budget 12000",
+            ],
+            "instructions": [
+                "Set TOTAL_RECALL_HOME for the accepting store before running the script.",
+                "Set TOTAL_RECALL_BACKUP_PASSPHRASE or approve this device before pulling encrypted backups.",
+                "Trust only the pulled ledger after verify and trust verify pass; the handoff JSON and packet are derived artifacts.",
+            ],
+            "push": self._summarize_operation(pushed),
+        }
+        self._write_json(json_path, payload)
+        script = self._handoff_bootstrap_script(target=target, session_id=session_id, ttl_seconds=ttl_seconds)
+        script_path.parent.mkdir(parents=True, exist_ok=True)
+        script_path.write_text(script, encoding="utf-8")
+        script_path.chmod(0o700)
+        payload["handoffFile"] = str(json_path)
+        payload["bootstrapScript"] = str(script_path)
+        self._write_json(json_path, payload)
+        return payload
+
+    def handoff_accept(
+        self,
+        handoff_file: str,
+        *,
+        ttl_seconds: int = 3600,
+        char_budget: int = 12000,
+        run_trust_gate: bool = True,
+        passphrase: str = "",
+    ) -> Dict[str, Any]:
+        path = Path(handoff_file).expanduser()
+        if not path.exists():
+            return {"ok": False, "error": "handoff_file_not_found", "handoffFile": str(path)}
+        handoff = self._read_json(path)
+        if handoff.get("schema") != HANDOFF_BOOTSTRAP_SCHEMA_VERSION:
+            return {"ok": False, "error": "invalid_handoff_schema", "handoffFile": str(path), "schema": handoff.get("schema")}
+        target = str(handoff.get("target") or "")
+        session_id = str(handoff.get("session_id") or "default")
+        pulled = self.backup_pull(target=target, passphrase=passphrase)
+        if not pulled.get("ok") and pulled.get("status") != "IN_SYNC":
+            return {"ok": False, "status": "FAIL_CLOSED", "error": "pull_failed", "handoff": handoff, "pull": pulled}
+        verification = self.verify(receipts=True)
+        if not verification.get("ok"):
+            return {"ok": False, "status": "FAIL_CLOSED", "error": "verify_receipts_failed", "handoff": handoff, "pull": pulled, "verification": verification}
+        trust = self.trust_gate_run() if run_trust_gate else {"ok": True, "status": "SKIPPED_INTERNAL_FIXTURE"}
+        if not trust.get("ok"):
+            return {
+                "ok": False,
+                "status": "FAIL_CLOSED",
+                "error": "trust_gate_failed",
+                "handoff": handoff,
+                "pull": pulled,
+                "verification": verification,
+                "trustGate": trust,
+            }
+        lease = self.lease_acquire(target=target, ttl_seconds=ttl_seconds)
+        if not lease.get("ok"):
+            return {
+                "ok": False,
+                "status": "FAIL_CLOSED",
+                "error": "lease_acquire_failed",
+                "handoff": handoff,
+                "pull": pulled,
+                "verification": verification,
+                "trustGate": trust,
+                "lease": lease,
+            }
+        resume = self.rehydrate(session_id=session_id, mode="resume", char_budget=char_budget)
+        ok = bool(resume.get("ok"))
+        return {
+            "ok": ok,
+            "status": "PASS" if ok else "FAIL_CLOSED",
+            "schema": HANDOFF_BOOTSTRAP_SCHEMA_VERSION,
+            "handoff": handoff,
+            "handoffFile": str(path),
+            "pull": pulled,
+            "verification": verification,
+            "trustGate": trust,
+            "lease": lease,
+            "resume": resume,
+            "resumeBlock": resume.get("context_block"),
+        }
+
+    def write_resume_packet(
+        self,
+        *,
+        session_id: str = "default",
+        turns: Optional[int] = None,
+        checkpoint: Optional[Dict[str, Any]] = None,
+        checkpoint_file: str = "",
+        anchor: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self._write_resume_packet_unlocked(
+            session_id=session_id,
+            turns=turns,
+            checkpoint=checkpoint,
+            checkpoint_file=checkpoint_file,
+            anchor=anchor,
+        )
+
+    def _write_resume_packet_unlocked(
+        self,
+        *,
+        session_id: str = "default",
+        turns: Optional[int] = None,
+        checkpoint: Optional[Dict[str, Any]] = None,
+        checkpoint_file: str = "",
+        anchor: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        safe_session = _safe_id(session_id or "default")
+        turn_count = max(1, int(turns if turns is not None else os.getenv("TOTAL_RECALL_RESUME_PACKET_TURNS", "30")))
+        events = self._read_events(verify_chain=True)
+        state = self._state_from_events(events)
+        if checkpoint is None:
+            checkpoint_path = self._select_checkpoint(session_id)
+            checkpoint = self._read_json(checkpoint_path) if checkpoint_path and checkpoint_path.exists() else {}
+            checkpoint_file = str(checkpoint_path or checkpoint_file or "")
+        anchor = anchor or {}
+        if checkpoint and not anchor:
+            anchor_path = self.home / "anchors" / f"{checkpoint.get('checkpoint_id')}.json"
+            if anchor_path.exists():
+                anchor = self._read_json(anchor_path)
+                anchor["anchorFile"] = str(anchor_path)
+
+        recent_turns = [
+            {
+                "event_id": event.get("event_id"),
+                "timestamp": event.get("timestamp"),
+                "hash": event.get("hash"),
+                "text": event.get("text") or "",
+            }
+            for event in events
+            if event.get("kind") == "turn" and (event.get("session_id") or "default") == (session_id or "default")
+        ][-turn_count:]
+        open_loops = (self.loop_inbox().get("loops") or [])[:20]
+        freshness = self._resume_freshness_summary()
+        compiled_truth_excerpt = self._compiled_truth_excerpt(limit=4000)
+        next_actions = self._extract_next_actions(recent_turns=recent_turns, open_loops=open_loops)
+        created_at = utc_now()
+        packet_id = self._new_id(f"packet_{safe_session}")
+        packet = {
+            "schema": RESUME_PACKET_SCHEMA_VERSION,
+            "packet_id": packet_id,
+            "created_at": created_at,
+            "session_id": session_id or "default",
+            "checkpoint_id": (checkpoint or {}).get("checkpoint_id"),
+            "anchor_id": (anchor or {}).get("anchor_id") or (anchor or {}).get("checkpoint_id"),
+            "anchor_file": (anchor or {}).get("anchorFile") or (anchor or {}).get("anchor_file") or "",
+            "ledger": {
+                "event_count": state.get("event_count", 0),
+                "last_event_hash": state.get("last_event_hash"),
+            },
+            "recent_turns": recent_turns,
+            "open_loops": open_loops,
+            "freshness": freshness,
+            "compiled_truth_excerpt": compiled_truth_excerpt,
+            "environment": self._environment_fingerprint(),
+            "next_actions": next_actions,
+        }
+        packet_path = self.home / "continuation" / safe_session / f"packet_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{secrets.token_hex(4)}.json"
+        self._write_json(packet_path, packet)
+        return {
+            "ok": True,
+            "schema": RESUME_PACKET_SCHEMA_VERSION,
+            "packet": packet,
+            "packetFile": str(packet_path),
+            "recentTurnCount": len(recent_turns),
+            "nextActionCount": len(next_actions),
+        }
+
+    def _rehydrate_resume(
+        self,
+        *,
+        session_id: str,
+        verification: Dict[str, Any],
+        char_budget: int,
+    ) -> Dict[str, Any]:
+        try:
+            events = self._read_events(verify_chain=True)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "status": "FAIL_CLOSED",
+                "error": f"ledger invalid; refusing resume rehydrate: {exc}",
+                "verification": verification,
+            }
+        packet_info = self._newest_resume_packet_for_chain(session_id=session_id, events=events)
+        if not packet_info:
+            return {"ok": False, "status": "NO_RESUME_PACKET", "session_id": session_id, "verification": verification}
+        packet = packet_info["packet"]
+        context_block = self._resume_context_block(
+            packet,
+            verification=verification,
+            packet_file=str(packet_info["path"]),
+            char_budget=char_budget,
+        )
+        payload = {
+            "ok": True,
+            "status": "PASS",
+            "mode": "resume",
+            "session_id": session_id,
+            "context_block": context_block,
+            "packet": packet,
+            "packetFile": str(packet_info["path"]),
+            "verification": verification,
+        }
+        payload["report"] = self._write_report("rehydrate", _safe_id(session_id), payload)
+        return payload
+
+    def _newest_resume_packet_for_chain(self, *, session_id: str, events: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        hashes = {str(event.get("hash") or "") for event in events if event.get("hash")}
+        session_dir = self.home / "continuation" / _safe_id(session_id or "default")
+        if not session_dir.exists():
+            return None
+        packets = sorted(session_dir.glob("packet_*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        for path in packets:
+            try:
+                packet = self._read_json(path)
+            except Exception:
+                continue
+            if packet.get("schema") != RESUME_PACKET_SCHEMA_VERSION:
+                continue
+            last_hash = str(((packet.get("ledger") or {}).get("last_event_hash")) or "")
+            if last_hash and last_hash in hashes:
+                return {"packet": packet, "path": path}
+        return None
+
+    def _resume_context_block(
+        self,
+        packet: Dict[str, Any],
+        *,
+        verification: Dict[str, Any],
+        packet_file: str,
+        char_budget: int,
+    ) -> str:
+        budget = max(1000, int(char_budget or 8000))
+        header = [
+            "[Total Recall Resume Packet Authority]",
+            "status: PASS",
+            f"session_id: {packet.get('session_id')}",
+            f"packet: {packet_file}",
+            f"checkpoint: {packet.get('checkpoint_id')} ({verification.get('checkpointFile')})",
+            f"anchor: {packet.get('anchor_id')} ({packet.get('anchor_file') or verification.get('anchorFile')})",
+            f"ledger: {((packet.get('ledger') or {}).get('event_count'))} events @ {((packet.get('ledger') or {}).get('last_event_hash'))}",
+            "",
+        ]
+        static_sections = header + ["Recent verbatim turn events:"]
+        lines = list(static_sections)
+        turn_lines: List[str] = []
+        for turn in reversed(packet.get("recent_turns") or []):
+            turn_lines.extend(
+                [
+                    f"- {turn.get('timestamp')} {turn.get('event_id')} {turn.get('hash')}",
+                    str(turn.get("text") or ""),
+                    "",
+                ]
+            )
+            candidate = "\n".join(lines + turn_lines)
+            if len(candidate) > budget and len(turn_lines) > 3:
+                turn_lines = turn_lines[:-3]
+                break
+        if turn_lines:
+            lines.extend(turn_lines)
+        else:
+            lines.append("- No turn events found in the selected resume packet.")
+        lines.extend(["", "Open loops:"])
+        open_loops = packet.get("open_loops") or []
+        if open_loops:
+            for loop in open_loops[:8]:
+                lines.append(f"- {loop.get('loop_id')}: {loop.get('goal')} [{loop.get('phase')}]")
+        else:
+            lines.append("- No open loops.")
+        lines.extend(["", "Deterministic next actions:"])
+        next_actions = packet.get("next_actions") or []
+        if next_actions:
+            for action in next_actions[:12]:
+                lines.append(f"- {action}")
+        else:
+            lines.append("- No explicit next/todo/blocker/decision lines extracted.")
+        freshness = packet.get("freshness") or {}
+        if freshness:
+            lines.extend(["", "Freshness summary:", canonical_json(freshness)])
+        truth = str(packet.get("compiled_truth_excerpt") or "").strip()
+        if truth:
+            lines.extend(["", "Compiled-truth excerpt:", truth[:4000]])
+        return "\n".join(lines)
+
+    def _resume_freshness_summary(self) -> Dict[str, Any]:
+        try:
+            report = self.knowledge_freshness_report()
+            return {
+                "ok": bool(report.get("ok")),
+                "asOf": report.get("asOf"),
+                "counts": report.get("counts") or {},
+                "itemCount": len(report.get("items") or []),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _compiled_truth_excerpt(self, *, limit: int) -> str:
+        try:
+            truth = self.knowledge_compiled_truth_show(format_="md")
+            text = str(truth.get("text") or "")
+            return text[: max(0, int(limit))]
+        except Exception:
+            return ""
+
+    def _extract_next_actions(self, *, recent_turns: List[Dict[str, Any]], open_loops: List[Dict[str, Any]]) -> List[str]:
+        patterns = re.compile(r"\b(next|todo|to do|blocker|blocked|decision|decide|follow[- ]?up|action item)\b", re.IGNORECASE)
+        actions: List[str] = []
+        seen: set[str] = set()
+        for turn in recent_turns:
+            for line in str(turn.get("text") or "").splitlines():
+                cleaned = _one_line(line, limit=240)
+                if not cleaned or not patterns.search(cleaned):
+                    continue
+                key = cleaned.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                actions.append(cleaned)
+                if len(actions) >= 20:
+                    break
+            if len(actions) >= 20:
+                break
+        for loop in open_loops:
+            goal = _one_line(str(loop.get("goal") or ""), limit=200)
+            if not goal:
+                continue
+            item = f"Open loop {loop.get('loop_id')}: {goal}"
+            key = item.lower()
+            if key not in seen:
+                seen.add(key)
+                actions.append(item)
+            if len(actions) >= 24:
+                break
+        return actions
+
+    def _environment_fingerprint(self) -> Dict[str, Any]:
+        repo = ""
+        branch = ""
+        try:
+            repo = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            ).stdout.strip()
+            branch = subprocess.run(
+                ["git", "branch", "--show-current"],
+                text=True,
+                capture_output=True,
+                timeout=3,
+                check=False,
+            ).stdout.strip()
+        except Exception:
+            pass
+        return {
+            "cwd": str(Path.cwd()),
+            "git_repo": repo,
+            "git_branch": branch,
+            "hermes_profile": os.getenv("HERMES_PROFILE", ""),
+            "device_id": self.device_id(),
+            "host": platform.node(),
+        }
 
     def search(
         self,
@@ -2557,7 +3079,7 @@ class TotalRecallCore:
         source.unlink(missing_ok=True)
         return {"ok": True, "external": item, "externalFile": str(dest)}
 
-    def export_bundle(self, out: str, *, include_index: bool = False) -> Dict[str, Any]:
+    def export_bundle(self, out: str, *, include_index: bool = False, include_keys: bool = False) -> Dict[str, Any]:
         out_path = Path(out).expanduser()
         out_path.parent.mkdir(parents=True, exist_ok=True)
         include_dirs = [
@@ -2568,10 +3090,14 @@ class TotalRecallCore:
             "reports",
             "incidents",
             "external-memory",
-            "keys",
+            "continuation",
+            "handoff",
+            "devices",
             "reviews",
             "federation",
         ]
+        if include_keys:
+            include_dirs.append("keys")
         if include_index:
             include_dirs.append("index")
 
@@ -2586,6 +3112,7 @@ class TotalRecallCore:
             "version": VERSION,
             "created_at": utc_now(),
             "include_index": include_index,
+            "include_keys": include_keys,
             "files": [],
         }
         for path in sorted(files):
@@ -2609,6 +3136,8 @@ class TotalRecallCore:
             "bundle": str(out_path),
             "fileCount": len(files),
             "includeIndex": include_index,
+            "includeKeys": include_keys,
+            "warnings": [] if include_keys else ["keys_excluded_by_default"],
             "manifestHash": hashlib.sha256(canonical_json(manifest).encode("utf-8")).hexdigest(),
         }
 
@@ -2661,7 +3190,7 @@ class TotalRecallCore:
                     return {"ok": False, "error": "manifest_hash_mismatch", "path": str(rel)}
 
             if replace:
-                for rel_dir in ("ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "keys", "index", "reviews", "federation"):
+                for rel_dir in ("ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "continuation", "handoff", "keys", "devices", "index", "reviews", "federation"):
                     shutil.rmtree(self.home / rel_dir, ignore_errors=True)
             self._ensure_layout()
             for item in manifest.get("files", []):
@@ -2672,12 +3201,26 @@ class TotalRecallCore:
                 shutil.copy2(src, dest)
 
         verification = self.verify()
+        re_anchor = None
+        checkpoint_after_re_anchor = None
+        if verification.get("ok"):
+            checkpoint = (verification.get("checkpoint") or {})
+            re_anchor = self._append_re_anchor_event(
+                restored_checkpoint_id=str(checkpoint.get("checkpoint_id") or ""),
+                restored_last_event_hash=str(verification.get("currentLastEventHash") or checkpoint.get("last_event_hash") or ""),
+                source_bundle_sha256=self._file_sha256(bundle_path),
+                source=f"import:{bundle_path.name}",
+            )
+            checkpoint_after_re_anchor = self.checkpoint(session_id="re-anchor", label="import_bundle")
+            verification = self.verify(session_id="re-anchor")
         return {
             "ok": bool(verification.get("ok")),
             "bundle": str(bundle_path),
             "home": str(self.home),
             "fileCount": len(manifest.get("files", [])),
             "verification": verification,
+            "reAnchor": re_anchor,
+            "checkpoint": checkpoint_after_re_anchor,
         }
 
     def portable_clone_export(
@@ -2714,7 +3257,7 @@ class TotalRecallCore:
 
         with tempfile.TemporaryDirectory(prefix="total-recall-portable-clone.") as tmpdir:
             plaintext_bundle = Path(tmpdir) / "total-recall-export.tar.gz"
-            exported = self.export_bundle(str(plaintext_bundle), include_index=include_index)
+            exported = self.export_bundle(str(plaintext_bundle), include_index=include_index, include_keys=True)
             plaintext = plaintext_bundle.read_bytes()
 
         salt = secrets.token_bytes(16)
@@ -2957,7 +3500,7 @@ class TotalRecallCore:
         def add(name: str, ok: bool, **details: Any) -> None:
             checks.append({"name": name, "ok": ok, **details})
 
-        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "index", "keys", "knowledge", "reviews", "federation", "portable-clones", "loops"]
+        required_dirs = ["ledger", "state", "checkpoints", "anchors", "reports", "incidents", "external-memory", "continuation", "index", "keys", "devices", "knowledge", "reviews", "federation", "portable-clones", "loops"]
         for rel_dir in required_dirs:
             add(f"dir:{rel_dir}", (self.home / rel_dir).is_dir(), path=str(self.home / rel_dir))
 
@@ -3196,6 +3739,24 @@ class TotalRecallCore:
                         "occurredAt": [(event.get("metadata") or {}).get("occurred_at") for event in source_events],
                     },
                 )
+                first_origin = source_events[0].get("origin") or {}
+                device_id = str(first_origin.get("device_id") or "")
+                device_path = core.home / "devices" / f"device_{device_id}.json"
+                add(
+                    "fixture_event_origin_device_identity",
+                    bool(device_id)
+                    and first_origin.get("harness") == "cli"
+                    and bool(first_origin.get("host"))
+                    and device_path.exists()
+                    and core.device_id() == device_id
+                    and core.device_private_key_file != core.ed25519_private_key_file,
+                    "New ledger events carry a hashed origin with a self-registered device key distinct from the store anchor key.",
+                    evidence={
+                        "deviceId": device_id,
+                        "harness": first_origin.get("harness"),
+                        "deviceFile": str(device_path),
+                    },
+                )
 
                 core.knowledge_index_rebuild()
                 freshness = core.knowledge_freshness_report(
@@ -3316,12 +3877,156 @@ class TotalRecallCore:
                 imported_state = imported.reduce_state(write=True)
                 add(
                     "fixture_persistence_checkpoint_export_import",
-                    bool(checkpoint.get("ok")) and bool(verification.get("ok")) and bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == core.health().get("eventCount"),
-                    "Checkpoint, signed verify, export manifest, and import restore preserve the fixture ledger.",
+                    bool(checkpoint.get("ok")) and bool(verification.get("ok")) and bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == int(core.health().get("eventCount") or 0) + 1 and ((imported_result.get("reAnchor") or {}).get("event") or {}).get("kind") == "re_anchor",
+                    "Checkpoint, signed verify, export manifest, import restore, and re-anchor preserve the fixture ledger with an explicit local restore event.",
                     evidence={
                         "verifyStatus": verification.get("status"),
                         "exportFileCount": exported.get("fileCount"),
                         "importedEventCount": imported_state.get("event_count"),
+                        "reAnchorEvent": ((imported_result.get("reAnchor") or {}).get("event") or {}).get("event_id"),
+                    },
+                )
+
+                resume_marker = "NEXT ACTION: fixture resume packet must preserve verbatim continuity text."
+                core.sync_turn(resume_marker, "Fixture resume packet stored.", session_id="trust-gate-resume")
+                resume_checkpoint = core.checkpoint(session_id="trust-gate-resume", label="session_end")
+                resume = core.rehydrate(session_id="trust-gate-resume", mode="resume")
+                resume_packet = resume_checkpoint.get("resumePacket") or {}
+                add(
+                    "fixture_resume_packet_rehydrate_verbatim",
+                    bool(resume_checkpoint.get("ok"))
+                    and bool(resume_packet.get("ok"))
+                    and bool(resume.get("ok"))
+                    and resume.get("mode") == "resume"
+                    and resume_marker in str(resume.get("context_block") or ""),
+                    "Session resume packets are derived from verified ledger turns and rehydrate verbatim after fail-closed verification.",
+                    evidence={
+                        "packetFile": resume_packet.get("packetFile"),
+                        "rehydrateStatus": resume.get("status"),
+                        "mode": resume.get("mode"),
+                    },
+                )
+
+                backup_dir = root / "encrypted-backups"
+                encrypted_backup = core.backup_run(str(backup_dir), keep=10, passphrase="fixture-backup-passphrase")
+                encrypted_path = Path(str((encrypted_backup.get("backup") or {}).get("encryptedBundle") or ""))
+                manifest_path = Path(str((encrypted_backup.get("backup") or {}).get("manifestFile") or ""))
+                restored_backup = TotalRecallCore(TotalRecallConfig(home=root / "backup-restored", enable_lancedb=False, enable_qmd=False))
+                restored_result = restored_backup.backup_restore(str(encrypted_path), passphrase="fixture-backup-passphrase", replace=True)
+                manifest = (encrypted_backup.get("backup") or {}).get("manifest") or {}
+                add(
+                    "fixture_encrypted_backup_restore",
+                    bool(encrypted_backup.get("ok"))
+                    and encrypted_backup.get("encrypted") is True
+                    and encrypted_path.exists()
+                    and manifest_path.exists()
+                    and bool(restored_result.get("ok"))
+                    and bool(manifest.get("recipients"))
+                    and b"Trust gate" not in encrypted_path.read_bytes(),
+                    "Encrypted backup writes a clear manifest plus AES-GCM ciphertext and restores through a non-ledger passphrase recipient.",
+                    evidence={
+                        "encryptedBundle": str(encrypted_path),
+                        "manifestFile": str(manifest_path),
+                        "recipientTypes": [item.get("type") for item in manifest.get("recipients") or []],
+                        "restoreStatus": restored_result.get("status"),
+                    },
+                )
+                receipt_verify = core.verify(receipts=True)
+                add(
+                    "fixture_receipt_lineage_verify",
+                    bool(receipt_verify.get("ok")) and (receipt_verify.get("receipts") or {}).get("count", 0) > 0,
+                    "Checkpoint receipts are device-signed and verify against the current ledger lineage.",
+                    evidence={
+                        "receiptCount": (receipt_verify.get("receipts") or {}).get("count"),
+                        "failures": (receipt_verify.get("receipts") or {}).get("failures"),
+                    },
+                )
+
+                remote_dir = root / "remote-head"
+                pushed = core.backup_push(target=str(remote_dir), passphrase="fixture-remote-passphrase")
+                pulled_core = TotalRecallCore(TotalRecallConfig(home=root / "remote-pulled", enable_lancedb=False, enable_qmd=False))
+                pulled = pulled_core.backup_pull(target=str(remote_dir), passphrase="fixture-remote-passphrase")
+                head_path = remote_dir / "HEAD.json"
+                add(
+                    "fixture_remote_head_push_pull",
+                    bool(pushed.get("ok"))
+                    and head_path.exists()
+                    and bool((pushed.get("head") or {}).get("signature"))
+                    and bool(pulled.get("ok"))
+                    and pulled_core.store_id() == core.store_id(),
+                    "Local-folder remote push writes a device-signed HEAD and pull restores only after signature and store-id checks.",
+                    evidence={
+                        "headFile": str(head_path),
+                        "pushLatest": (pushed.get("head") or {}).get("latest"),
+                        "pullStatus": pulled.get("status"),
+                    },
+                )
+
+                lease = core.lease_acquire(target=str(remote_dir), ttl_seconds=3600)
+                independent_core = TotalRecallCore(TotalRecallConfig(home=root / "remote-second-device", enable_lancedb=False, enable_qmd=False))
+                blocked_lease = independent_core.lease_acquire(target=str(remote_dir), ttl_seconds=3600)
+                add(
+                    "fixture_single_writer_lease_blocks_second_device",
+                    bool(lease.get("ok"))
+                    and lease.get("lease", {}).get("holder_device_id") == core.device_id()
+                    and blocked_lease.get("status") == "LEASE_HELD",
+                    "A device-signed remote lease prevents a second device from acquiring the write lease while it is unexpired.",
+                    evidence={
+                        "holder": (lease.get("lease") or {}).get("holder_device_id"),
+                        "secondStatus": blocked_lease.get("status"),
+                    },
+                )
+
+                fork_base = TotalRecallCore(TotalRecallConfig(home=root / "fork-base", enable_lancedb=False, enable_qmd=False))
+                fork_base.ingest(kind="note", text="Fork base memory.", session_id="fork")
+                base_bundle = root / "fork-base.tar.gz"
+                fork_base.export_bundle(str(base_bundle), include_keys=True)
+                fork_local = TotalRecallCore(TotalRecallConfig(home=root / "fork-local", enable_lancedb=False, enable_qmd=False))
+                fork_archive = TotalRecallCore(TotalRecallConfig(home=root / "fork-archive", enable_lancedb=False, enable_qmd=False))
+                fork_local.import_bundle(str(base_bundle))
+                fork_archive.import_bundle(str(base_bundle))
+                fork_local.ingest(kind="note", text="Fork local suffix.", session_id="fork")
+                fork_archive.ingest(kind="note", text="Fork archive suffix.", session_id="fork")
+                archive_bundle = root / "fork-archive.tar.gz"
+                fork_archive.export_bundle(str(archive_bundle), include_keys=True)
+                forked = fork_local.sync_fork_import(str(archive_bundle))
+                fork_suffix = next((item for item in forked.get("quarantined") or [] if item.get("text") == "Fork archive suffix."), {})
+                promoted_fork = fork_local.external_promote(fork_suffix.get("external_id", ""), session_id="fork") if fork_suffix else {}
+                add(
+                    "fixture_fork_import_quarantine_promote",
+                    bool(forked.get("ok"))
+                    and forked.get("commonPrefixEvents") == 1
+                    and forked.get("quarantinedCount") >= 1
+                    and bool(promoted_fork.get("ok"))
+                    and fork_local.search("Fork archive suffix").get("count", 0) >= 1,
+                    "Divergent archive suffixes are quarantined with fork provenance and promoted as new local ledger events, never merged silently.",
+                    evidence={
+                        "commonPrefixEvents": forked.get("commonPrefixEvents"),
+                        "quarantinedCount": forked.get("quarantinedCount"),
+                        "promotedEventKind": ((promoted_fork.get("event") or {}).get("kind")),
+                    },
+                )
+
+                handoff_source = TotalRecallCore(TotalRecallConfig(home=root / "handoff-source", enable_lancedb=False, enable_qmd=False))
+                handoff_remote = root / "handoff-remote"
+                handoff_marker = "NEXT ACTION: handoff accept must restore this exact resume marker."
+                handoff_source.sync_turn("Handoff source turn.", handoff_marker, session_id="handoff-fixture")
+                issued = handoff_source.handoff_issue(target=str(handoff_remote), session_id="handoff-fixture", turns=5, passphrase="fixture-handoff-passphrase")
+                accepted_core = TotalRecallCore(TotalRecallConfig(home=root / "handoff-accepted", enable_lancedb=False, enable_qmd=False))
+                accepted = accepted_core.handoff_accept(str(issued.get("handoffFile") or ""), run_trust_gate=False, passphrase="fixture-handoff-passphrase")
+                add(
+                    "fixture_handoff_issue_accept_bootstrap",
+                    bool(issued.get("ok"))
+                    and Path(str(issued.get("handoffFile") or "")).exists()
+                    and Path(str(issued.get("bootstrapScript") or "")).exists()
+                    and bool(accepted.get("ok"))
+                    and handoff_marker in str(accepted.get("resumeBlock") or ""),
+                    "Handoff issue writes a resume-packeted encrypted remote backup plus bootstrap artifacts, and accept pulls, verifies, trust-gates, leases, and resumes.",
+                    evidence={
+                        "handoffFile": issued.get("handoffFile"),
+                        "bootstrapScript": issued.get("bootstrapScript"),
+                        "acceptStatus": accepted.get("status"),
+                        "resumeMode": ((accepted.get("resume") or {}).get("mode")),
                     },
                 )
         except Exception as exc:
@@ -3347,8 +4052,8 @@ class TotalRecallCore:
                 imported_state = imported.reduce_state(write=True)
                 return self._trust_gate_check(
                     "real_store_export_import_round_trip",
-                    bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == event_count and imported_state.get("last_event_hash") == state.get("last_event_hash"),
-                    "Real store can be exported, manifest-verified, imported, and reduced to the same ledger point.",
+                    bool(exported.get("ok")) and bool(imported_result.get("ok")) and imported_state.get("event_count") == event_count + 1 and ((imported_result.get("reAnchor") or {}).get("event") or {}).get("kind") == "re_anchor",
+                    "Real store can be exported, manifest-verified, imported, reduced, and locally re-anchored without rewriting the restored chain.",
                     evidence={
                         "exportOk": exported.get("ok"),
                         "importOk": imported_result.get("ok"),
@@ -3356,6 +4061,7 @@ class TotalRecallCore:
                         "importedEventCount": imported_state.get("event_count"),
                         "lastEventHash": state.get("last_event_hash"),
                         "importedLastEventHash": imported_state.get("last_event_hash"),
+                        "reAnchorEvent": ((imported_result.get("reAnchor") or {}).get("event") or {}).get("event_id"),
                     },
                 )
         except Exception as exc:
@@ -3435,6 +4141,181 @@ class TotalRecallCore:
             "checked_at": utc_now(),
         }
 
+    def _encrypted_backup_payload(
+        self,
+        *,
+        plaintext: bytes,
+        exported: Dict[str, Any],
+        checkpoint_result: Optional[Dict[str, Any]],
+        state: Dict[str, Any],
+        passphrase: str = "",
+    ) -> Dict[str, Any]:
+        data_key = secrets.token_bytes(32)
+        nonce = secrets.token_bytes(12)
+        ciphertext = AESGCM(data_key).encrypt(nonce, plaintext, None)
+        recipients = self._backup_device_recipients(data_key)
+        passphrase_recipient = self._backup_passphrase_recipient(data_key, passphrase=passphrase)
+        if passphrase_recipient:
+            recipients.append(passphrase_recipient)
+        checkpoint = (checkpoint_result or {}).get("checkpoint") or self._latest_checkpoint_summary() or {}
+        manifest = {
+            "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION,
+            "backupId": self._new_id("backup"),
+            "created_at": utc_now(),
+            "source_device_id": self.device_id(),
+            "version": VERSION,
+            "bundle_sha256": hashlib.sha256(plaintext).hexdigest(),
+            "ciphertext_sha256": hashlib.sha256(ciphertext).hexdigest(),
+            "plaintext_bytes": len(plaintext),
+            "ciphertext_bytes": len(ciphertext),
+            "checkpoint_id": checkpoint.get("checkpoint_id"),
+            "event_count": state.get("event_count"),
+            "last_event_hash": state.get("last_event_hash"),
+            "latestCheckpoint": checkpoint,
+            "export": exported,
+            "recipients": recipients,
+            "provider_receipts": [],
+        }
+        envelope = {
+            "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION,
+            "manifest": manifest,
+            "encryption": {
+                "algorithm": "AES-256-GCM",
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+            },
+            "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+        }
+        return {"envelope": envelope, "manifest": manifest}
+
+    def _backup_device_recipients(self, data_key: bytes) -> List[Dict[str, Any]]:
+        recipients = []
+        for device in self.device_list().get("devices") or []:
+            if not device.get("approved_at") or device.get("revoked_at"):
+                continue
+            x_public_hex = str(device.get("x25519_public_key") or "").strip()
+            if not x_public_hex:
+                continue
+            try:
+                recipients.append(self._wrap_data_key_for_x25519_device(data_key, device_id=str(device.get("device_id") or ""), public_key_hex=x_public_hex))
+            except Exception:
+                continue
+        return recipients
+
+    def _wrap_data_key_for_x25519_device(self, data_key: bytes, *, device_id: str, public_key_hex: str) -> Dict[str, Any]:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        recipient_public = X25519PublicKey.from_public_bytes(bytes.fromhex(public_key_hex))
+        ephemeral_private = X25519PrivateKey.generate()
+        shared = ephemeral_private.exchange(recipient_public)
+        wrap_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"total-recall-backup-device-wrap-v1",
+        ).derive(shared)
+        nonce = secrets.token_bytes(12)
+        wrapped_key = AESGCM(wrap_key).encrypt(nonce, data_key, None)
+        ephemeral_public = ephemeral_private.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        return {
+            "type": "device-x25519",
+            "device_id": device_id,
+            "ephemeral_public_key": ephemeral_public.hex(),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+        }
+
+    def _backup_passphrase_recipient(self, data_key: bytes, *, passphrase: str = "") -> Optional[Dict[str, Any]]:
+        secret = passphrase or os.getenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "")
+        if not secret:
+            return None
+        salt = secrets.token_bytes(16)
+        nonce = secrets.token_bytes(12)
+        iterations = 390_000
+        wrap_key = self._portable_clone_key(secret, salt=salt, iterations=iterations)
+        wrapped_key = AESGCM(wrap_key).encrypt(nonce, data_key, None)
+        return {
+            "type": "passphrase-pbkdf2",
+            "kdf": "PBKDF2HMAC-SHA256",
+            "iterations": iterations,
+            "salt": base64.b64encode(salt).decode("ascii"),
+            "nonce": base64.b64encode(nonce).decode("ascii"),
+            "wrapped_key": base64.b64encode(wrapped_key).decode("ascii"),
+            "passphrase_env": "TOTAL_RECALL_BACKUP_PASSPHRASE",
+        }
+
+    def _decrypt_backup_envelope(self, encrypted_path: Path, *, passphrase: str = "") -> Dict[str, Any]:
+        try:
+            envelope = json.loads(encrypted_path.read_text(encoding="utf-8"))
+            manifest = envelope.get("manifest") or {}
+            if envelope.get("schema") != ENCRYPTED_BACKUP_SCHEMA_VERSION or manifest.get("schema") != ENCRYPTED_BACKUP_SCHEMA_VERSION:
+                return {"ok": False, "error": "invalid_backup_schema", "bundle": str(encrypted_path)}
+            ciphertext = base64.b64decode(envelope.get("ciphertext") or "")
+            nonce = base64.b64decode(((envelope.get("encryption") or {}).get("nonce")) or "")
+        except Exception as exc:
+            return {"ok": False, "error": "backup_envelope_unreadable", "detail": exc.__class__.__name__, "bundle": str(encrypted_path)}
+        data_key_result = self._unwrap_backup_data_key(manifest.get("recipients") or [], passphrase=passphrase)
+        if not data_key_result.get("ok"):
+            return data_key_result
+        try:
+            plaintext = AESGCM(data_key_result["data_key"]).decrypt(nonce, ciphertext, None)
+        except InvalidTag:
+            return {"ok": False, "error": "backup_decrypt_failed", "bundle": str(encrypted_path)}
+        expected = str(manifest.get("bundle_sha256") or "")
+        actual = hashlib.sha256(plaintext).hexdigest()
+        if expected and actual != expected:
+            return {"ok": False, "error": "backup_plaintext_hash_mismatch", "expected": expected, "actual": actual}
+        return {"ok": True, "plaintext": plaintext, "manifest": manifest, "recipient": data_key_result.get("recipient")}
+
+    def _unwrap_backup_data_key(self, recipients: List[Dict[str, Any]], *, passphrase: str = "") -> Dict[str, Any]:
+        if self.device_private_key_file.exists() and self.device_x25519_private_key_file.exists():
+            current_id = self.device_id()
+            for recipient in recipients:
+                if recipient.get("type") != "device-x25519" or recipient.get("device_id") != current_id:
+                    continue
+                try:
+                    data_key = self._unwrap_data_key_with_x25519(recipient)
+                    return {"ok": True, "data_key": data_key, "recipient": {"type": "device-x25519", "device_id": current_id}}
+                except Exception:
+                    continue
+        secret = passphrase or os.getenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "")
+        if secret:
+            for recipient in recipients:
+                if recipient.get("type") != "passphrase-pbkdf2":
+                    continue
+                try:
+                    salt = base64.b64decode(recipient.get("salt") or "")
+                    iterations = int(recipient.get("iterations") or 390_000)
+                    nonce = base64.b64decode(recipient.get("nonce") or "")
+                    wrapped_key = base64.b64decode(recipient.get("wrapped_key") or "")
+                    wrap_key = self._portable_clone_key(secret, salt=salt, iterations=iterations)
+                    data_key = AESGCM(wrap_key).decrypt(nonce, wrapped_key, None)
+                    return {"ok": True, "data_key": data_key, "recipient": {"type": "passphrase-pbkdf2"}}
+                except Exception:
+                    continue
+        return {"ok": False, "error": "backup_data_key_unavailable", "hint": "Use an approved device key or TOTAL_RECALL_BACKUP_PASSPHRASE."}
+
+    def _unwrap_data_key_with_x25519(self, recipient: Dict[str, Any]) -> bytes:
+        from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+
+        private_key = X25519PrivateKey.from_private_bytes(bytes.fromhex(self._device_x25519_private_key_hex()))
+        ephemeral_public = X25519PublicKey.from_public_bytes(bytes.fromhex(str(recipient.get("ephemeral_public_key") or "")))
+        shared = private_key.exchange(ephemeral_public)
+        wrap_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=None,
+            info=b"total-recall-backup-device-wrap-v1",
+        ).derive(shared)
+        nonce = base64.b64decode(recipient.get("nonce") or "")
+        wrapped_key = base64.b64decode(recipient.get("wrapped_key") or "")
+        return AESGCM(wrap_key).decrypt(nonce, wrapped_key, None)
+
     def backup_status(self, out_dir: str) -> Dict[str, Any]:
         directory = Path(out_dir).expanduser()
         backups = self._list_backup_files(directory)
@@ -3511,14 +4392,56 @@ class TotalRecallCore:
         keep_days: Optional[int] = None,
         include_index: bool = False,
         checkpoint: bool = True,
+        encrypt: bool = True,
+        passphrase: str = "",
     ) -> Dict[str, Any]:
         directory = Path(out_dir).expanduser()
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-        bundle = directory / f"total-recall-backup-{stamp}-{secrets.token_hex(3)}.tar.gz"
 
         checkpoint_result = self.checkpoint(session_id="backup", label="automatic_backup") if checkpoint else None
-        exported = self.export_bundle(str(bundle), include_index=include_index)
+        state = self.reduce_state(write=True)
+        backup_path: Path
+        if encrypt:
+            backup_path = directory / f"total-recall-backup-{stamp}-{secrets.token_hex(3)}.tar.gz.enc"
+            manifest_path = backup_path.with_suffix(backup_path.suffix + ".manifest.json")
+            with tempfile.TemporaryDirectory(prefix="total-recall-backup-plaintext.") as tmpdir:
+                plaintext_bundle = Path(tmpdir) / "total-recall-export.tar.gz"
+                exported = self.export_bundle(str(plaintext_bundle), include_index=include_index, include_keys=True)
+                plaintext = plaintext_bundle.read_bytes()
+            encrypted = self._encrypted_backup_payload(
+                plaintext=plaintext,
+                exported=exported,
+                checkpoint_result=checkpoint_result,
+                state=state,
+                passphrase=passphrase,
+            )
+            envelope = encrypted["envelope"]
+            manifest = encrypted["manifest"]
+            backup_path.write_text(json.dumps(envelope, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            manifest["encrypted"] = {
+                "path": backup_path.name,
+                "sha256": self._file_sha256(backup_path),
+                "bytes": backup_path.stat().st_size,
+            }
+            manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            exported = {
+                "ok": True,
+                "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION,
+                "encrypted": True,
+                "bundle": str(backup_path),
+                "encryptedBundle": str(backup_path),
+                "manifestFile": str(manifest_path),
+                "manifest": manifest,
+                "fileCount": exported.get("fileCount"),
+                "includeIndex": include_index,
+                "includeKeys": True,
+            }
+        else:
+            backup_path = directory / f"total-recall-backup-{stamp}-{secrets.token_hex(3)}.tar.gz"
+            exported = self.export_bundle(str(backup_path), include_index=include_index, include_keys=False)
+            exported["bundle"] = str(backup_path)
+            exported.setdefault("warnings", []).append("plaintext_backup_keys_excluded")
         doctor = self.doctor()
         verification = self.verify()
         pruned: List[str] = []
@@ -3538,6 +4461,8 @@ class TotalRecallCore:
         payload = {
             "ok": ok,
             "status": "PASS" if ok else "FAIL_CLOSED",
+            "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION if encrypt else "total-recall-backup-v1",
+            "encrypted": encrypt,
             "checkpoint": checkpoint_result,
             "backup": exported,
             "doctor": doctor,
@@ -3547,6 +4472,570 @@ class TotalRecallCore:
         }
         payload["report"] = self._write_report("backup", "latest", payload)
         return payload
+
+    def backup_restore(
+        self,
+        bundle: str | Path,
+        *,
+        passphrase: str = "",
+        replace: bool = False,
+    ) -> Dict[str, Any]:
+        encrypted_path = Path(bundle).expanduser()
+        if not encrypted_path.exists():
+            return {"ok": False, "error": "backup_bundle_not_found", "bundle": str(encrypted_path)}
+        if not encrypted_path.name.endswith(".enc"):
+            imported = self.import_bundle(str(encrypted_path), replace=replace)
+            return {
+                "ok": bool(imported.get("ok")),
+                "schema": "total-recall-backup-restore-v1",
+                "encrypted": False,
+                "bundle": str(encrypted_path),
+                "import": imported,
+                "verification": imported.get("verification"),
+            }
+        decrypted = self._decrypt_backup_envelope(encrypted_path, passphrase=passphrase)
+        if not decrypted.get("ok"):
+            return {"ok": False, "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION, "status": "FAIL_CLOSED", **decrypted}
+        with tempfile.TemporaryDirectory(prefix="total-recall-backup-restore.") as tmpdir:
+            plaintext_bundle = Path(tmpdir) / "total-recall-export.tar.gz"
+            plaintext_bundle.write_bytes(decrypted["plaintext"])
+            imported = self.import_bundle(str(plaintext_bundle), replace=replace)
+        verification = imported.get("verification") or self.verify()
+        return {
+            "ok": bool(imported.get("ok")) and bool(verification.get("ok")),
+            "schema": ENCRYPTED_BACKUP_SCHEMA_VERSION,
+            "status": "PASS" if imported.get("ok") and verification.get("ok") else "FAIL_CLOSED",
+            "encrypted": True,
+            "bundle": str(encrypted_path),
+            "manifest": decrypted.get("manifest"),
+            "recipient": decrypted.get("recipient"),
+            "import": imported,
+            "verification": verification,
+        }
+
+    def backup_push(self, *, target: str, passphrase: str = "") -> Dict[str, Any]:
+        remote = self._resolve_remote_target(target)
+        if not remote.get("ok"):
+            return remote
+        with tempfile.TemporaryDirectory(prefix="total-recall-push.") as tmpdir:
+            backup = self.backup_run(tmpdir, keep=10, encrypt=True, passphrase=passphrase)
+            if not backup.get("ok"):
+                return {"ok": False, "error": "backup_failed", "backup": backup}
+            backup_info = backup.get("backup") or {}
+            bundle_path = Path(str(backup_info.get("encryptedBundle") or ""))
+            manifest_path = Path(str(backup_info.get("manifestFile") or ""))
+            uploaded = self._remote_upload_files(remote, [bundle_path, manifest_path])
+            if not uploaded.get("ok"):
+                return uploaded
+            manifest = backup_info.get("manifest") or self._read_json(manifest_path)
+            latest = {
+                "bundle": bundle_path.name,
+                "manifest": manifest_path.name,
+                "bundle_sha256": self._file_sha256(bundle_path),
+                "checkpoint_id": manifest.get("checkpoint_id"),
+                "event_count": manifest.get("event_count"),
+                "last_event_hash": manifest.get("last_event_hash"),
+                "created_at": manifest.get("created_at"),
+                "device_id": self.device_id(),
+            }
+            existing_head = self._remote_read_head(remote)
+            receipts = self._receipts_tail()
+            head = {
+                "schema": "total-recall-remote-head-v1",
+                "updated_at": utc_now(),
+                "store_id": self.store_id(),
+                "latest": latest,
+                "lease": (existing_head.get("head") or {}).get("lease") if existing_head.get("ok") else None,
+                "receipts": receipts,
+            }
+            head["signature"] = self._device_sign_json({"latest": latest, "receipts": receipts})
+            written = self._remote_write_head(remote, head)
+            return {
+                "ok": bool(written.get("ok")),
+                "schema": "total-recall-remote-head-v1",
+                "target": remote,
+                "backup": backup,
+                "upload": uploaded,
+                "head": head,
+                "headFile": written.get("headFile"),
+            }
+
+    def backup_pull(self, *, target: str, passphrase: str = "", replace: bool = True) -> Dict[str, Any]:
+        remote = self._resolve_remote_target(target)
+        if not remote.get("ok"):
+            return remote
+        head_result = self._remote_read_head(remote)
+        if not head_result.get("ok"):
+            return head_result
+        head = head_result["head"]
+        verified = self._verify_remote_head(head)
+        if not verified.get("ok"):
+            return {"ok": False, "status": "FAIL_CLOSED", "error": "remote_head_signature_invalid", "head": head}
+        store_check = self._remote_store_id_check(str(head.get("store_id") or ""))
+        if not store_check.get("ok"):
+            return store_check
+        relation = self._remote_relation(head)
+        if relation["relation"] == "in_sync":
+            return {"ok": True, "status": "IN_SYNC", "relation": relation, "head": head}
+        if relation["relation"] == "local_ahead":
+            return {"ok": False, "status": "LOCAL_AHEAD", "relation": relation, "message": "Local store is ahead; push instead of pulling."}
+        if relation["relation"] == "diverged":
+            return {"ok": False, "status": "DIVERGED", "relation": relation, "message": "Local and remote diverged; use sync fork-import."}
+        fetched = self._remote_fetch_latest_bundle(remote, head)
+        if not fetched.get("ok"):
+            return fetched
+        restored = self.backup_restore(fetched["bundle"], passphrase=passphrase, replace=replace)
+        if restored.get("ok"):
+            self._set_store_id(str(head.get("store_id") or ""))
+        return {
+            "ok": bool(restored.get("ok")),
+            "status": "PASS" if restored.get("ok") else "FAIL_CLOSED",
+            "relation": relation,
+            "head": head,
+            "fetch": fetched,
+            "restore": restored,
+        }
+
+    def sync_check(self, *, target: str) -> Dict[str, Any]:
+        remote = self._resolve_remote_target(target)
+        if not remote.get("ok"):
+            return remote
+        head_result = self._remote_read_head(remote)
+        if not head_result.get("ok"):
+            return head_result
+        head = head_result["head"]
+        signature = self._verify_remote_head(head)
+        relation = self._remote_relation(head) if signature.get("ok") else {"relation": "unknown", "message": "Remote HEAD signature invalid."}
+        return {"ok": bool(signature.get("ok")), "schema": "total-recall-sync-check-v1", "target": remote, "head": head, "signature": signature, "relation": relation}
+
+    def sync_fork_import(self, source: str, *, passphrase: str = "") -> Dict[str, Any]:
+        archive = self._archive_events_from_source(source, passphrase=passphrase)
+        if not archive.get("ok"):
+            return archive
+        archive_events = archive.get("events") or []
+        local_events = self._read_events(verify_chain=True)
+        prefix_len = 0
+        for local_event, archive_event in zip(local_events, archive_events):
+            if local_event.get("hash") != archive_event.get("hash"):
+                break
+            prefix_len += 1
+        fork_base_hash = local_events[prefix_len - 1].get("hash") if prefix_len > 0 and local_events else None
+        suffix = archive_events[prefix_len:]
+        quarantined = []
+        for event in suffix:
+            external_id = self._new_id("fork")
+            item = {
+                "schema": "total-recall-external-v1",
+                "external_id": external_id,
+                "created_at": utc_now(),
+                "source": f"fork-import:{archive.get('source')}",
+                "source_kind": "ledger_fork",
+                "text": event.get("text", ""),
+                "status": "quarantine",
+                "metadata": {
+                    "fork_import": {
+                        "fork_base_hash": fork_base_hash,
+                        "archive_bundle": archive.get("source"),
+                        "origin_device": ((event.get("origin") or {}).get("device_id")),
+                        "original_event_hash": event.get("hash"),
+                        "original_event_id": event.get("event_id"),
+                        "original_event": event,
+                    }
+                },
+            }
+            path = self.home / "external-memory" / "quarantine" / f"{external_id}.json"
+            self._write_json(path, item)
+            quarantined.append({**item, "externalFile": str(path)})
+        return {
+            "ok": True,
+            "schema": "total-recall-fork-import-v1",
+            "source": archive.get("source"),
+            "localEventCount": len(local_events),
+            "archiveEventCount": len(archive_events),
+            "commonPrefixEvents": prefix_len,
+            "forkBaseHash": fork_base_hash,
+            "quarantinedCount": len(quarantined),
+            "quarantined": quarantined,
+        }
+
+    def lease_status(self, *, target: str) -> Dict[str, Any]:
+        remote = self._resolve_remote_target(target)
+        if not remote.get("ok"):
+            return remote
+        head_result = self._remote_read_head(remote)
+        if not head_result.get("ok"):
+            return head_result
+        head = head_result["head"]
+        lease = head.get("lease")
+        return {
+            "ok": True,
+            "schema": "total-recall-lease-status-v1",
+            "target": remote,
+            "lease": lease,
+            "active": self._lease_active(lease),
+            "heldBySelf": bool(lease and lease.get("holder_device_id") == self.device_id()),
+            "head": head,
+        }
+
+    def lease_acquire(self, *, target: str, ttl_seconds: int = 3600) -> Dict[str, Any]:
+        remote, head_result = self._remote_head_for_lease(target)
+        if not head_result.get("ok"):
+            return head_result
+        head = head_result["head"]
+        lease = head.get("lease")
+        if self._lease_active(lease) and (lease or {}).get("holder_device_id") != self.device_id():
+            return {"ok": False, "status": "LEASE_HELD", "lease": lease, "message": "Another device holds an unexpired lease."}
+        new_lease = self._new_lease(ttl_seconds=ttl_seconds)
+        head["lease"] = new_lease
+        head["updated_at"] = utc_now()
+        written = self._remote_write_head(remote, head)
+        return {"ok": bool(written.get("ok")), "schema": "total-recall-lease-v1", "status": "ACQUIRED", "lease": new_lease, "headFile": written.get("headFile")}
+
+    def lease_release(self, *, target: str) -> Dict[str, Any]:
+        remote, head_result = self._remote_head_for_lease(target)
+        if not head_result.get("ok"):
+            return head_result
+        head = head_result["head"]
+        lease = head.get("lease")
+        if lease and self._lease_active(lease) and lease.get("holder_device_id") != self.device_id():
+            return {"ok": False, "status": "LEASE_HELD_BY_OTHER", "lease": lease}
+        head["lease"] = None
+        head["updated_at"] = utc_now()
+        written = self._remote_write_head(remote, head)
+        return {"ok": bool(written.get("ok")), "schema": "total-recall-lease-v1", "status": "RELEASED", "headFile": written.get("headFile")}
+
+    def lease_steal(self, *, target: str, ttl_seconds: int = 3600, force: bool = False) -> Dict[str, Any]:
+        if not force:
+            return {"ok": False, "error": "force_required", "hint": "Pass --force to steal a lease and record an incident."}
+        remote, head_result = self._remote_head_for_lease(target)
+        if not head_result.get("ok"):
+            return head_result
+        old_lease = (head_result["head"] or {}).get("lease")
+        incident = self.create_incident(
+            title="Remote lease stolen",
+            severity="DEGRADED",
+            summary=f"Lease on {target} was force-stolen by {self.device_id()}.",
+            metadata={"target": target, "oldLease": old_lease, "device_id": self.device_id()},
+        )
+        event = self.ingest(
+            kind="lease_steal",
+            text=f"Lease stolen for target {target}. Previous lease: {canonical_json(old_lease or {})}",
+            session_id="lease",
+            source="lease.steal",
+            metadata={"target": target, "old_lease": old_lease, "incident_id": (incident.get("incident") or {}).get("incident_id")},
+        )
+        head = head_result["head"]
+        new_lease = self._new_lease(ttl_seconds=ttl_seconds)
+        head["lease"] = new_lease
+        head["updated_at"] = utc_now()
+        written = self._remote_write_head(remote, head)
+        return {
+            "ok": bool(written.get("ok")),
+            "schema": "total-recall-lease-v1",
+            "status": "STOLEN",
+            "lease": new_lease,
+            "incident": incident.get("incident"),
+            "event": event.get("event"),
+            "headFile": written.get("headFile"),
+        }
+
+    def _remote_head_for_lease(self, target: str) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        remote = self._resolve_remote_target(target)
+        if not remote.get("ok"):
+            return remote, remote
+        head_result = self._remote_read_head(remote)
+        if not head_result.get("ok"):
+            return remote, head_result
+        verified = self._verify_remote_head(head_result["head"])
+        if not verified.get("ok"):
+            return remote, {"ok": False, "status": "FAIL_CLOSED", "error": "remote_head_signature_invalid"}
+        return remote, head_result
+
+    def _new_lease(self, *, ttl_seconds: int) -> Dict[str, Any]:
+        now_dt = datetime.now(timezone.utc).replace(microsecond=0)
+        ttl = max(1, int(ttl_seconds or 3600))
+        expires_dt = now_dt.timestamp() + ttl
+        expires_at = datetime.fromtimestamp(expires_dt, tz=timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        device = self._register_self_device()
+        base = {
+            "holder_device_id": self.device_id(),
+            "holder_label": device.get("label") or self.device_id(),
+            "acquired_at": now_dt.isoformat().replace("+00:00", "Z"),
+            "ttl_seconds": ttl,
+            "expires_at": expires_at,
+        }
+        return {**base, "signature": self._device_sign_json(base)}
+
+    def _lease_active(self, lease: Any) -> bool:
+        if not isinstance(lease, dict) or not lease.get("expires_at"):
+            return False
+        if not self._verify_lease_signature(lease):
+            return False
+        try:
+            expires = datetime.strptime(str(lease.get("expires_at")), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except Exception:
+            return False
+        return expires > datetime.now(timezone.utc)
+
+    def _verify_lease_signature(self, lease: Dict[str, Any]) -> bool:
+        signature = lease.get("signature") or {}
+        base = {k: v for k, v in lease.items() if k != "signature"}
+        return self._verify_device_signature(base, signature)
+
+    def _resolve_remote_target(self, target: str) -> Dict[str, Any]:
+        raw = str(target or "").strip()
+        if not raw:
+            return {"ok": False, "error": "target_required"}
+        registry_path = self.home / "remote" / "targets.json"
+        if registry_path.exists():
+            try:
+                registry = self._read_json(registry_path)
+                configured = (registry.get("targets") or {}).get(raw)
+                if configured:
+                    configured = dict(configured)
+                    configured.setdefault("name", raw)
+                    configured["ok"] = True
+                    return configured
+            except Exception:
+                pass
+        if raw.startswith("hf:"):
+            return {"ok": True, "name": raw, "type": "huggingface", "repo_id": raw.removeprefix("hf:")}
+        return {"ok": True, "name": raw, "type": "local-folder", "path": str(Path(raw).expanduser())}
+
+    def _remote_upload_files(self, remote: Dict[str, Any], files: List[Path]) -> Dict[str, Any]:
+        if remote.get("type") == "local-folder":
+            root = Path(str(remote.get("path") or "")).expanduser()
+            root.mkdir(parents=True, exist_ok=True)
+            copied = []
+            for path in files:
+                dest = root / path.name
+                shutil.copy2(path, dest)
+                copied.append(str(dest))
+            return {"ok": True, "provider": "local-folder", "files": copied}
+        if remote.get("type") == "huggingface":
+            repo_id = str(remote.get("repo_id") or "")
+            results = []
+            for path in files:
+                result = self._remote_hf_upload_file(repo_id=repo_id, path=path)
+                results.append(result)
+                if not result.get("ok"):
+                    return {"ok": False, "provider": "huggingface", "repoId": repo_id, "results": results}
+            return {"ok": True, "provider": "huggingface", "repoId": repo_id, "results": results}
+        return {"ok": False, "error": "remote_type_unsupported", "type": remote.get("type")}
+
+    def _remote_read_head(self, remote: Dict[str, Any]) -> Dict[str, Any]:
+        if remote.get("type") == "local-folder":
+            path = Path(str(remote.get("path") or "")).expanduser() / "HEAD.json"
+            if not path.exists():
+                return {"ok": False, "error": "remote_head_not_found", "headFile": str(path)}
+            return {"ok": True, "head": self._read_json(path), "headFile": str(path)}
+        if remote.get("type") == "huggingface":
+            downloaded = self._portable_clone_hf_download(repo_id=str(remote.get("repo_id") or ""), filename="HEAD.json")
+            if not downloaded.get("ok"):
+                return downloaded
+            return {"ok": True, "head": self._read_json(Path(downloaded["path"])), "headFile": downloaded["path"]}
+        return {"ok": False, "error": "remote_type_unsupported", "type": remote.get("type")}
+
+    def _remote_write_head(self, remote: Dict[str, Any], head: Dict[str, Any]) -> Dict[str, Any]:
+        if remote.get("type") == "local-folder":
+            path = Path(str(remote.get("path") or "")).expanduser() / "HEAD.json"
+            self._write_json(path, head)
+            return {"ok": True, "headFile": str(path)}
+        if remote.get("type") == "huggingface":
+            with tempfile.TemporaryDirectory(prefix="total-recall-head-upload.") as tmpdir:
+                path = Path(tmpdir) / "HEAD.json"
+                path.write_text(json.dumps(head, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+                return self._remote_hf_upload_file(repo_id=str(remote.get("repo_id") or ""), path=path)
+        return {"ok": False, "error": "remote_type_unsupported", "type": remote.get("type")}
+
+    def _remote_fetch_latest_bundle(self, remote: Dict[str, Any], head: Dict[str, Any]) -> Dict[str, Any]:
+        latest = head.get("latest") or {}
+        bundle = str(latest.get("bundle") or "")
+        manifest = str(latest.get("manifest") or "")
+        if not bundle:
+            return {"ok": False, "error": "remote_latest_bundle_missing"}
+        if remote.get("type") == "local-folder":
+            root = Path(str(remote.get("path") or "")).expanduser()
+            bundle_path = root / bundle
+            manifest_path = root / manifest if manifest else None
+            if not bundle_path.exists():
+                return {"ok": False, "error": "remote_bundle_not_found", "bundle": str(bundle_path)}
+            return {"ok": True, "bundle": str(bundle_path), "manifest": str(manifest_path) if manifest_path else ""}
+        if remote.get("type") == "huggingface":
+            bundle_result = self._portable_clone_hf_download(repo_id=str(remote.get("repo_id") or ""), filename=bundle)
+            if not bundle_result.get("ok"):
+                return bundle_result
+            manifest_result = self._portable_clone_hf_download(repo_id=str(remote.get("repo_id") or ""), filename=manifest) if manifest else {"ok": True}
+            return {"ok": bool(manifest_result.get("ok")), "bundle": bundle_result.get("path"), "manifest": manifest_result.get("path")}
+        return {"ok": False, "error": "remote_type_unsupported", "type": remote.get("type")}
+
+    def _verify_remote_head(self, head: Dict[str, Any]) -> Dict[str, Any]:
+        if head.get("schema") != "total-recall-remote-head-v1":
+            return {"ok": False, "error": "invalid_remote_head_schema"}
+        signed_payload = {"latest": head.get("latest") or {}, "receipts": head.get("receipts") or []}
+        ok = self._verify_device_signature(signed_payload, head.get("signature") or {})
+        return {"ok": ok, "device_id": ((head.get("signature") or {}).get("device_id"))}
+
+    def _remote_store_id_check(self, remote_store_id: str) -> Dict[str, Any]:
+        state = self.reduce_state(write=False)
+        local_events = int(state.get("event_count") or 0)
+        local_path = self.home / "state" / "store_id"
+        local_store_id = local_path.read_text(encoding="utf-8").strip() if local_path.exists() else ""
+        if local_store_id and remote_store_id and local_store_id != remote_store_id and local_events > 0:
+            return {"ok": False, "error": "store_id_mismatch", "localStoreId": local_store_id, "remoteStoreId": remote_store_id}
+        return {"ok": True, "localStoreId": local_store_id, "remoteStoreId": remote_store_id}
+
+    def _remote_relation(self, head: Dict[str, Any]) -> Dict[str, Any]:
+        state = self.reduce_state(write=False)
+        latest = head.get("latest") or {}
+        local_count = int(state.get("event_count") or 0)
+        remote_count = int(latest.get("event_count") or 0)
+        local_hash = state.get("last_event_hash")
+        remote_hash = latest.get("last_event_hash")
+        if local_count == remote_count and local_hash == remote_hash:
+            relation = "in_sync"
+            message = "Local store and remote HEAD pin the same ledger point."
+        elif remote_count > local_count:
+            relation = "archive_ahead"
+            message = f"Remote archive is ahead by {remote_count - local_count} event(s)."
+        elif local_count > remote_count:
+            relation = "local_ahead"
+            message = f"Local store is ahead by {local_count - remote_count} event(s)."
+        else:
+            relation = "diverged"
+            message = "Local and remote event counts match but ledger hashes differ."
+        return {
+            "relation": relation,
+            "message": message,
+            "local": {"eventCount": local_count, "lastEventHash": local_hash},
+            "remote": {"eventCount": remote_count, "lastEventHash": remote_hash},
+        }
+
+    def _archive_events_from_source(self, source: str, *, passphrase: str = "") -> Dict[str, Any]:
+        raw = str(source or "").strip()
+        path = Path(raw).expanduser()
+        bundle_path: Optional[Path] = None
+        if path.exists() and path.is_dir():
+            remote = {"ok": True, "type": "local-folder", "path": str(path), "name": raw}
+            head_result = self._remote_read_head(remote)
+            if not head_result.get("ok"):
+                return head_result
+            verified = self._verify_remote_head(head_result["head"])
+            if not verified.get("ok"):
+                return {"ok": False, "error": "remote_head_signature_invalid"}
+            fetched = self._remote_fetch_latest_bundle(remote, head_result["head"])
+            if not fetched.get("ok"):
+                return fetched
+            bundle_path = Path(str(fetched.get("bundle") or ""))
+        elif path.exists() and path.is_file():
+            bundle_path = path
+        else:
+            remote = self._resolve_remote_target(raw)
+            if not remote.get("ok"):
+                return {"ok": False, "error": "source_not_found", "source": raw}
+            head_result = self._remote_read_head(remote)
+            if not head_result.get("ok"):
+                return head_result
+            verified = self._verify_remote_head(head_result["head"])
+            if not verified.get("ok"):
+                return {"ok": False, "error": "remote_head_signature_invalid"}
+            fetched = self._remote_fetch_latest_bundle(remote, head_result["head"])
+            if not fetched.get("ok"):
+                return fetched
+            bundle_path = Path(str(fetched.get("bundle") or ""))
+        if not bundle_path or not bundle_path.exists():
+            return {"ok": False, "error": "bundle_not_found", "source": raw}
+        if bundle_path.name.endswith(".enc"):
+            decrypted = self._decrypt_backup_envelope(bundle_path, passphrase=passphrase)
+            if not decrypted.get("ok"):
+                return decrypted
+            with tempfile.TemporaryDirectory(prefix="total-recall-fork-import.") as tmpdir:
+                plain = Path(tmpdir) / "archive.tar.gz"
+                plain.write_bytes(decrypted["plaintext"])
+                events = self._events_from_export_tarball(plain)
+        else:
+            events = self._events_from_export_tarball(bundle_path)
+        if not events.get("ok"):
+            return events
+        return {"ok": True, "source": str(bundle_path), "events": events.get("events") or []}
+
+    def _events_from_export_tarball(self, bundle: Path) -> Dict[str, Any]:
+        try:
+            with tarfile.open(bundle, "r:gz") as tar:
+                member = tar.extractfile("ledger/events.jsonl")
+                if member is None:
+                    return {"ok": False, "error": "ledger_not_found_in_bundle", "bundle": str(bundle)}
+                lines = member.read().decode("utf-8").splitlines()
+        except Exception as exc:
+            return {"ok": False, "error": "bundle_unreadable", "bundle": str(bundle), "detail": str(exc)}
+        events: List[Dict[str, Any]] = []
+        prev: Optional[str] = None
+        for line_no, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            event_hash = event.get("hash")
+            base = {k: v for k, v in event.items() if k != "hash"}
+            if event_hash != sha256_json(base):
+                return {"ok": False, "error": "archive_hash_mismatch", "line": line_no}
+            if event.get("prev_hash") != prev:
+                return {"ok": False, "error": "archive_prev_hash_mismatch", "line": line_no}
+            prev = event_hash
+            events.append(event)
+        return {"ok": True, "events": events, "eventCount": len(events)}
+
+    def _receipts_tail(self) -> List[Dict[str, Any]]:
+        path = self.home / "anchors" / "receipts.jsonl"
+        if not path.exists():
+            return []
+        receipts = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                receipts.append(json.loads(line))
+            except Exception:
+                continue
+        return receipts[-100:]
+
+    def _verify_receipts_against_events(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        receipts = self._receipts_tail()
+        if not receipts:
+            return {"ok": True, "count": 0, "status": "NO_RECEIPTS"}
+        events = self._read_events(verify_chain=True)
+        hashes = {str(event.get("hash") or "") for event in events if event.get("hash")}
+        failures = []
+        for receipt in receipts:
+            signature = receipt.get("signature") or {}
+            base = {k: v for k, v in receipt.items() if k != "signature"}
+            if not self._verify_device_signature(base, signature):
+                failures.append({"checkpoint_id": receipt.get("checkpoint_id"), "error": "signature_mismatch"})
+                continue
+            event_count = int(receipt.get("event_count") or 0)
+            last_hash = str(receipt.get("last_event_hash") or "")
+            if event_count > int(state.get("event_count") or 0):
+                failures.append({"checkpoint_id": receipt.get("checkpoint_id"), "error": "event_count_ahead"})
+            if last_hash and last_hash not in hashes:
+                failures.append({"checkpoint_id": receipt.get("checkpoint_id"), "error": "last_event_hash_not_in_chain"})
+        return {"ok": not failures, "count": len(receipts), "failures": failures}
+
+    def _remote_hf_upload_file(self, *, repo_id: str, path: Path) -> Dict[str, Any]:
+        if not repo_id:
+            return {"ok": False, "error": "repo_id_required", "provider": "huggingface"}
+        hf_bin = shutil.which("hf") or shutil.which("huggingface-cli")
+        if not hf_bin:
+            return {"ok": False, "error": "hf_cli_not_found", "provider": "huggingface", "file": str(path)}
+        command = [hf_bin, "upload", repo_id, str(path), path.name, "--repo-type", "dataset"]
+        run = subprocess.run(command, text=True, capture_output=True, timeout=300)
+        return {
+            "ok": run.returncode == 0,
+            "provider": "huggingface",
+            "repoId": repo_id,
+            "file": path.name,
+            "returncode": run.returncode,
+            "stdout": _redact_secret_text(run.stdout[-1000:]),
+            "stderr": _redact_secret_text(run.stderr[-1000:]),
+        }
 
     def rehydrate_status(self, *, session_key: Optional[str] = None, agent: Optional[str] = None) -> Dict[str, Any]:
         session_id = session_key or (f"agent:{agent}:main" if agent else "default")
@@ -4162,8 +5651,11 @@ class TotalRecallCore:
             "external-memory/quarantine",
             "external-memory/promoted",
             "external-memory/rejected",
+            "continuation",
+            "handoff",
             "index",
             "keys",
+            "devices",
             "knowledge/index",
             "knowledge/graph",
             "knowledge/synthesis/staging",
@@ -4252,6 +5744,48 @@ class TotalRecallCore:
         anchor["anchorFile"] = str(anchor_path)
         return anchor
 
+    def _append_checkpoint_receipt(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+        base = {
+            "schema": "total-recall-checkpoint-receipt-v1",
+            "checkpoint_id": checkpoint.get("checkpoint_id"),
+            "state_hash": checkpoint.get("state_hash"),
+            "event_count": checkpoint.get("event_count"),
+            "last_event_hash": checkpoint.get("last_event_hash"),
+            "created_at": utc_now(),
+            "device_id": self.device_id(),
+        }
+        receipt = {**base, "signature": self._device_sign_json(base)}
+        path = self.home / "anchors" / "receipts.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(canonical_json(receipt) + "\n")
+        return receipt
+
+    def _append_re_anchor_event(
+        self,
+        *,
+        restored_checkpoint_id: str,
+        restored_last_event_hash: str,
+        source_bundle_sha256: str,
+        source: str,
+    ) -> Dict[str, Any]:
+        base = {
+            "schema": "total-recall-re-anchor-v1",
+            "restored_checkpoint_id": restored_checkpoint_id,
+            "restored_last_event_hash": restored_last_event_hash,
+            "source_bundle_sha256": source_bundle_sha256,
+            "device_id": self.device_id(),
+            "created_at": utc_now(),
+        }
+        metadata = {**base, "signature": self._device_sign_json(base)}
+        return self.ingest(
+            kind="re_anchor",
+            text=f"Re-anchor after restore/import from {source}. Restored checkpoint {restored_checkpoint_id} at {restored_last_event_hash}.",
+            session_id="re-anchor",
+            source=source,
+            metadata=metadata,
+        )
+
     def _secret_key(self) -> bytes:
         if not self.key_file.exists():
             self.key_file.write_text(secrets.token_hex(32), encoding="utf-8")
@@ -4328,6 +5862,236 @@ class TotalRecallCore:
             self.ed25519_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
         return self.ed25519_public_key_file.read_text(encoding="utf-8").strip()
 
+    def _device_private_key_hex(self) -> str:
+        if not self.device_private_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            private_key = Ed25519PrivateKey.generate()
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.device_private_key_file.parent.mkdir(parents=True, exist_ok=True)
+            self.device_private_key_file.write_text(private_bytes.hex() + "\n", encoding="utf-8")
+            self.device_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+            try:
+                self.device_private_key_file.chmod(0o600)
+                self.device_public_key_file.chmod(0o644)
+            except Exception:
+                pass
+        return self.device_private_key_file.read_text(encoding="utf-8").strip()
+
+    def _device_public_key_hex(self) -> str:
+        if not self.device_public_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+            private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(self._device_private_key_hex()))
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.device_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+        return self.device_public_key_file.read_text(encoding="utf-8").strip()
+
+    def _device_x25519_private_key_hex(self) -> str:
+        if not self.device_x25519_private_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+            private_key = X25519PrivateKey.generate()
+            private_bytes = private_key.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.device_x25519_private_key_file.parent.mkdir(parents=True, exist_ok=True)
+            self.device_x25519_private_key_file.write_text(private_bytes.hex() + "\n", encoding="utf-8")
+            self.device_x25519_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+            try:
+                self.device_x25519_private_key_file.chmod(0o600)
+                self.device_x25519_public_key_file.chmod(0o644)
+            except Exception:
+                pass
+        return self.device_x25519_private_key_file.read_text(encoding="utf-8").strip()
+
+    def _device_x25519_public_key_hex(self) -> str:
+        if not self.device_x25519_public_key_file.exists():
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+
+            private_key = X25519PrivateKey.from_private_bytes(bytes.fromhex(self._device_x25519_private_key_hex()))
+            public_bytes = private_key.public_key().public_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PublicFormat.Raw,
+            )
+            self.device_x25519_public_key_file.write_text(public_bytes.hex() + "\n", encoding="utf-8")
+        return self.device_x25519_public_key_file.read_text(encoding="utf-8").strip()
+
+    def device_id(self) -> str:
+        return hashlib.sha256(bytes.fromhex(self._device_public_key_hex())).hexdigest()[:16]
+
+    def store_id(self) -> str:
+        path = self.home / "state" / "store_id"
+        if path.exists():
+            value = path.read_text(encoding="utf-8").strip()
+            if value:
+                return value
+        value = str(uuid.uuid4())
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value + "\n", encoding="utf-8")
+        return value
+
+    def _set_store_id(self, store_id: str) -> None:
+        value = str(store_id or "").strip()
+        if not value:
+            return
+        path = self.home / "state" / "store_id"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value + "\n", encoding="utf-8")
+
+    def device_init(self, *, label: str = "") -> Dict[str, Any]:
+        return {"ok": True, "device": self._register_self_device(label=label), "schema": "total-recall-device-registry-v1"}
+
+    def device_list(self) -> Dict[str, Any]:
+        self._register_self_device()
+        devices = []
+        for path in sorted((self.home / "devices").glob("device_*.json")):
+            try:
+                item = self._read_json(path)
+            except Exception:
+                continue
+            item["deviceFile"] = str(path)
+            devices.append(item)
+        return {"ok": True, "schema": "total-recall-device-registry-v1", "devices": devices, "count": len(devices)}
+
+    def device_approve(self, device_id: str = "", *, public_key: str = "", x25519_public_key: str = "", label: str = "") -> Dict[str, Any]:
+        public_key = str(public_key or "").strip()
+        x25519_public_key = str(x25519_public_key or "").strip()
+        safe_device_id = _safe_id(device_id or "")
+        if public_key:
+            try:
+                public_key_bytes = bytes.fromhex(public_key)
+            except ValueError:
+                return {"ok": False, "error": "invalid_public_key_hex"}
+            calculated = hashlib.sha256(public_key_bytes).hexdigest()[:16]
+            if safe_device_id and safe_device_id != calculated:
+                return {"ok": False, "error": "device_id_public_key_mismatch", "expected": calculated, "device_id": safe_device_id}
+            safe_device_id = calculated
+        if not safe_device_id:
+            return {"ok": False, "error": "device_id_required"}
+        path = self.home / "devices" / f"device_{safe_device_id}.json"
+        now = utc_now()
+        device = self._read_json(path) if path.exists() else {
+            "schema": "total-recall-device-v1",
+            "device_id": safe_device_id,
+            "label": label or safe_device_id,
+            "public_key": public_key,
+            "x25519_public_key": x25519_public_key,
+            "created_at": now,
+            "approved_at": None,
+            "revoked_at": None,
+            "last_seen_at": None,
+        }
+        if public_key:
+            device["public_key"] = public_key
+        if x25519_public_key:
+            try:
+                bytes.fromhex(x25519_public_key)
+            except ValueError:
+                return {"ok": False, "error": "invalid_x25519_public_key_hex"}
+            device["x25519_public_key"] = x25519_public_key
+        if label:
+            device["label"] = label
+        device["approved_at"] = device.get("approved_at") or now
+        device["revoked_at"] = None
+        self._write_json(path, device)
+        return {"ok": True, "schema": "total-recall-device-registry-v1", "device": device, "deviceFile": str(path)}
+
+    def device_revoke(self, device_id: str) -> Dict[str, Any]:
+        safe_device_id = _safe_id(device_id or "")
+        if not safe_device_id:
+            return {"ok": False, "error": "device_id_required"}
+        path = self.home / "devices" / f"device_{safe_device_id}.json"
+        if not path.exists():
+            return {"ok": False, "error": "device_not_found", "device_id": safe_device_id}
+        device = self._read_json(path)
+        device["revoked_at"] = utc_now()
+        self._write_json(path, device)
+        return {"ok": True, "schema": "total-recall-device-registry-v1", "device": device, "deviceFile": str(path)}
+
+    def _register_self_device(self, *, label: str = "") -> Dict[str, Any]:
+        now = utc_now()
+        public_key = self._device_public_key_hex()
+        x25519_public_key = self._device_x25519_public_key_hex()
+        device_id = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()[:16]
+        path = self.home / "devices" / f"device_{device_id}.json"
+        device = self._read_json(path) if path.exists() else {
+            "schema": "total-recall-device-v1",
+            "device_id": device_id,
+            "label": label or platform.node() or "local-device",
+            "public_key": public_key,
+            "x25519_public_key": x25519_public_key,
+            "created_at": now,
+            "approved_at": now,
+            "revoked_at": None,
+            "last_seen_at": None,
+        }
+        if label:
+            device["label"] = label
+        device["public_key"] = public_key
+        device["x25519_public_key"] = x25519_public_key
+        device["approved_at"] = device.get("approved_at") or now
+        device["last_seen_at"] = now
+        self._write_json(path, device)
+        return device
+
+    def _event_origin(self, *, source: str = "") -> Dict[str, Any]:
+        device = self._register_self_device()
+        source_text = str(source or "")
+        harness = "hermes" if source_text.startswith("hermes.") or "hermes" in source_text.lower() else "cli"
+        return {
+            "device_id": device.get("device_id"),
+            "agent": os.getenv("TOTAL_RECALL_AGENT", ""),
+            "harness": harness,
+            "host": platform.node(),
+        }
+
+    def _device_sign_json(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+        private_key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(self._device_private_key_hex()))
+        body = canonical_json(payload).encode("utf-8")
+        return {
+            "algorithm": "ed25519-device-v1",
+            "device_id": self.device_id(),
+            "public_key": self._device_public_key_hex(),
+            "signature": private_key.sign(body).hex(),
+        }
+
+    @staticmethod
+    def _verify_device_signature(payload: Dict[str, Any], signature: Dict[str, Any]) -> bool:
+        try:
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+            if signature.get("algorithm") != "ed25519-device-v1":
+                return False
+            public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(str(signature.get("public_key") or "")))
+            public_key.verify(bytes.fromhex(str(signature.get("signature") or "")), canonical_json(payload).encode("utf-8"))
+            return True
+        except Exception:
+            return False
+
     @staticmethod
     def _file_sha256(path: Path) -> str:
         digest = hashlib.sha256()
@@ -4351,7 +6115,13 @@ class TotalRecallCore:
         if not directory.exists():
             return []
         return sorted(
-            [path for path in directory.glob("total-recall-backup-*.tar.gz") if path.is_file()],
+            [
+                path
+                for path in directory.glob("total-recall-backup-*")
+                if path.is_file()
+                and (path.name.endswith(".tar.gz") or path.name.endswith(".tar.gz.enc"))
+                and not path.name.endswith(".manifest.json")
+            ],
             key=lambda path: (path.stat().st_mtime, path.name),
             reverse=True,
         )
@@ -4374,6 +6144,40 @@ class TotalRecallCore:
     def _backup_bundle_summary(self, bundle: Path) -> Dict[str, Any]:
         if not bundle.exists():
             return {"ok": False, "error": "bundle_not_found", "bundle": str(bundle)}
+        if bundle.name.endswith(".enc"):
+            try:
+                sidecar = bundle.with_suffix(bundle.suffix + ".manifest.json")
+                if sidecar.exists():
+                    manifest = self._read_json(sidecar)
+                else:
+                    envelope = json.loads(bundle.read_text(encoding="utf-8"))
+                    manifest = envelope.get("manifest") or {}
+            except Exception as exc:
+                return {"ok": False, "error": "encrypted_manifest_unreadable", "bundle": str(bundle), "detail": str(exc)}
+            return {
+                "ok": True,
+                "bundle": str(bundle),
+                "encrypted": True,
+                "schema": manifest.get("schema"),
+                "bytes": bundle.stat().st_size,
+                "modified": datetime.fromtimestamp(bundle.stat().st_mtime, tz=timezone.utc)
+                .replace(microsecond=0)
+                .isoformat()
+                .replace("+00:00", "Z"),
+                "manifest": {
+                    "schema": manifest.get("schema"),
+                    "version": manifest.get("version"),
+                    "created_at": manifest.get("created_at"),
+                    "recipientCount": len(manifest.get("recipients") or []),
+                    "ciphertextSha256": manifest.get("ciphertext_sha256"),
+                    "bundleSha256": manifest.get("bundle_sha256"),
+                },
+                "latestCheckpoint": manifest.get("latestCheckpoint") or {
+                    "checkpoint_id": manifest.get("checkpoint_id"),
+                    "event_count": manifest.get("event_count"),
+                    "last_event_hash": manifest.get("last_event_hash"),
+                },
+            }
         checkpoints: List[Dict[str, Any]] = []
         manifest: Dict[str, Any] = {}
         with tarfile.open(bundle, "r:gz") as tar:
@@ -4475,6 +6279,29 @@ class TotalRecallCore:
             if run.returncode != 0:
                 return {"ok": False, "error": "hf_upload_failed", "provider": "huggingface", "repoId": repo_id, "results": results}
         return {"ok": True, "provider": "huggingface", "repoId": repo_id, "results": results}
+
+    def _portable_clone_hf_download(self, *, repo_id: str, filename: str) -> Dict[str, Any]:
+        if not repo_id:
+            return {"ok": False, "error": "repo_id_required", "provider": "huggingface"}
+        if not filename:
+            return {"ok": False, "error": "filename_required", "provider": "huggingface", "repoId": repo_id}
+        hf_bin = shutil.which("hf") or shutil.which("huggingface-cli")
+        if not hf_bin:
+            return {"ok": False, "error": "hf_cli_not_found", "provider": "huggingface", "repoId": repo_id}
+        out_dir = Path(tempfile.mkdtemp(prefix="total-recall-hf-download."))
+        command = [hf_bin, "download", repo_id, filename, "--repo-type", "dataset", "--local-dir", str(out_dir)]
+        run = subprocess.run(command, text=True, capture_output=True, timeout=300)
+        path = out_dir / filename
+        return {
+            "ok": run.returncode == 0 and path.exists(),
+            "provider": "huggingface",
+            "repoId": repo_id,
+            "filename": filename,
+            "path": str(path),
+            "returncode": run.returncode,
+            "stdout": _redact_secret_text(run.stdout[-1000:]),
+            "stderr": _redact_secret_text(run.stderr[-1000:]),
+        }
 
     def _loop_index(self) -> Dict[str, Dict[str, Any]]:
         loops: Dict[str, Dict[str, Any]] = {}
@@ -4630,6 +6457,54 @@ class TotalRecallCore:
         tmp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, ensure_ascii=False) + "\n", encoding="utf-8")
         shutil.move(str(tmp), str(path))
+
+    def _home_relative(self, path: Path) -> str:
+        try:
+            return path.expanduser().resolve().relative_to(self.home).as_posix()
+        except Exception:
+            return ""
+
+    def _handoff_release_allowed(self, release: Dict[str, Any]) -> bool:
+        if release.get("ok"):
+            return True
+        return release.get("error") == "remote_head_not_found"
+
+    def _summarize_operation(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        summary = {
+            "ok": bool(payload.get("ok")),
+            "status": payload.get("status"),
+            "error": payload.get("error"),
+            "message": payload.get("message"),
+        }
+        if payload.get("headFile"):
+            summary["headFile"] = payload.get("headFile")
+        if payload.get("handoffFile"):
+            summary["handoffFile"] = payload.get("handoffFile")
+        if payload.get("packetFile"):
+            summary["packetFile"] = payload.get("packetFile")
+        return {key: value for key, value in summary.items() if value not in (None, "")}
+
+    def _handoff_bootstrap_script(self, *, target: str, session_id: str, ttl_seconds: int) -> str:
+        quoted_target = shlex.quote(target)
+        quoted_session = shlex.quote(session_id)
+        ttl = max(1, int(ttl_seconds or 3600))
+        return "\n".join(
+            [
+                "#!/usr/bin/env bash",
+                "set -euo pipefail",
+                "",
+                "if ! command -v total-recall >/dev/null 2>&1; then",
+                "  python3 -m pip install total-recall-core",
+                "fi",
+                "",
+                f"total-recall backup pull --target {quoted_target}",
+                "total-recall verify --receipts",
+                "total-recall trust verify --format text",
+                f"total-recall lease acquire --target {quoted_target} --ttl {ttl}",
+                f"total-recall rehydrate --session-id {quoted_session} --mode resume --char-budget 12000",
+                "",
+            ]
+        )
 
     def _write_markdown(self, path: Path, content: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

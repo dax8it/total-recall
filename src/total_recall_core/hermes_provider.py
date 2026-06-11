@@ -81,6 +81,7 @@ VERIFY_SCHEMA = {
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "description": "Optional session id."},
+            "receipts": {"type": "boolean", "description": "Also cross-check checkpoint receipt lineage. Defaults to false."},
         },
         "required": [],
     },
@@ -122,6 +123,7 @@ REHYDRATE_SCHEMA = {
             "session_id": {"type": "string", "description": "Session id. Defaults to current Hermes session."},
             "query": {"type": "string", "description": "Optional focus query."},
             "max_results": {"type": "integer", "description": "Default 8, max 20."},
+            "mode": {"type": "string", "enum": ["keyword", "resume"], "description": "Use resume for verified session continuation packets; keyword keeps legacy search-based recall."},
         },
         "required": [],
     },
@@ -338,6 +340,19 @@ LOOP_COMPLETE_SCHEMA = {
     },
 }
 
+HANDOFF_EXPORT_SCHEMA = {
+    "name": "total_recall_handoff_export",
+    "description": "Write a verified Total Recall resume packet for handing this session to another machine or harness.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session_id": {"type": "string", "description": "Session id. Defaults to current Hermes session."},
+            "turns": {"type": "integer", "description": "Number of recent turn events to include. Defaults to Total Recall config/env or 30."},
+        },
+        "required": [],
+    },
+}
+
 ALL_SCHEMAS = [
     SEARCH_SCHEMA,
     STATUS_SCHEMA,
@@ -361,6 +376,7 @@ ALL_SCHEMAS = [
     LOOP_NOTE_SCHEMA,
     LOOP_VERIFY_SCHEMA,
     LOOP_COMPLETE_SCHEMA,
+    HANDOFF_EXPORT_SCHEMA,
 ]
 
 
@@ -376,6 +392,8 @@ class TotalRecallMemoryProvider(MemoryProvider):
         self._turn_number = 0
         self._compression_count = 0
         self._last_stale_check_turn = 0
+        self._read_only = False
+        self._lease_warning = ""
 
     @property
     def name(self) -> str:
@@ -389,6 +407,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
         self._hermes_home = str(kwargs.get("hermes_home") or os.getenv("HERMES_HOME") or Path.home() / ".hermes")
         self._home = self._configured_home()
         health = self._core().health()
+        self._refresh_lease_mode("initialize")
         if int(health.get("eventCount") or 0) > 0:
             self._schedule_auto_rehydrate(
                 "startup_or_gateway_restart",
@@ -404,20 +423,24 @@ class TotalRecallMemoryProvider(MemoryProvider):
             "`total_recall_source_ingest` for meetings/email/Slack/GitHub/CRM/tickets/calendar/agent transcripts, "
             "`total_recall_federation_query` only when explicit cross-agent/workspace authorization is provided, "
             "`total_recall_loop_inbox` plus append-only loop event tools for external worker evidence/status, "
+            "`total_recall_handoff_export` to write a verified session resume packet, "
             "`total_recall_checkpoint` before risky resets or handoffs, `total_recall_trust_verify` for release-grade hard-coded gates, and `total_recall_verify`/`total_recall_rehydrate` "
             "when continuity integrity matters. Treat returned context as source-cited recall, not as a substitute for file verification. Portable-clone restore is not exposed as a Hermes tool.\n"
             f"Total Recall home: {self._home or self._configured_home()}"
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        self._refresh_lease_mode("prefetch")
+        warning = self._lease_warning_block()
         auto = self._consume_auto_rehydrate(query, session_id=session_id or self._session_id)
         if auto:
-            return auto
+            return (warning + "\n\n" + auto).strip() if warning else auto
         if not query.strip():
-            return self._consume_prefetch()
+            cached_empty = self._consume_prefetch()
+            return (warning + "\n\n" + cached_empty).strip() if warning else cached_empty
         cached = self._consume_prefetch()
         if cached:
-            return cached
+            return (warning + "\n\n" + cached).strip() if warning else cached
         context = self._format_context(self._core().context_plan(query, session_id=session_id or self._session_id, max_results=5))
         if not context.strip() and query.strip():
             low_confidence = self._run_auto_rehydrate(
@@ -426,8 +449,8 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 session_id=session_id or self._session_id,
             )
             if low_confidence:
-                return low_confidence
-        return context
+                return (warning + "\n\n" + low_confidence).strip() if warning else low_confidence
+        return (warning + "\n\n" + context).strip() if warning else context
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not query.strip():
@@ -450,6 +473,15 @@ class TotalRecallMemoryProvider(MemoryProvider):
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         if not user_content.strip() and not assistant_content.strip():
             return
+        if self._read_only:
+            self._queue_pending_event(
+                kind="turn",
+                text=f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}".strip(),
+                session_id=session_id or self._session_id,
+                source="hermes.sync_turn",
+                metadata={"provider": "hermes.total-recall", "queued_reason": "lease_read_only"},
+            )
+            return
         try:
             self._core().sync_turn(
                 user_content,
@@ -469,6 +501,15 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 text_parts.append(f"{role}: {content.strip()[:1200]}")
         if not text_parts:
             return
+        if self._read_only:
+            self._queue_pending_event(
+                kind="session_end",
+                text="\n".join(text_parts),
+                session_id=self._session_id,
+                source="hermes.on_session_end",
+                metadata={"queued_reason": "lease_read_only"},
+            )
+            return
         try:
             self._core().ingest(
                 kind="session_end",
@@ -485,6 +526,15 @@ class TotalRecallMemoryProvider(MemoryProvider):
         self._session_id = new_session_id or "default"
         reason = str(kwargs.get("reason") or ("new_session" if reset else "session_switch"))
         try:
+            if self._read_only:
+                self._queue_pending_event(
+                    kind="session_switch",
+                    text=f"Session switched from {old or 'unknown'} to {self._session_id}. reset={reset}. reason={reason}",
+                    session_id=self._session_id,
+                    source="hermes.on_session_switch",
+                    metadata={"parent_session_id": parent_session_id, "reset": reset, "reason": reason, "queued_reason": "lease_read_only"},
+                )
+                raise RuntimeError("lease_read_only")
             self._core().ingest(
                 kind="session_switch",
                 text=f"Session switched from {old or 'unknown'} to {self._session_id}. reset={reset}. reason={reason}",
@@ -493,7 +543,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 metadata={"parent_session_id": parent_session_id, "reset": reset, "reason": reason},
             )
         except Exception as exc:
-            logger.debug("total-recall session switch ingest failed: %s", exc)
+            logger.debug("total-recall session switch ingest skipped/failed: %s", exc)
         if reset:
             trigger = "after_new_session"
         elif reason == "resume":
@@ -520,13 +570,22 @@ class TotalRecallMemoryProvider(MemoryProvider):
         query = " ".join(recent)[-1600:] or "active continuity state decisions blockers next actions"
         try:
             core = self._core()
-            core.ingest(
-                kind="pre_compress",
-                text=query,
-                session_id=self._session_id,
-                source="hermes.on_pre_compress",
-                metadata={"message_count": len(messages)},
-            )
+            if self._read_only:
+                self._queue_pending_event(
+                    kind="pre_compress",
+                    text=query,
+                    session_id=self._session_id,
+                    source="hermes.on_pre_compress",
+                    metadata={"message_count": len(messages), "queued_reason": "lease_read_only"},
+                )
+            else:
+                core.ingest(
+                    kind="pre_compress",
+                    text=query,
+                    session_id=self._session_id,
+                    source="hermes.on_pre_compress",
+                    metadata={"message_count": len(messages)},
+                )
             block = self._format_context(core.context_plan(query, session_id=self._session_id, max_results=8))
             if self._compression_count >= self._auto_rehydrate_config().get("compression_count_threshold", 2):
                 self._schedule_auto_rehydrate(
@@ -540,6 +599,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self._turn_number = int(turn_number or 0)
+        self._refresh_lease_mode("turn_start")
         cfg = self._auto_rehydrate_config()
         if not cfg.get("enabled", True):
             return
@@ -566,6 +626,15 @@ class TotalRecallMemoryProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Dict[str, Any] | None = None) -> None:
         if action == "remove":
+            return
+        if self._read_only:
+            self._queue_pending_event(
+                kind=f"memory_{action}",
+                text=content,
+                session_id=str((metadata or {}).get("session_id") or self._session_id),
+                source=f"hermes.memory.{target}",
+                metadata={**(metadata or {}), "queued_reason": "lease_read_only"},
+            )
             return
         try:
             self._core().ingest(
@@ -642,6 +711,16 @@ class TotalRecallMemoryProvider(MemoryProvider):
 
     def _handle_tool(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         core = self._core()
+        if self._read_only and tool_name in {
+            "total_recall_checkpoint",
+            "total_recall_source_ingest",
+            "total_recall_loop_start",
+            "total_recall_loop_note",
+            "total_recall_loop_verify",
+            "total_recall_loop_complete",
+            "total_recall_handoff_export",
+        }:
+            return {"ok": False, "status": "READ_ONLY_LEASE_HELD", "warning": self._lease_warning}
         if tool_name == "total_recall_search":
             query = str(args.get("query") or "").strip()
             if not query:
@@ -659,7 +738,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 label=str(args.get("label") or ""),
             )
         if tool_name == "total_recall_verify":
-            return core.verify(session_id=str(args.get("session_id") or "").strip() or self._session_id)
+            return core.verify(session_id=str(args.get("session_id") or "").strip() or self._session_id, receipts=bool(args.get("receipts")))
         if tool_name == "total_recall_trust_verify":
             return core.trust_gate_run(persist=bool(args.get("persist", True)))
         if tool_name == "total_recall_learning_review":
@@ -674,6 +753,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 session_id=str(args.get("session_id") or "").strip() or self._session_id,
                 query=str(args.get("query") or ""),
                 max_results=min(max(int(args.get("max_results") or 8), 1), 20),
+                mode=str(args.get("mode") or "keyword"),
             )
         if tool_name == "total_recall_incidents":
             action = str(args.get("action") or "list")
@@ -805,6 +885,12 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 summary=str(args.get("summary") or ""),
                 evidence=evidence,
             )
+        if tool_name == "total_recall_handoff_export":
+            turns = args.get("turns")
+            return core.handoff_export(
+                session_id=str(args.get("session_id") or "").strip() or self._session_id,
+                turns=int(turns) if turns not in {None, ""} else None,
+            )
         return {"ok": False, "error": f"unknown Total Recall tool: {tool_name}"}
 
     def _core(self) -> TotalRecallCore:
@@ -900,6 +986,78 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 pass
         return defaults
 
+    def _lease_config(self) -> Dict[str, Any]:
+        defaults = {
+            "target": os.getenv("TOTAL_RECALL_REMOTE_TARGET", ""),
+            "enforce": os.getenv("TOTAL_RECALL_LEASE_ENFORCE", "block"),
+            "check_every_turns": int(os.getenv("TOTAL_RECALL_LEASE_CHECK_EVERY_TURNS", "1") or "1"),
+        }
+        try:
+            from hermes_cli.config import cfg_get, load_config
+
+            cfg = load_config()
+            configured = cfg_get(cfg, "memory", "total-recall", "lease", default={}) or {}
+            if isinstance(configured, dict):
+                defaults.update({k: v for k, v in configured.items() if v is not None})
+        except Exception:
+            pass
+        defaults["enforce"] = str(defaults.get("enforce") or "block")
+        try:
+            defaults["check_every_turns"] = max(1, int(defaults.get("check_every_turns") or 1))
+        except Exception:
+            defaults["check_every_turns"] = 1
+        return defaults
+
+    def _refresh_lease_mode(self, reason: str) -> None:
+        cfg = self._lease_config()
+        target = str(cfg.get("target") or "").strip()
+        if not target:
+            self._read_only = False
+            self._lease_warning = ""
+            return
+        if reason == "turn_start" and self._turn_number % int(cfg.get("check_every_turns") or 1) != 0:
+            return
+        try:
+            status = self._core().lease_status(target=target)
+        except Exception as exc:
+            logger.debug("total-recall lease status failed: %s", exc)
+            return
+        lease = status.get("lease") or {}
+        held_by_other = bool(status.get("active")) and not bool(status.get("heldBySelf"))
+        if held_by_other and str(cfg.get("enforce") or "block") == "block":
+            self._read_only = True
+            self._lease_warning = (
+                "Another Total Recall device holds the remote write lease. "
+                f"holder={lease.get('holder_device_id')} expires_at={lease.get('expires_at')}. "
+                "Provider writes are queued to state/pending_events.jsonl."
+            )
+        else:
+            self._read_only = False
+            self._lease_warning = ""
+
+    def _lease_warning_block(self) -> str:
+        if not self._read_only:
+            return ""
+        return "[Total Recall Lease]\nstatus: READ_ONLY\n" + self._lease_warning
+
+    def _queue_pending_event(self, *, kind: str, text: str, session_id: str, source: str, metadata: Dict[str, Any]) -> None:
+        path = Path(self._configured_home()) / "state" / "pending_events.jsonl"
+        payload = {
+            "schema": "total-recall-pending-event-v1",
+            "queued_at": time.time(),
+            "kind": kind,
+            "text": text,
+            "session_id": session_id or self._session_id or "default",
+            "source": source,
+            "metadata": metadata or {},
+        }
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(payload, sort_keys=True, ensure_ascii=False) + "\n")
+        except Exception as exc:
+            logger.warning("total-recall pending event queue failed: %s", exc)
+
     def _schedule_auto_rehydrate(self, reason: str, *, query: str = "", force: bool = False) -> None:
         cfg = self._auto_rehydrate_config()
         if not cfg.get("enabled", True):
@@ -942,11 +1100,20 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 f"failures: {failures}\n"
                 "Use `total_recall_verify` before trusting prior continuity."
             )
+        mode = "resume" if reason in {"startup_or_gateway_restart", "after_resume", "after_new_session", "after_compaction"} else "keyword"
         payload = core.rehydrate(
             session_id=session_id,
             query=query or "active continuity state decisions blockers next actions",
             max_results=8,
+            mode=mode,
         )
+        if not payload.get("ok") and mode == "resume" and payload.get("status") == "NO_RESUME_PACKET":
+            payload = core.rehydrate(
+                session_id=session_id,
+                query=query or "active continuity state decisions blockers next actions",
+                max_results=8,
+                mode="keyword",
+            )
         self._record_auto_rehydrate(reason, session_id, ok=bool(payload.get("ok")))
         if not payload.get("ok"):
             return ""

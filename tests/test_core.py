@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +15,7 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from total_recall_core import TotalRecallConfig, TotalRecallCore
+from total_recall_core.api import canonical_json, sha256_json
 
 
 def test_ingest_search_checkpoint_verify_rehydrate(tmp_path):
@@ -50,6 +53,70 @@ def test_ingest_search_checkpoint_verify_rehydrate(tmp_path):
     assert rehydrated["ok"] is True
     assert "Total Recall Rehydrate Authority" in rehydrated["context_block"]
     assert "smoke test memory" in rehydrated["context_block"]
+
+
+def test_session_end_checkpoint_writes_resume_packet_and_resume_rehydrates_verbatim(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    verbatim_tail = "NEXT ACTION: preserve this exact long handoff marker " + ("alpha " * 260) + "omega-tail"
+    core.sync_turn("First continuity turn.", "Stored first turn.", session_id="handoff-session")
+    core.sync_turn(verbatim_tail, "Assistant keeps the handoff marker verbatim.", session_id="handoff-session")
+
+    checkpoint = core.checkpoint(session_id="handoff-session", label="session_end")
+
+    packet_info = checkpoint["resumePacket"]
+    packet_path = Path(packet_info["packetFile"])
+    assert packet_info["ok"] is True
+    assert packet_path.exists()
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    assert packet["schema"] == "total-recall-resume-packet-v1"
+    assert packet["recent_turns"][-1]["text"].endswith("Assistant keeps the handoff marker verbatim.")
+    assert "omega-tail" in packet["recent_turns"][-1]["text"]
+    assert packet["ledger"]["last_event_hash"] == checkpoint["checkpoint"]["last_event_hash"]
+    assert any("NEXT ACTION" in action for action in packet["next_actions"])
+
+    resumed = core.rehydrate(session_id="handoff-session", mode="resume", char_budget=12000)
+    assert resumed["ok"] is True
+    assert resumed["mode"] == "resume"
+    assert "Total Recall Resume Packet Authority" in resumed["context_block"]
+    assert "omega-tail" in resumed["context_block"]
+
+    bundle = tmp_path / "with-continuation.tar.gz"
+    exported = core.export_bundle(str(bundle))
+    assert exported["ok"] is True
+    with tarfile.open(bundle, "r:gz") as tar:
+        assert any(name.startswith("continuation/handoff-session/packet_") for name in tar.getnames())
+
+
+def test_resume_rehydrate_fails_closed_when_ledger_is_tampered(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.sync_turn("Tamper-protected resume turn.", "Stored.", session_id="resume-tamper")
+    core.checkpoint(session_id="resume-tamper", label="session_end")
+
+    lines = (tmp_path / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    event = json.loads(lines[0])
+    event["text"] = "Tampered resume turn."
+    lines[0] = json.dumps(event, sort_keys=True, separators=(",", ":"))
+    (tmp_path / "ledger" / "events.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    resumed = core.rehydrate(session_id="resume-tamper", mode="resume")
+    assert resumed["ok"] is False
+    assert resumed["status"] == "FAIL_CLOSED"
+
+
+def test_resume_packet_with_unknown_last_hash_is_ignored_and_keyword_fallback_runs(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.sync_turn("Known packet hash fallback marker.", "Stored.", session_id="resume-fallback")
+    checkpoint = core.checkpoint(session_id="resume-fallback", label="session_end")
+    packet_path = Path(checkpoint["resumePacket"]["packetFile"])
+    packet = json.loads(packet_path.read_text(encoding="utf-8"))
+    packet["ledger"]["last_event_hash"] = "unknown-to-this-ledger"
+    packet_path.write_text(json.dumps(packet, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    resumed = core.rehydrate(session_id="resume-fallback", query="fallback marker", mode="resume")
+    assert resumed["ok"] is True
+    assert resumed["mode"] == "keyword"
+    assert "Total Recall Rehydrate Authority" in resumed["context_block"]
+    assert "Total Recall Resume Packet Authority" not in resumed["context_block"]
 
 
 def test_portable_clone_export_encrypts_and_restore_bootstrap_verifies(tmp_path):
@@ -194,6 +261,132 @@ def test_loop_cli_start_and_inbox_json(tmp_path):
     inbox_payload = json.loads(inbox.stdout)
     assert inbox_payload["count"] == 1
     assert inbox_payload["loops"][0]["agent"] == "smarty"
+
+
+def test_new_events_include_origin_and_self_device_registry(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+
+    ingested = core.ingest(kind="note", text="Origin identity memory.", session_id="origin")
+
+    origin = ingested["event"]["origin"]
+    assert origin["device_id"] == core.device_id()
+    assert origin["harness"] == "cli"
+    assert origin["host"]
+    device_file = tmp_path / "devices" / f"device_{origin['device_id']}.json"
+    assert device_file.exists()
+    device = json.loads(device_file.read_text(encoding="utf-8"))
+    assert device["approved_at"]
+    assert device["revoked_at"] is None
+    assert device["x25519_public_key"]
+    assert (tmp_path / "keys" / "device.ed25519").exists()
+    assert (tmp_path / "keys" / "device.x25519").exists()
+
+    checkpoint = core.checkpoint(session_id="origin")
+    assert checkpoint["ok"] is True
+    assert (tmp_path / "keys" / "anchor.ed25519").read_text(encoding="utf-8") != (tmp_path / "keys" / "device.ed25519").read_text(encoding="utf-8")
+
+
+def test_legacy_events_without_origin_still_verify(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    base = {
+        "event_id": "evt_legacy_originless",
+        "timestamp": "2026-01-01T00:00:00Z",
+        "kind": "note",
+        "session_id": "legacy",
+        "scope": "private",
+        "source": "legacy-test",
+        "text": "Legacy event without origin.",
+        "metadata": {},
+        "prev_hash": None,
+    }
+    event = {**base, "hash": sha256_json(base)}
+    (tmp_path / "ledger").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "ledger" / "events.jsonl").write_text(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+    checkpoint = core.checkpoint(session_id="legacy")
+    verified = core.verify(session_id="legacy")
+
+    assert checkpoint["ok"] is True
+    assert verified["ok"] is True
+    state = core.reduce_state(write=True)
+    assert state["memories"][0]["origin"] == {}
+
+
+def test_device_registry_crud(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+
+    initialized = core.device_init(label="Laptop A")
+    self_id = initialized["device"]["device_id"]
+    assert initialized["device"]["label"] == "Laptop A"
+    assert initialized["device"]["approved_at"]
+
+    public_key = "11" * 32
+    external_id = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()[:16]
+    approved = core.device_approve(external_id, public_key=public_key, x25519_public_key="22" * 32, label="Harness B")
+    assert approved["ok"] is True
+    assert approved["device"]["device_id"] == external_id
+    assert approved["device"]["x25519_public_key"] == "22" * 32
+    assert approved["device"]["revoked_at"] is None
+
+    listed = core.device_list()
+    ids = {device["device_id"] for device in listed["devices"]}
+    assert {self_id, external_id} <= ids
+
+    revoked = core.device_revoke(external_id)
+    assert revoked["ok"] is True
+    assert revoked["device"]["revoked_at"]
+
+
+def test_handoff_export_cli_writes_resume_packet_json(tmp_path):
+    env = os.environ.copy()
+    env["PYTHONPATH"] = "src"
+    home = tmp_path / "cli-handoff"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(home),
+            "ingest",
+            "--kind",
+            "turn",
+            "--text",
+            "NEXT ACTION: CLI handoff packet marker.",
+            "--session-id",
+            "cli-session",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    exported = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "total_recall_core.cli",
+            "--home",
+            str(home),
+            "handoff",
+            "export",
+            "--session-id",
+            "cli-session",
+            "--format",
+            "json",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    payload = json.loads(exported.stdout)
+    assert payload["ok"] is True
+    assert Path(payload["packetFile"]).exists()
+    assert payload["packet"]["packet"]["schema"] == "total-recall-resume-packet-v1"
 
 
 def test_verify_fails_closed_when_anchor_is_tampered(tmp_path):
@@ -1083,6 +1276,334 @@ def test_export_import_doctor_round_trip(tmp_path):
     assert imported.search("Exported continuity memory")["results"]
 
 
+def test_plain_export_excludes_keys_by_default_and_requires_include_keys(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Plain export key hygiene memory.", session_id="export")
+    core.checkpoint(session_id="export")
+
+    safe_bundle = tmp_path / "safe.tar.gz"
+    safe = core.export_bundle(str(safe_bundle))
+    assert safe["ok"] is True
+    assert safe["includeKeys"] is False
+    with tarfile.open(safe_bundle, "r:gz") as tar:
+        assert not any(name.startswith("keys/") for name in tar.getnames())
+
+    key_bundle = tmp_path / "keys.tar.gz"
+    with_keys = core.export_bundle(str(key_bundle), include_keys=True)
+    assert with_keys["ok"] is True
+    with tarfile.open(key_bundle, "r:gz") as tar:
+        assert any(name.startswith("keys/") for name in tar.getnames())
+
+
+def test_backup_run_defaults_to_encrypted_envelope_and_status_reads_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "backup-passphrase")
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    backup_dir = tmp_path / "backups"
+    core.ingest(kind="note", text="Encrypted backup default memory.", session_id="backup")
+
+    result = core.backup_run(str(backup_dir), keep=10)
+
+    assert result["ok"] is True
+    assert result["encrypted"] is True
+    encrypted_path = Path(result["backup"]["encryptedBundle"])
+    manifest_path = Path(result["backup"]["manifestFile"])
+    assert encrypted_path.exists()
+    assert manifest_path.exists()
+    assert encrypted_path.name.endswith(".tar.gz.enc")
+    assert not list(backup_dir.glob("*.tar.gz"))
+    assert b"Encrypted backup default memory" not in encrypted_path.read_bytes()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema"] == "total-recall-encrypted-backup-v1"
+    assert manifest["event_count"] == result["verification"]["currentEventCount"]
+    assert any(recipient["type"] == "device-x25519" for recipient in manifest["recipients"])
+    assert any(recipient["type"] == "passphrase-pbkdf2" for recipient in manifest["recipients"])
+
+    status = core.backup_status(str(backup_dir))
+    assert status["count"] == 1
+    summary = core.sync_status(str(backup_dir))
+    assert summary["relation"] == "in_sync"
+    assert summary["archive"]["encrypted"] is True
+
+
+def test_backup_restore_round_trip_with_passphrase(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "restore-passphrase")
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    source.ingest(kind="note", text="Passphrase restore continuity memory.", session_id="restore")
+    backup = source.backup_run(str(tmp_path / "backups"), keep=10)
+
+    restored = TotalRecallCore(TotalRecallConfig(home=tmp_path / "restored", enable_lancedb=False, enable_qmd=False))
+    result = restored.backup_restore(backup["backup"]["encryptedBundle"], replace=True)
+
+    assert result["ok"] is True
+    assert result["recipient"]["type"] == "passphrase-pbkdf2"
+    assert restored.search("Passphrase restore continuity")["count"] == 1
+
+
+def test_backup_restore_round_trip_with_device_key(tmp_path):
+    source_home = tmp_path / "source"
+    source = TotalRecallCore(TotalRecallConfig(home=source_home, enable_lancedb=False, enable_qmd=False))
+    source.ingest(kind="note", text="Device key restore continuity memory.", session_id="restore")
+    backup = source.backup_run(str(tmp_path / "backups"), keep=10)
+
+    restored_home = tmp_path / "restored-device"
+    (restored_home / "keys").mkdir(parents=True)
+    for key_file in source_home.joinpath("keys").glob("device.*"):
+        shutil.copy2(key_file, restored_home / "keys" / key_file.name)
+    restored = TotalRecallCore(TotalRecallConfig(home=restored_home, enable_lancedb=False, enable_qmd=False))
+    result = restored.backup_restore(backup["backup"]["encryptedBundle"], replace=True)
+
+    assert result["ok"] is True
+    assert result["recipient"]["type"] == "device-x25519"
+    assert restored.search("Device key restore continuity")["count"] == 1
+
+
+def test_revoked_device_is_not_in_backup_recipients(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Revoked recipient memory.", session_id="backup")
+    public_key = "33" * 32
+    revoked_id = hashlib.sha256(bytes.fromhex(public_key)).hexdigest()[:16]
+    approved = core.device_approve(revoked_id, public_key=public_key, x25519_public_key="44" * 32, label="Revoked Harness")
+    assert approved["ok"] is True
+    core.device_revoke(revoked_id)
+
+    backup = core.backup_run(str(tmp_path / "backups"), keep=10)
+    recipients = backup["backup"]["manifest"]["recipients"]
+
+    assert revoked_id not in {recipient.get("device_id") for recipient in recipients}
+
+
+def test_backup_push_pull_round_trip_via_local_folder_target(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "remote-passphrase")
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    source.ingest(kind="note", text="Remote push pull continuity memory.", session_id="remote")
+
+    pushed = source.backup_push(target=str(remote))
+
+    assert pushed["ok"] is True
+    head_path = remote / "HEAD.json"
+    assert head_path.exists()
+    head = json.loads(head_path.read_text(encoding="utf-8"))
+    assert head["schema"] == "total-recall-remote-head-v1"
+    assert head["store_id"] == source.store_id()
+    assert (remote / head["latest"]["bundle"]).exists()
+
+    restored = TotalRecallCore(TotalRecallConfig(home=tmp_path / "restored", enable_lancedb=False, enable_qmd=False))
+    checked = restored.sync_check(target=str(remote))
+    assert checked["ok"] is True
+    assert checked["relation"]["relation"] == "archive_ahead"
+
+    pulled = restored.backup_pull(target=str(remote))
+    assert pulled["ok"] is True
+    assert pulled["relation"]["relation"] == "archive_ahead"
+    assert restored.search("Remote push pull continuity")["count"] == 1
+    assert restored.store_id() == source.store_id()
+
+
+def test_backup_pull_refuses_diverged_local_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "remote-passphrase")
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    source.ingest(kind="note", text="Remote canonical event.", session_id="remote")
+    source.backup_push(target=str(remote))
+
+    local = TotalRecallCore(TotalRecallConfig(home=tmp_path / "local", enable_lancedb=False, enable_qmd=False))
+    local._set_store_id(source.store_id())
+    local.ingest(kind="note", text="Different local event at same count.", session_id="remote")
+
+    pulled = local.backup_pull(target=str(remote))
+
+    assert pulled["ok"] is False
+    assert pulled["status"] == "DIVERGED"
+
+
+def test_backup_pull_refuses_remote_head_signature_mismatch(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "remote-passphrase")
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    source.ingest(kind="note", text="Signed head memory.", session_id="remote")
+    source.backup_push(target=str(remote))
+    head_path = remote / "HEAD.json"
+    head = json.loads(head_path.read_text(encoding="utf-8"))
+    head["latest"]["event_count"] = 999
+    head_path.write_text(json.dumps(head, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    target = TotalRecallCore(TotalRecallConfig(home=tmp_path / "target", enable_lancedb=False, enable_qmd=False))
+    pulled = target.backup_pull(target=str(remote))
+
+    assert pulled["ok"] is False
+    assert pulled["error"] == "remote_head_signature_invalid"
+
+
+def test_lease_acquire_blocks_second_device_until_expired(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "lease-passphrase")
+    owner = TotalRecallCore(TotalRecallConfig(home=tmp_path / "owner", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    owner.ingest(kind="note", text="Lease owner memory.", session_id="lease")
+    owner.backup_push(target=str(remote))
+
+    acquired = owner.lease_acquire(target=str(remote), ttl_seconds=3600)
+    assert acquired["ok"] is True
+    assert acquired["lease"]["holder_device_id"] == owner.device_id()
+
+    second = TotalRecallCore(TotalRecallConfig(home=tmp_path / "second", enable_lancedb=False, enable_qmd=False))
+    blocked = second.lease_acquire(target=str(remote), ttl_seconds=3600)
+    assert blocked["ok"] is False
+    assert blocked["status"] == "LEASE_HELD"
+
+    head_path = remote / "HEAD.json"
+    head = json.loads(head_path.read_text(encoding="utf-8"))
+    expired_base = {k: v for k, v in head["lease"].items() if k != "signature"}
+    expired_base["expires_at"] = "2000-01-01T00:00:00Z"
+    head["lease"] = {**expired_base, "signature": owner._device_sign_json(expired_base)}
+    head_path.write_text(json.dumps(head, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    acquired_after_expiry = second.lease_acquire(target=str(remote), ttl_seconds=3600)
+    assert acquired_after_expiry["ok"] is True
+    assert acquired_after_expiry["lease"]["holder_device_id"] == second.device_id()
+
+
+def test_lease_steal_requires_force_and_records_incident_event(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "lease-passphrase")
+    owner = TotalRecallCore(TotalRecallConfig(home=tmp_path / "owner", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    owner.ingest(kind="note", text="Lease steal owner memory.", session_id="lease")
+    owner.backup_push(target=str(remote))
+    owner.lease_acquire(target=str(remote), ttl_seconds=3600)
+    second = TotalRecallCore(TotalRecallConfig(home=tmp_path / "second", enable_lancedb=False, enable_qmd=False))
+
+    denied = second.lease_steal(target=str(remote), force=False)
+    stolen = second.lease_steal(target=str(remote), force=True)
+
+    assert denied["ok"] is False
+    assert stolen["ok"] is True
+    assert stolen["status"] == "STOLEN"
+    assert stolen["incident"]["title"] == "Remote lease stolen"
+    events = second._read_events(verify_chain=True)
+    assert events[-1]["kind"] == "lease_steal"
+
+
+def test_sync_fork_import_quarantines_archive_suffix_and_promote_rehashes(tmp_path):
+    base = TotalRecallCore(TotalRecallConfig(home=tmp_path / "base", enable_lancedb=False, enable_qmd=False))
+    base.ingest(kind="note", text="Shared fork base memory.", session_id="fork")
+    base.checkpoint(session_id="fork")
+    base_bundle = tmp_path / "base.tar.gz"
+    base.export_bundle(str(base_bundle), include_keys=True)
+
+    local = TotalRecallCore(TotalRecallConfig(home=tmp_path / "local", enable_lancedb=False, enable_qmd=False))
+    archive = TotalRecallCore(TotalRecallConfig(home=tmp_path / "archive", enable_lancedb=False, enable_qmd=False))
+    assert local.import_bundle(str(base_bundle))["ok"] is True
+    assert archive.import_bundle(str(base_bundle))["ok"] is True
+    local.ingest(kind="note", text="Local-only divergent memory.", session_id="fork")
+    archive_event = archive.ingest(kind="note", text="Archive-only divergent memory.", session_id="fork")["event"]
+    archive.checkpoint(session_id="fork")
+    archive_bundle = tmp_path / "archive.tar.gz"
+    archive.export_bundle(str(archive_bundle), include_keys=True)
+
+    imported = local.sync_fork_import(str(archive_bundle))
+
+    assert imported["ok"] is True
+    assert imported["commonPrefixEvents"] == 1
+    assert imported["quarantinedCount"] == 2
+    item = next(item for item in imported["quarantined"] if item["text"] == "Archive-only divergent memory.")
+    assert item["text"] == "Archive-only divergent memory."
+    provenance = item["metadata"]["fork_import"]
+    assert provenance["original_event_hash"] == archive_event["hash"]
+    assert provenance["fork_base_hash"]
+    assert local._read_events(verify_chain=True)[-1]["text"] == "Local-only divergent memory."
+    local.checkpoint(session_id="fork")
+    assert local.verify(session_id="fork")["ok"] is True
+
+    promoted = local.external_promote(item["external_id"], session_id="fork")
+    assert promoted["ok"] is True
+    assert promoted["event"]["kind"] == "external_promoted"
+    assert promoted["event"]["hash"] != archive_event["hash"]
+    assert local.search("Archive-only divergent memory")["count"] >= 1
+    local.checkpoint(session_id="fork")
+    assert local.verify(session_id="fork")["ok"] is True
+
+
+def test_import_bundle_appends_re_anchor_and_checkpoint_receipt(tmp_path):
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    source.ingest(kind="note", text="Re-anchor import memory.", session_id="restore")
+    source.checkpoint(session_id="restore")
+    bundle = tmp_path / "source.tar.gz"
+    source.export_bundle(str(bundle), include_keys=True)
+
+    restored = TotalRecallCore(TotalRecallConfig(home=tmp_path / "restored", enable_lancedb=False, enable_qmd=False))
+    imported = restored.import_bundle(str(bundle))
+
+    assert imported["ok"] is True
+    assert imported["reAnchor"]["event"]["kind"] == "re_anchor"
+    assert imported["checkpoint"]["checkpoint"]["label"] == "import_bundle"
+    receipts = (tmp_path / "restored" / "anchors" / "receipts.jsonl").read_text(encoding="utf-8").splitlines()
+    assert receipts
+    assert restored.verify(session_id="re-anchor", receipts=True)["ok"] is True
+
+
+def test_verify_receipts_flags_lineage_mismatch_and_records_incident(tmp_path):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Receipt mismatch memory.", session_id="receipts")
+    checkpoint = core.checkpoint(session_id="receipts")
+    receipt_path = tmp_path / "anchors" / "receipts.jsonl"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8").splitlines()[-1])
+    base = {k: v for k, v in receipt.items() if k != "signature"}
+    base["last_event_hash"] = "not-in-this-chain"
+    receipt_path.write_text(canonical_json({**base, "signature": core._device_sign_json(base)}) + "\n", encoding="utf-8")
+
+    verified = core.verify(checkpoint_file=checkpoint["checkpointFile"], receipts=True)
+
+    assert verified["ok"] is False
+    assert "receipt_lineage_mismatch" in verified["failures"]
+    incidents = core.list_incidents(status="OPEN")
+    assert incidents["count"] == 1
+
+
+def test_backup_push_merges_checkpoint_receipts_into_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "receipt-passphrase")
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Receipt head memory.", session_id="receipts")
+    core.checkpoint(session_id="receipts")
+    remote = tmp_path / "remote"
+
+    pushed = core.backup_push(target=str(remote))
+
+    assert pushed["ok"] is True
+    head = json.loads((remote / "HEAD.json").read_text(encoding="utf-8"))
+    assert head["receipts"]
+    assert head["receipts"][-1]["checkpoint_id"]
+
+
+def test_handoff_issue_accept_pulls_verifies_leases_and_resumes(tmp_path, monkeypatch):
+    monkeypatch.setenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "handoff-passphrase")
+    source = TotalRecallCore(TotalRecallConfig(home=tmp_path / "source", enable_lancedb=False, enable_qmd=False))
+    remote = tmp_path / "remote"
+    marker = "NEXT ACTION: accept this handoff with verbatim continuity."
+    source.sync_turn("Issue the handoff.", marker, session_id="handoff-session")
+
+    issued = source.handoff_issue(target=str(remote), session_id="handoff-session", turns=5)
+
+    assert issued["ok"] is True
+    assert Path(issued["handoffFile"]).exists()
+    assert Path(issued["bootstrapScript"]).exists()
+    assert "TOTAL_RECALL_BACKUP_PASSPHRASE" in "\n".join(issued["instructions"])
+    head = json.loads((remote / "HEAD.json").read_text(encoding="utf-8"))
+    assert head["lease"] is None
+    assert head["latest"]["bundle"]
+
+    accepted = TotalRecallCore(TotalRecallConfig(home=tmp_path / "accepted", enable_lancedb=False, enable_qmd=False))
+    result = accepted.handoff_accept(issued["handoffFile"])
+
+    assert result["ok"] is True
+    assert result["verification"]["ok"] is True
+    assert result["trustGate"]["ok"] is True
+    assert result["lease"]["status"] == "ACQUIRED"
+    assert result["resume"]["mode"] == "resume"
+    assert marker in result["resumeBlock"]
+    accepted_head = json.loads((remote / "HEAD.json").read_text(encoding="utf-8"))
+    assert accepted_head["lease"]["holder_device_id"] == accepted.device_id()
+
+
 def test_trust_gate_persists_hardcoded_execution_report(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path / "store", enable_lancedb=False, enable_qmd=False))
     core.ingest_source(
@@ -1110,6 +1631,7 @@ def test_trust_gate_persists_hardcoded_execution_report(tmp_path):
         "real_store_knowledge_authority",
         "real_store_export_import_round_trip",
         "fixture_source_ingest_ledgered",
+        "fixture_event_origin_device_identity",
         "fixture_freshness_supersession",
         "fixture_temporal_graph_timeline",
         "fixture_obsidian_preview_no_ledger_write",
@@ -1118,6 +1640,12 @@ def test_trust_gate_persists_hardcoded_execution_report(tmp_path):
         "fixture_federation_authorization_required",
         "fixture_federation_workspace_separated",
         "fixture_persistence_checkpoint_export_import",
+        "fixture_resume_packet_rehydrate_verbatim",
+        "fixture_encrypted_backup_restore",
+        "fixture_receipt_lineage_verify",
+        "fixture_remote_head_push_pull",
+        "fixture_single_writer_lease_blocks_second_device",
+        "fixture_fork_import_quarantine_promote",
         "fixture_hermes_plugin_bundle_surface",
     } <= check_names
     assert all(check["ok"] for check in gate["checks"] if check["name"].startswith("fixture_"))

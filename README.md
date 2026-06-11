@@ -28,10 +28,13 @@ It gives you a local trust spine for agent continuity:
 - deterministic state reduction
 - signed checkpoints and anchors
 - fail-closed verification and rehydrate
+- verified session resume packets for compaction/restart/handoff continuity
 - cited recall and Knowledge Engine answers
 - freshness checks for stale/superseded promises and decisions
 - temporal graph timelines for "what did we know then?"
 - explicit federation instead of silent cross-workspace memory soup
+- encrypted backup push/pull with device identity, leases, fork-import, receipts,
+  and handoff bootstrap artifacts
 - dashboard/operator console for trust, incidents, knowledge, vault, and backups
 
 Start here:
@@ -89,6 +92,9 @@ total-recall hermes bundle --out dist/total-recall-hermes-plugin.tar.gz
 - signed anchor verification
 - fail-closed verify and rehydrate
 - hard-coded trust gate for release/day-one execution verification
+- resume-packet handoff export and fail-closed resume rehydrate
+- device registry, encrypted backup restore, remote HEAD push/pull, single-writer
+  leases, fork-import quarantine, receipt verification, and handoff issue/accept
 - incident artifacts
 - external-memory quarantine, promote, and reject flow
 - file/folder document ingest for basic local context without a separate brain layer
@@ -266,10 +272,17 @@ total-recall verify --session-id main
 total-recall trust verify
 total-recall learning review --session-id nightly-learning --format text
 total-recall rehydrate --session-id main --query "Remember"
+total-recall handoff export --session-id main
 total-recall doctor
 total-recall export --out total-recall-backup.tar.gz
 total-recall import total-recall-backup.tar.gz
 total-recall backup run --out-dir ~/total-recall-backups --keep 14 --keep-days 90
+total-recall backup push --target ~/total-recall-remote
+total-recall backup pull --target ~/total-recall-remote
+total-recall lease acquire --target ~/total-recall-remote
+total-recall sync fork-import ~/total-recall-remote
+total-recall handoff issue --target ~/total-recall-remote --session-id main
+total-recall handoff accept ~/.total-recall/handoff/<handoff-id>.json
 total-recall backup status --out-dir ~/total-recall-backups
 total-recall dashboard --backup-dir ~/total-recall-backups --keep 14 --keep-days 90
 PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
@@ -310,6 +323,31 @@ Verification fails closed when:
 During verification, Total Recall rebuilds derived indexes from the ledger after
 the authoritative checks. A tampered or stale derived index is overwritten from
 trusted ledger state rather than trusted directly.
+
+Device identity is separate from the store anchor key. New events include a
+hashed origin with the local device id, while device keys sign remote HEADs,
+leases, and checkpoint receipts. Imported/restored stores append a `re_anchor`
+event and checkpoint locally. Remote artifacts, resume packets, handoff JSON,
+and bootstrap scripts are derived transport aids; they are never trusted until
+the pulled ledger verifies and, for receipt-aware flows, `verify --receipts`
+passes.
+
+## Continuity Handoff
+
+For local-to-online-to-local continuity, use encrypted push/pull plus a
+single-writer lease:
+
+```bash
+total-recall handoff issue --target ~/total-recall-remote --session-id main
+total-recall handoff accept ~/.total-recall/handoff/<handoff-id>.json
+```
+
+`handoff issue` releases any self-held lease, writes a resume packet, pushes an
+encrypted backup with a device-signed `HEAD.json`, and writes
+`handoff/<id>.json` plus a bootstrap shell script. `handoff accept` pulls,
+verifies receipts, runs the trust gate, acquires the lease, and prints a
+resume-mode rehydrate block. Set `TOTAL_RECALL_BACKUP_PASSPHRASE` or approve the
+accepting device before pulling an encrypted backup.
 
 ## Hermes Setup
 

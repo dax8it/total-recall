@@ -1,0 +1,23 @@
+You are implementing continuity upgrades to Total Recall, a local-first memory layer for hermes-agent (src/total_recall_core: api.py, hermes_provider.py, cli.py). Read docs/continuity-implementation-handoff-2026-06-10.md FIRST — the authoritative spec. Background: docs/continuity-gap-analysis-2026-06-10.md.
+
+Rules: preserve the trust model (append-only hash-chained ledger -> state -> signed checkpoint -> Ed25519 anchor -> fail-closed verify). Derived/remote artifacts are never authority. Additive schemas only; legacy events must still verify. No new heavy deps (cryptography present; HF via hf CLI). Secrets only in env/keychain. Keep pytest, privacy_scan.py, install_smoke.sh green at every step. Add a trust-gate fixture per new flow. Track work with loop events. Report after each step with test evidence.
+
+Goal: an agent restorable and continuable on another machine or online harness, without context loss or split-brain. Implement in order:
+
+1. Session Resume Packet. Write continuation/<session>/packet_<ts>.json (total-recall-resume-packet-v1): verbatim last N turn events (default 30, untruncated, from ledger), open loops, freshness summary, compiled-truth excerpt, checkpoint/anchor ids, environment fingerprint, deterministic next-actions. Triggers: checkpoint(session_end), provider on_session_end, CLI `handoff export`. Add rehydrate(mode="resume"): verify first (fail closed), inject newest packet whose last_event_hash matches the chain; keyword mode is the fallback. Auto-rehydrate uses resume mode after startup/resume/new/compaction. Packets are derived: excluded from retrieval indexing, included in exports.
+
+2. Event origin + device identity. Per-machine keys/device.ed25519; device_id = pubkey fingerprint. ingest() adds origin{device_id, agent, harness, host} in the hashed base; events without it still verify. Registry devices/device_<id>.json + CLI device init|list|approve|revoke. Device key != anchor key.
+
+3. Encrypted backups by default. export_bundle excludes keys/ unless include_keys; backup_run defaults to an AES-256-GCM envelope (total-recall-encrypted-backup-v1), data key wrapped to each approved device's X25519 key plus a passphrase fallback. Add `backup restore`. backup_status/sync_status/dashboard read .enc manifests.
+
+4. Remote HEAD + push/pull. Device-signed HEAD.json (total-recall-remote-head-v1): latest{bundle, sha256, checkpoint_id, event_count, last_event_hash, device_id}, lease, receipts tail. RemoteTarget impls: local-folder, huggingface (add download mirroring the existing upload). push = encrypted backup -> upload -> sign HEAD. pull = fetch HEAD -> compare -> import/verify/rebuild on archive_ahead; refuse on local_ahead/diverged. store_id guards against pulling the wrong agent's HEAD.
+
+5. Single-writer lease. Signed lease{holder_device_id, acquired_at, ttl, expires_at} in HEAD. CLI lease acquire|release|status|steal (steal = --force + incident + ledger event). Provider: if another device holds an unexpired lease, go read-only — queue writes to state/pending_events.jsonl and warn. This makes local->online->local handoff safe.
+
+6. Divergence fork-import. `sync fork-import <bundle|target>`: find longest common prefix by event hash; archive-only suffix goes to external-memory quarantine with fork provenance; promotion re-ingests as new local events. Never silent merge or ledger rewrite. Dashboard offers this on diverged.
+
+7. Re-anchor + receipts. Each import/restore/pull appends a device-signed re_anchor event, then checkpoints. checkpoint() appends receipts to anchors/receipts.jsonl; push merges them into HEAD. verify --receipts cross-checks lineage; mismatch raises an incident.
+
+8. Handoff bootstrap. `handoff issue` = lease release + push + resume packet + handoff/<id>.json + bootstrap script (install, pull, verify, trust verify, lease acquire, print resume block); `handoff accept` runs it. No remote MCP in v1.
+
+Finish: update README and remote-backup-design statuses; see handoff doc acceptance list.

@@ -29,3 +29,4 @@ tools:
   - total_recall_loop_note
   - total_recall_loop_verify
   - total_recall_loop_complete
+  - total_recall_handoff_export
