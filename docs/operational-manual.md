@@ -309,5 +309,5 @@ Resolve only after the root cause is fixed and a fresh verify/trust gate passes.
 
 - Demo guide: [demo-guide.md](demo-guide.md)
 - Benchmarks: [benchmarks.md](benchmarks.md)
-- Architecture: [knowledge-engine-architecture.md](knowledge-engine-architecture.md)
+- Architecture: [architecture.md](architecture.md)
 - Comparison: [total-recall-memory-layer-comparison-2026-06-03.md](total-recall-memory-layer-comparison-2026-06-03.md)

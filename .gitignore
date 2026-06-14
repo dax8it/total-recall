@@ -21,3 +21,6 @@ build/
 /external-memory/
 /index/
 /keys/
+
+# Internal implementation/planning docs — not for public repo
+/internal/

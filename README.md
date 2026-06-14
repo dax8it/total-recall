@@ -39,13 +39,16 @@ It gives you a local trust spine for agent continuity:
 
 Start here:
 
+- [Install and run](docs/install.md) - zero to a verified local store
+- [Architecture](docs/architecture.md) - the trust spine and how the pieces fit
 - [Operational manual](docs/operational-manual.md) - what to run, what good looks like, and how to operate it
 - [Demo guide](docs/demo-guide.md) - dashboard/video/storyboard script and public demo flow
 - [Benchmarks](docs/benchmarks.md) - reproducible continuity benchmark and scorecard
 - [Nightly learning review](docs/nightly-learning.md) - candidate cards, layer routing, action boundaries, and wake-up diff
 - [Memory layer comparison](docs/total-recall-memory-layer-comparison-2026-06-03.md) - how Total Recall differs from GBrain, Zep/Graphiti, Hindsight, Mem0, Letta, and native Hermes memory
+- [Integrations](docs/integrations.md) - how Total Recall works with other memory systems
 - [Dashboard docs](docs/backup-dashboard.md) - Trust Spine, Knowledge Engine, Workbench, Vault, and backups
-- [Public launch readiness](docs/public-launch.md) - license posture, validation commands, and visibility checklist
+- [Roadmap](docs/roadmap.md) - where Total Recall is headed
 
 ## License And Commercial Use
 
@@ -556,4 +559,4 @@ PYTHONDONTWRITEBYTECODE=1 ./scripts/install_smoke.sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
 ```
 
-For the full public-facing validation checklist, see [docs/release-checklist.md](docs/release-checklist.md). For benchmark interpretation, see [docs/benchmarks.md](docs/benchmarks.md).
+For benchmark interpretation, see [docs/benchmarks.md](docs/benchmarks.md).

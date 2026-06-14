@@ -69,7 +69,7 @@ The current working tree now gives Hermes:
 - Optional external-provider contract: skipped without explicit authorization, degraded as unavailable when authorized but unconfigured.
 - Evaluation harness with scope-leak, contradiction, temporal, context-fencing, provider-report, external-provider, redacted-Hermes, and federation fixtures.
 
-Current local validation is tracked in [fortification scorecard](fortification-scorecard.md).
+Current local validation is tracked through the project's test, benchmark, and trust-gate stack (see [benchmarks.md](benchmarks.md)).
 
 ## What Total Recall Does Better
 
@@ -259,7 +259,7 @@ That is Total Recall's job.
 
 ## Sources
 
-- Total Recall repository: `README.md`, `docs/hermes.md`, `docs/knowledge-engine-api.md`, `src/total_recall_core/knowledge.py`, `hermes-plugin/total-recall/__init__.py`, full pytest result `48 passed, 1 skipped`, privacy scan, and install smoke.
+- Total Recall repository: `README.md`, `docs/hermes.md`, `docs/architecture.md`, `src/total_recall_core/knowledge.py`, `hermes-plugin/total-recall/__init__.py`, plus the project test, privacy scan, and install smoke stack.
 - GBrain docs: https://github.com/garrytan/gbrain/blob/master/docs/GBRAIN_V0.md
 - GBrain remote MCP deployment docs: https://github.com/garrytan/gbrain/blob/master/docs/mcp/DEPLOY.md
 - Vectorize GBrain explainer: https://vectorize.io/articles/what-is-gbrain

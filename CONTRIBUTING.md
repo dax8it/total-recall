@@ -30,5 +30,15 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/privacy_scan.py
 
 ## Release Checks
 
-Before a change is described as public-release ready, run the validation stack
-listed in `docs/release-checklist.md`.
+Before a change is described as public-release ready, run the validation stack:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python scripts/privacy_scan.py
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python -m pytest -q
+PYTHONDONTWRITEBYTECODE=1 ./scripts/install_smoke.sh
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
+git diff --check
+```
+
+A clean `total-recall trust verify` for the exact commit is required before
+tagging a stable release.
