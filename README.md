@@ -45,6 +45,28 @@ Start here:
 - [Nightly learning review](docs/nightly-learning.md) - candidate cards, layer routing, action boundaries, and wake-up diff
 - [Memory layer comparison](docs/total-recall-memory-layer-comparison-2026-06-03.md) - how Total Recall differs from GBrain, Zep/Graphiti, Hindsight, Mem0, Letta, and native Hermes memory
 - [Dashboard docs](docs/backup-dashboard.md) - Trust Spine, Knowledge Engine, Workbench, Vault, and backups
+- [Public launch readiness](docs/public-launch.md) - license posture, validation commands, and visibility checklist
+
+## License And Commercial Use
+
+Total Recall is licensed under the GNU Affero General Public License, version 3
+or later (`AGPL-3.0-or-later`).
+
+You may use, study, modify, distribute, and run Total Recall under the AGPL,
+including for commercial activity, as long as you comply with the AGPL terms.
+If you distribute a modified version or operate a modified network service based
+on Total Recall, the corresponding source code must remain available to the
+users who receive or interact with it.
+
+Proprietary, closed-source, hosted, embedded, resale, or other use that cannot
+or will not comply with the AGPL requires a separate written commercial license
+from the copyright holder. See [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+
+The Total Recall name and project identity are not licensed for modified
+products or services that imply official status. See [TRADEMARKS.md](TRADEMARKS.md).
+
+Attribution requirements and original project credits are in [NOTICE](NOTICE).
+Contribution terms are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick Install For Hermes
 

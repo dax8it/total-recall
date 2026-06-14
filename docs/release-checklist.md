@@ -2,6 +2,10 @@
 
 Before sharing a release outside the private repo:
 
+- confirm `LICENSE` is AGPLv3, `NOTICE` contains the original project
+  attribution, and `COMMERCIAL-LICENSE.md`, `TRADEMARKS.md`, `CONTRIBUTING.md`,
+  and `SECURITY.md` are present
+- run `git diff --check`
 - run the repository privacy scan for local absolute paths, profile-specific
   runtime directories, and sensitive configuration strings
 - run `python -m pytest -q`
@@ -44,5 +48,6 @@ Before sharing a release outside the private repo:
   `hermes plugins list --plain --no-bundled` and
   `hermes -p <profile> memory status`
 - ensure no runtime store directories are tracked
-- choose whether the repo should remain private or become public
+- confirm the maintainer wants this exact commit public under the
+  AGPL/commercial dual-license posture described in `docs/public-launch.md`
 - tag a release only after the above passes

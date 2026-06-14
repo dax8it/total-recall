@@ -1,0 +1,19 @@
+Total Recall
+Copyright (C) 2026 Alex Covo
+
+Original project repository: https://github.com/dax8it/total-recall
+Author and maintainer: Alex Covo
+
+Total Recall is distributed under the GNU Affero General Public License,
+version 3 or later. Proprietary, closed-source, hosted, embedded, resale, or
+other commercial arrangements that cannot comply with the AGPL are available
+only under a separate written commercial license from the copyright holder.
+
+Additional attribution notice under AGPLv3 section 7(b): covered works must
+preserve the copyright, original repository, author, and attribution notices in
+this file in a reasonable form.
+
+QMD interoperability notice:
+Total Recall can optionally use a qmd executable as a derived retrieval backend.
+QMD is a separate project published as @tobilu/qmd and is not bundled by this
+repository.
