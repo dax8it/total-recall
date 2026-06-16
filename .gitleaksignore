@@ -1,0 +1,2 @@
+# Historical test fixture false positive. Current tests use REDACT_FIXTURE_* sentinels.
+5bfb39709fd2eb811c9f4ada32d27a92aa183efc:tests/test_dashboard.py:generic-api-key:371

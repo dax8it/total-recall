@@ -48,7 +48,7 @@ def _post_json_allow_error(url: str, payload: dict | None = None):
         return json.loads(exc.read().decode("utf-8"))
 
 
-def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "FAKE_SECRET_VALUE", no_repo_info: bool = False, shebang: str = "#!/usr/bin/env python3"):
+def _install_fake_hf(tmp_path, *, private: bool = True, leak: str = "REDACT_FIXTURE_VALUE", no_repo_info: bool = False, shebang: str = "#!/usr/bin/env python3"):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     remote_dir = tmp_path / "fake-hf-remote"
@@ -309,7 +309,7 @@ def test_dashboard_agent_fleet_reads_profile_boundaries(tmp_path, monkeypatch):
 
 def test_hf_wizard_status_session_repo_and_restore_safety(tmp_path, monkeypatch):
     secret = "correct horse battery staple"
-    token = "FAKE_SECRET_VALUE"
+    token = "REDACT_FIXTURE_VALUE"
     monkeypatch.setenv("PATH", str(_install_fake_hf(tmp_path, leak=token)) + os.pathsep + os.environ.get("PATH", ""))
     monkeypatch.setenv("HF_TOKEN", token)
     monkeypatch.setenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", secret)
@@ -468,19 +468,31 @@ def test_hf_wizard_redacts_colon_and_bearer_secrets():
         "secret": "secret",
     }
     detail = " ".join([
-        f"{secret_terms['tok']}: SECRET1",
-        f"{secret_terms['access']}: SECRET2",
-        f"{secret_terms['api_dash']}: SECRET3",
-        f"{secret_terms['api_under']}: SECRET4",
-        f"{secret_terms['auth']}: Bearer SECRET5",
-        f"{secret_terms['phrase']}: SECRET6",
-        f"{secret_terms['pwd']}: SECRET7",
-        f"{secret_terms['secret']}: SECRET8",
-        "hf_abcdef123456",
+        f"{secret_terms['tok']}: REDACT_FIXTURE_01",
+        f"{secret_terms['access']}: REDACT_FIXTURE_02",
+        f"{secret_terms['api_dash']}: REDACT_FIXTURE_03",
+        f"{secret_terms['api_under']}: REDACT_FIXTURE_04",
+        f"{secret_terms['auth']}: Bearer REDACT_FIXTURE_05",
+        f"{secret_terms['phrase']}: REDACT_FIXTURE_06",
+        f"{secret_terms['pwd']}: REDACT_FIXTURE_07",
+        f"{secret_terms['secret']}: REDACT_FIXTURE_08",
+        "hf_fixture_token",
     ])
-    payload = {"detail": detail, "api_key": "SECRET9", "nested": {"password": "SECRET10"}}
+    payload = {"detail": detail, "api_key": "REDACT_FIXTURE_09", "nested": {"password": "REDACT_FIXTURE_10"}}
     redacted = json.dumps(_redact_payload(payload))
-    for secret in ["SECRET1", "SECRET2", "SECRET3", "SECRET4", "SECRET5", "SECRET6", "SECRET7", "SECRET8", "SECRET9", "SECRET10", "hf_abcdef123456"]:
+    for secret in [
+        "REDACT_FIXTURE_01",
+        "REDACT_FIXTURE_02",
+        "REDACT_FIXTURE_03",
+        "REDACT_FIXTURE_04",
+        "REDACT_FIXTURE_05",
+        "REDACT_FIXTURE_06",
+        "REDACT_FIXTURE_07",
+        "REDACT_FIXTURE_08",
+        "REDACT_FIXTURE_09",
+        "REDACT_FIXTURE_10",
+        "hf_fixture_token",
+    ]:
         assert secret not in redacted
     assert "[redacted]" in redacted
     assert "BEARER_LEAK" not in _redacted_line(f"{secret_terms['auth']}: Bearer BEARER_LEAK")
