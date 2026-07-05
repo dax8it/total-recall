@@ -81,12 +81,18 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     }
 
     provider.sync_turn("remember plugin lifecycle", "stored", session_id="s1")
+    multiline_source_text = (
+        "Decision: Plugin promise is day-one install.\n"
+        "Quote: \"day-one / install\" should survive JSON transport.\n"
+        "Markdown-ish: [launch](https://example.test/path?q=1) and *bold* text.\n"
+        "Budget: USD 2,560.20."
+    )
     source = json.loads(
         provider.handle_tool_call(
             "total_recall_source_ingest",
             {
                 "source_type": "meeting",
-                "text": "Decision: Plugin promise is day-one install.",
+                "text": multiline_source_text,
                 "title": "Plugin Launch Review",
                 "occurred_at": "2026-01-01T00:00:00Z",
                 "scope": "public",
@@ -95,6 +101,10 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     )
     assert source["ok"] is True
     assert source["event"]["kind"] == "source_meeting"
+    assert multiline_source_text in source["event"]["text"]
+    ledger_lines = (tmp_path / "total-recall" / "ledger" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(ledger_lines) == 2
+    assert [json.loads(line)["kind"] for line in ledger_lines] == ["turn", "source_meeting"]
 
     result = json.loads(provider.handle_tool_call("total_recall_search", {"query": "plugin lifecycle"}))
     assert result["ok"] is True
