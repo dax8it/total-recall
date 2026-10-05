@@ -36,7 +36,9 @@ class RepairError(RuntimeError):
 
 
 def _parse_records(ledger_path: Path) -> tuple[list[LedgerRecord], list[dict[str, Any]], int]:
-    physical_lines = ledger_path.read_text(encoding="utf-8").splitlines()
+    physical_lines = ledger_path.read_text(encoding="utf-8").split("\n")
+    if physical_lines[-1] == "":
+        physical_lines.pop()
     records: list[LedgerRecord] = []
     repaired_blocks: list[dict[str, Any]] = []
     pending: list[str] = []

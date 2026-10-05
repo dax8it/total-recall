@@ -491,6 +491,30 @@ def test_verify_fails_closed_when_anchor_checkpoint_hash_is_modified(tmp_path):
     assert "anchor_signature_mismatch" in verified["failures"]
 
 
+@pytest.mark.parametrize("stale", [False, True])
+def test_verify_rebuilds_from_one_verified_ledger_snapshot(tmp_path, monkeypatch, stale):
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    core.ingest(kind="note", text="Verified snapshot marker.", session_id="s1")
+    core.checkpoint(session_id="s1")
+    if stale:
+        core.ingest(kind="note", text="Newer snapshot marker.", session_id="s1")
+    core.index_file.unlink()
+    original_read = core._read_events
+    reads = []
+
+    def counted_read(*, verify_chain=True):
+        reads.append(verify_chain)
+        return original_read(verify_chain=verify_chain)
+
+    monkeypatch.setattr(core, "_read_events", counted_read)
+    verified = core.verify(session_id="s1")
+
+    assert verified["ok"] is True
+    assert reads == [True]
+    with sqlite3.connect(core.index_file) as conn:
+        assert conn.execute("SELECT count(*) FROM documents").fetchone()[0] == (2 if stale else 1)
+
+
 def test_verify_allows_stale_checkpoint_against_signed_ledger_prefix(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
     core.ingest(kind="note", text="Checkpointed memory.", session_id="s1")

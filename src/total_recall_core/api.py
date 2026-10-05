@@ -11,6 +11,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import sqlite3
 import subprocess
 import tarfile
@@ -2078,6 +2079,7 @@ class TotalRecallCore:
 
         state: Dict[str, Any] = {}
         current_state: Dict[str, Any] = {}
+        events: Optional[List[Dict[str, Any]]] = None
         try:
             events = self._read_events(verify_chain=True)
             current_state = self._state_from_events(events)
@@ -2091,7 +2093,7 @@ class TotalRecallCore:
                 failures.append("checkpoint_event_count_invalid")
                 state = current_state
             else:
-                state = self._state_from_events(events[:checkpoint_event_count])
+                state = current_state if checkpoint_event_count == len(events) else self._state_from_events(events[:checkpoint_event_count])
             details["checkpointStateHash"] = state.get("state_hash")
             if current_state.get("event_count") != checkpoint_event_count:
                 details.setdefault("warnings", []).append("checkpoint_stale")
@@ -2122,7 +2124,7 @@ class TotalRecallCore:
 
         if "ledger_or_state_invalid" not in ",".join(failures):
             try:
-                details["indexRebuild"] = self._rebuild_index_locked(state=current_state or state)
+                details["indexRebuild"] = self._rebuild_index_locked(state=current_state or state, events=events)
             except Exception as exc:
                 details.setdefault("warnings", []).append(f"index_rebuild_failed:{exc}")
         if receipts:
@@ -2664,17 +2666,13 @@ class TotalRecallCore:
         try:
             with self._locked():
                 state = self.reduce_state(write=True)
-                status = self.index_status(state=state)
-                stale = []
-                for backend in ("lancedb", "qmd", "sqlite-fts"):
-                    item = status.get("backends", {}).get(backend, {})
-                    if item.get("available", item.get("ok")) and not item.get("fresh"):
-                        stale.append(backend)
-                if stale:
-                    self._rebuild_index_locked(state=state, backends=tuple(stale))
+                # Interactive recall never starts bulk external indexing.
+                if not self._sqlite_index_status(state=state).get("fresh"):
+                    self._rebuild_index_locked(state=state, backends=("sqlite-fts",))
 
             hybrid = self._search_derived_indexes(
                 query,
+                state=state,
                 max_results=max_results,
                 session_id=session_id,
                 allowed_scopes=allowed_scopes,
@@ -2697,9 +2695,42 @@ class TotalRecallCore:
         return lexical
 
     def rebuild_index(self, *, backends: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+        requested = set(backends or ("sqlite-fts", "lancedb", "qmd"))
+        if "sqlite" in requested:
+            requested.add("sqlite-fts")
+        # Capture a chain-checked snapshot under the ledger lock, then release
+        # it before waiting for or running optional maintenance.
         with self._locked():
             state = self.reduce_state(write=True)
-            return self._rebuild_index_locked(state=state, backends=tuple(backends) if backends else None)
+            events = self._read_events(verify_chain=True)
+            results = {}
+            if "sqlite-fts" in requested:
+                results["sqlite-fts"] = self._rebuild_sqlite_index_locked(state=state, events=events)
+        if requested.intersection(("lancedb", "qmd")):
+            with self._index_locked():
+                for backend, builder in (
+                    ("lancedb", self._rebuild_lancedb_index_locked),
+                    ("qmd", self._rebuild_qmd_index_locked),
+                ):
+                    if backend not in requested:
+                        continue
+                    meta_file = self.lancedb_meta_file if backend == "lancedb" else self.qmd_meta_file
+                    self._write_json(meta_file, {"build_status": "building", "started_at": utc_now()})
+                    try:
+                        result = builder(state=state, events=events)
+                    except Exception as exc:
+                        result = {"ok": False, "available": True, "backend": backend, "error": str(exc)}
+                    if not result.get("ok"):
+                        self._write_json(meta_file, {"build_status": "failed", "error": result.get("error")})
+                    results[backend] = result
+        # A save may have advanced the ledger during maintenance. Report
+        # freshness against the current state, never the older build snapshot.
+        with self._locked(shared=True):
+            status = self.index_status(state=self.reduce_state(write=False))
+        for backend, result in results.items():
+            result["fresh"] = bool(status["backends"][backend].get("fresh"))
+        ok = all(result.get("ok") for result in results.values() if result.get("available", True))
+        return {"ok": ok, "index": status, "rebuilt": results}
 
     def index_status(self, *, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         state = state or self.reduce_state(write=False)
@@ -2710,6 +2741,7 @@ class TotalRecallCore:
             "ok": sqlite_status.get("ok") is True,
             "backend": "derived-hybrid",
             "preferredOrder": ["lancedb", "qmd", "sqlite-fts", "lexical"],
+            "externalRefreshPolicy": "explicit-rebuild",
             "fresh": bool(sqlite_status.get("fresh"))
             and (not lancedb_status.get("available") or bool(lancedb_status.get("fresh")))
             and (not qmd_status.get("available") or bool(qmd_status.get("fresh"))),
@@ -2796,7 +2828,10 @@ class TotalRecallCore:
             meta = self._read_json(self.lancedb_meta_file)
             status.update(
                 {
-                    "ok": meta.get("schema") == LANCEDB_INDEX_SCHEMA_VERSION,
+                    "ok": meta.get("schema") == LANCEDB_INDEX_SCHEMA_VERSION
+                    and meta.get("build_status", "ready") == "ready",
+                    "buildStatus": meta.get("build_status", "ready"),
+                    "error": meta.get("error"),
                     "schema": meta.get("schema", ""),
                     "builtAt": meta.get("built_at"),
                     "eventCount": int(meta.get("event_count") or 0),
@@ -2850,7 +2885,10 @@ class TotalRecallCore:
             meta = self._read_json(self.qmd_meta_file)
             status.update(
                 {
-                    "ok": meta.get("schema") == QMD_INDEX_SCHEMA_VERSION,
+                    "ok": meta.get("schema") == QMD_INDEX_SCHEMA_VERSION
+                    and meta.get("build_status", "ready") == "ready",
+                    "buildStatus": meta.get("build_status", "ready"),
+                    "error": meta.get("error"),
                     "schema": meta.get("schema", ""),
                     "builtAt": meta.get("built_at"),
                     "eventCount": int(meta.get("event_count") or 0),
@@ -3521,7 +3559,9 @@ class TotalRecallCore:
 
         try:
             index_status = self.index_status(state=state)
-            add("derived_index_status", bool(index_status.get("fresh")), fresh=index_status.get("fresh"), backends=index_status.get("backends"))
+            core_index = index_status.get("backends", {}).get("sqlite-fts", {})
+            add("derived_index_status", bool(core_index.get("fresh")), fresh=core_index.get("fresh"),
+                allBackendsFresh=index_status.get("fresh"), backends=index_status.get("backends"))
         except Exception as exc:
             add("derived_index_status", False, error=str(exc))
 
@@ -3609,17 +3649,22 @@ class TotalRecallCore:
 
         try:
             index_status = self.index_status(state=state if state.get("event_count", -1) >= 0 else None)
-            if not index_status.get("fresh"):
+            # External indexes are optional explicit maintenance, not a core
+            # continuity gate. Keep their freshness visible in the evidence.
+            core_index = index_status.get("backends", {}).get("sqlite-fts", {})
+            if not core_index.get("fresh"):
                 rebuilt = self.rebuild_index(backends=["sqlite-fts"])
                 index_status = rebuilt.get("index") or self.index_status()
+                core_index = index_status.get("backends", {}).get("sqlite-fts", {})
             add(
                 "real_store_core_index_rebuildable",
-                bool(index_status.get("fresh")),
-                "Core retrieval index is fresh or was rebuilt from the ledger.",
+                bool(core_index.get("fresh")),
+                "Core SQLite/FTS index is fresh or was rebuilt from the ledger; external indexes are optional maintenance.",
                 evidence={
-                    "fresh": index_status.get("fresh"),
+                    "fresh": core_index.get("fresh"),
+                    "allBackendsFresh": index_status.get("fresh"),
                     "backends": index_status.get("backends"),
-                    "eventCount": index_status.get("eventCount"),
+                    "eventCount": core_index.get("eventCount"),
                 },
             )
         except Exception as exc:
@@ -4965,7 +5010,7 @@ class TotalRecallCore:
                 member = tar.extractfile("ledger/events.jsonl")
                 if member is None:
                     return {"ok": False, "error": "ledger_not_found_in_bundle", "bundle": str(bundle)}
-                lines = member.read().decode("utf-8").splitlines()
+                lines = member.read().decode("utf-8").split("\n")
         except Exception as exc:
             return {"ok": False, "error": "bundle_unreadable", "bundle": str(bundle), "detail": str(exc)}
         events: List[Dict[str, Any]] = []
@@ -5090,19 +5135,20 @@ class TotalRecallCore:
         *,
         state: Optional[Dict[str, Any]] = None,
         backends: Optional[Iterable[str]] = None,
+        events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         state = state or self.reduce_state(write=True)
-        events = self._read_events(verify_chain=True)
-        requested = set(backends or ("sqlite-fts", "lancedb", "qmd"))
+        # A verifier may reuse its chain-checked snapshot under the same lock.
+        if events is None:
+            events = self._read_events(verify_chain=True)
+        # Only the inexpensive canonical-ledger projection belongs under
+        # this lock. Optional backends are rebuilt by explicit maintenance.
+        requested = set(backends or ("sqlite-fts",))
         results: Dict[str, Any] = {}
         if "sqlite" in requested:
             requested.add("sqlite-fts")
         if "sqlite-fts" in requested:
             results["sqlite-fts"] = self._rebuild_sqlite_index_locked(state=state, events=events)
-        if "lancedb" in requested:
-            results["lancedb"] = self._rebuild_lancedb_index_locked(state=state, events=events)
-        if "qmd" in requested:
-            results["qmd"] = self._rebuild_qmd_index_locked(state=state, events=events)
         return {"ok": bool(results.get("sqlite-fts", {"ok": True}).get("ok", False)), "index": self.index_status(state=state), "rebuilt": results}
 
     def _rebuild_sqlite_index_locked(self, *, state: Dict[str, Any], events: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -5262,9 +5308,12 @@ class TotalRecallCore:
             check=False,
         )
         if not added.get("ok"):
-            return {"ok": False, "available": True, "backend": "qmd", "error": added.get("stderr") or added.get("stdout") or "collection_add_failed"}
+            return {"ok": False, "available": True, "backend": "qmd", "error": added.get("error") or added.get("stderr") or added.get("stdout") or "collection_add_failed"}
         if self.config.qmd_embed:
-            self._run_qmd([qmd, "--index", index_name, "embed"], timeout=600, check=False)
+            embedded = self._run_qmd([qmd, "--index", index_name, "embed"], timeout=600, check=False)
+            if not embedded.get("ok"):
+                return {"ok": False, "available": True, "backend": "qmd",
+                        "error": embedded.get("error") or embedded.get("stderr") or "embed_failed"}
         meta = self._index_meta_payload(
             schema=QMD_INDEX_SCHEMA_VERSION,
             backend="qmd",
@@ -5383,6 +5432,7 @@ class TotalRecallCore:
         self,
         query: str,
         *,
+        state: Dict[str, Any],
         max_results: int,
         session_id: Optional[str],
         allowed_scopes: Optional[Iterable[str]],
@@ -5397,12 +5447,20 @@ class TotalRecallCore:
             ("sqlite-fts", self._search_index),
         ):
             try:
-                payload = searcher(
-                    query,
-                    max_results=max_results,
-                    session_id=session_id,
-                    allowed_scopes=allowed_scopes,
-                )
+                options = dict(max_results=max_results, session_id=session_id, allowed_scopes=allowed_scopes)
+                if backend == "sqlite-fts":
+                    payload = searcher(query, **options)
+                else:
+                    # Optional indexes may be stale or undergoing destructive
+                    # rebuilds. Never wait for their maintenance lock.
+                    with self._index_locked(shared=True, blocking=False) as acquired:
+                        if not acquired:
+                            continue
+                        status = (self._lancedb_index_status if backend == "lancedb"
+                                  else self._qmd_index_status)(state=state)
+                        if not status.get("fresh"):
+                            continue
+                        payload = searcher(query, **options)
             except Exception as exc:
                 errors.append(f"{backend}:{exc}")
                 continue
@@ -5629,15 +5687,45 @@ class TotalRecallCore:
 
     def _run_qmd(self, cmd: List[str], *, timeout: int, check: bool) -> Dict[str, Any]:
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-        except subprocess.TimeoutExpired:
-            return {"ok": False, "cmd": cmd, "error": f"timeout:{timeout}s", "stdout": "", "stderr": ""}
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       text=True, start_new_session=os.name == "posix")
         except Exception as exc:
             return {"ok": False, "cmd": cmd, "error": str(exc), "stdout": "", "stderr": ""}
-        ok = cp.returncode == 0
-        if check and not ok:
-            return {"ok": False, "cmd": cmd, "returncode": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
-        return {"ok": ok, "cmd": cmd, "returncode": cp.returncode, "stdout": cp.stdout, "stderr": cp.stderr}
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            # Settle this job's descendants too; a timed-out embedding child
+            # must not continue consuming resources after failure is reported.
+            if os.name == "posix":
+                try:
+                    os.killpg(process.pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.terminate()
+            try:
+                process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+            finally:
+                if os.name == "posix":
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                elif process.poll() is None:
+                    process.kill()
+                try:
+                    process.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    # An escaped descendant may retain inherited pipes. Do
+                    # not wait indefinitely after settling the owned group.
+                    process.stdout.close()
+                    process.stderr.close()
+                    process.wait(timeout=2)
+            return {"ok": False, "cmd": cmd, "error": f"timeout:{timeout}s", "stdout": "", "stderr": ""}
+        return {"ok": process.returncode == 0, "cmd": cmd, "returncode": process.returncode,
+                "stdout": stdout, "stderr": stderr}
 
     def _ensure_layout(self) -> None:
         for rel in (
@@ -5682,6 +5770,25 @@ class TotalRecallCore:
         return KnowledgeEngine(self)
 
     @contextmanager
+    def _index_locked(self, *, shared: bool = False, blocking: bool = True):
+        import fcntl
+
+        path = self.home / ".total-recall-index.lock"
+        with path.open("a+", encoding="utf-8") as fh:
+            flags = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+            if not blocking:
+                flags |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(fh.fileno(), flags)
+            except BlockingIOError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
     def _locked(self, *, shared: bool = False):
         import fcntl
 
@@ -5698,7 +5805,8 @@ class TotalRecallCore:
         prev: Optional[str] = None
         if not self.ledger_file.exists():
             return events
-        for line_no, line in enumerate(self.ledger_file.read_text(encoding="utf-8").splitlines(), start=1):
+        # JSONL records end at LF, not Unicode separators inside JSON strings.
+        for line_no, line in enumerate(self.ledger_file.read_text(encoding="utf-8").split("\n"), start=1):
             if not line.strip():
                 continue
             event = json.loads(line)
