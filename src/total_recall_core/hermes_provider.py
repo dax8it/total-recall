@@ -1088,8 +1088,27 @@ class TotalRecallMemoryProvider(MemoryProvider):
         if not cfg.get("enabled", True) or not self._cooldown_allows(reason, session_id, cfg):
             return ""
         core = self._core()
-        verification = self._ensure_verifiable_checkpoint(core, session_id=session_id, reason=reason)
-        if not verification.get("ok"):
+        mode = "resume" if reason in {"startup_or_gateway_restart", "after_resume", "after_new_session", "after_compaction"} else "keyword"
+        # rehydrate owns verification; a separate preflight repeats the full
+        # ledger scan/index rebuild and can exceed Hermes' prefetch deadline.
+        payload = core.rehydrate(
+            session_id=session_id,
+            query=query or "active continuity state decisions blockers next actions",
+            max_results=8,
+            mode=mode,
+        )
+        verification = payload.get("verification") or {}
+        if not payload.get("ok") and self._is_stale_checkpoint_failure(verification):
+            verification = self._ensure_verifiable_checkpoint(core, session_id=session_id, reason=reason)
+            if verification.get("ok"):
+                payload = core.rehydrate(
+                    session_id=session_id,
+                    query=query or "active continuity state decisions blockers next actions",
+                    max_results=8,
+                    mode=mode,
+                )
+                verification = payload.get("verification") or {}
+        if not payload.get("ok") and verification and not verification.get("ok"):
             self._record_auto_rehydrate(reason, session_id, ok=False)
             failures = ", ".join(map(str, verification.get("failures") or [])) or "verification failed"
             return (
@@ -1100,13 +1119,6 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 f"failures: {failures}\n"
                 "Use `total_recall_verify` before trusting prior continuity."
             )
-        mode = "resume" if reason in {"startup_or_gateway_restart", "after_resume", "after_new_session", "after_compaction"} else "keyword"
-        payload = core.rehydrate(
-            session_id=session_id,
-            query=query or "active continuity state decisions blockers next actions",
-            max_results=8,
-            mode=mode,
-        )
         if not payload.get("ok") and mode == "resume" and payload.get("status") == "NO_RESUME_PACKET":
             payload = core.rehydrate(
                 session_id=session_id,

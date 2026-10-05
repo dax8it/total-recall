@@ -229,6 +229,30 @@ def test_plugin_context_threshold_auto_rehydrate(tmp_path, monkeypatch):
     assert "reason: context_usage_threshold" in auto
 
 
+def test_plugin_auto_rehydrate_verifies_once(tmp_path, monkeypatch):
+    from total_recall_core import TotalRecallCore
+
+    module = _load_plugin(monkeypatch)
+    provider = module.TotalRecallMemoryProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path))
+    provider.sync_turn("bounded rehydrate marker", "stored", session_id="s1")
+    provider.handle_tool_call("total_recall_checkpoint", {"session_id": "s1"})
+    original_verify = TotalRecallCore.verify
+    verifications = []
+
+    def counted_verify(core, **kwargs):
+        verifications.append(kwargs)
+        return original_verify(core, **kwargs)
+
+    monkeypatch.setattr(TotalRecallCore, "verify", counted_verify)
+    provider.on_turn_start(1, "continue", context_usage_ratio=0.8)
+    auto = provider.prefetch("bounded rehydrate marker", session_id="s1")
+
+    assert "status: PASS" in auto
+    assert "bounded rehydrate marker" in auto
+    assert len(verifications) == 1
+
+
 def test_plugin_auto_rehydrate_fails_closed_on_tampered_anchor(tmp_path, monkeypatch):
     module = _load_plugin(monkeypatch)
     provider = module.TotalRecallMemoryProvider()
