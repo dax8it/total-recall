@@ -14,6 +14,9 @@ For what exists today, see [architecture.md](architecture.md) and the
 - Append-only hash-chained ledger, deterministic state reduction.
 - Signed Ed25519 checkpoints/anchors; fail-closed verify and rehydrate.
 - Derived retrieval ladder: LanceDB, QMD, SQLite/FTS, lexical fallback.
+- Explicit external-index maintenance outside the ledger lock, with local
+  fallback when external indexes are stale or busy.
+- Unicode-safe JSONL record boundaries in ledger, archive, and repair readers.
 - Generated-report exclusion from retrieval.
 - Knowledge Engine: cited query, freshness, temporal graph timelines,
   evidence-locked graph, owner-promoted synthesis, evaluation harness.
@@ -24,6 +27,10 @@ For what exists today, see [architecture.md](architecture.md) and the
 - Explicit, read-only workspace federation.
 - Operator dashboard (Trust Spine, Knowledge Engine, Workbench, Vault, Backups).
 - Optional Hermes Agent memory-provider plugin.
+- Automatic rehydrate without a redundant verification preflight on its normal
+  successful path; integrity failures still fail closed.
+- Operator-controlled recovery of missing Hermes message records from a
+  preserved snapshot, with append-only provenance and replay deduplication.
 
 ## Near-term direction
 

@@ -40,6 +40,7 @@ total-recall external reject <candidate-id>
 
 - adapter results are quarantined by default
 - promotion creates a normal ledger event with source citation metadata
-- verification rebuilds derived indexes from the ledger, never from adapter state
+- verification refreshes SQLite/FTS from the ledger, never from adapter state;
+  external-index rebuilds remain explicit maintenance
 - adapter outages do not block core ingest, checkpoint, verify, or rehydrate
 - tampered adapter receipts cannot become authoritative without promotion

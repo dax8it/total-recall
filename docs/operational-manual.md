@@ -214,6 +214,52 @@ total-recall sources ingest \
   --text "Decision: Launch requires a clean trust gate report."
 ```
 
+### Index maintenance
+
+Normal saves and verification refresh SQLite/FTS, not the optional LanceDB or
+QMD indexes. Recall does not launch bulk embedding: it skips stale or busy
+external indexes and uses SQLite/FTS or lexical fallback. This separates
+interactive memory work from expensive index maintenance without removing
+ledger, checkpoint, or signature checks.
+
+Target the intended store explicitly, especially when using multiple profiles:
+
+```bash
+total-recall --home /path/to/store index status
+total-recall --home /path/to/store index rebuild --backend sqlite-fts
+total-recall --home /path/to/store index rebuild --backend lancedb
+TOTAL_RECALL_QMD_EMBED=1 total-recall --home /path/to/store index rebuild --backend qmd
+```
+
+`--backend` may be repeated. Omitting it requests all derived backends. QMD and
+LanceDB remain optional; the embedding setting is used only during an explicit
+QMD rebuild. No maintenance schedule is enabled automatically.
+
+The status field `externalRefreshPolicy` is `explicit-rebuild`. Inspect each
+backend's `fresh` flag rather than treating aggregate index freshness as a
+memory-integrity verdict. After a save, SQLite/FTS can be current while external
+indexes are stale. That is an expected state, not proof of lost memory.
+
+`doctor` and the trust gate require the core SQLite/FTS index to be current or
+rebuildable. Their index checks retain `allBackendsFresh` and per-backend details
+so optional maintenance needs stay visible. An unrebuildable core index still
+fails the check. The dashboard's aggregate search-catalog indicator can remain
+stale until explicit external maintenance; it does not replace signed verification.
+
+External rebuilds serialize under a separate maintenance lock, outside the
+ledger lock. They use a chain-checked snapshot; if another save advances the
+ledger during the build, the completed snapshot is reported as stale. Failed
+or interrupted builds remain incomplete. Timed-out QMD jobs receive bounded
+cleanup of their owned process group. Do not cancel unrelated jobs or edit
+index metadata to make a health check pass.
+
+Saves still perform local state reduction and SQLite/FTS work, so this is not
+a constant-time or instant-save guarantee. The bounded native repair test
+observed a manual save of approximately 11 seconds on its existing store;
+that measurement is not a general performance benchmark or a voice-continuity
+certification. The synthetic subprocess regression is in
+[`tests/test_index_concurrency.py`](../tests/test_index_concurrency.py).
+
 ### Check freshness
 
 ```bash
@@ -260,6 +306,46 @@ If running from a checkout:
 ./scripts/install_hermes_plugin.sh --profile filippo --activate --format text
 ```
 
+### Recover missing Hermes session records
+
+The checkout-only utility `scripts/recover_hermes_session_gap.py` appends
+missing original message records from an operator-preserved JSON snapshot.
+It is not an automatic session crawler, ledger-corruption repair, or a way to
+invent completed turns from partial conversations.
+
+Before using it, preserve a backup, verify the target store, and select only
+records from the authorized profile. Keep snapshots and recovery output private.
+The snapshot object must contain `source_database` (a stable source identifier)
+and `records` (an array). Each record must include `id`, `session_id`, `role`,
+`content`, and `timestamp`; preserve the original `display_kind`,
+`finish_reason`, `tool_calls`, and `_compressed_summary` fields too, so filtering
+does not mistake generated scaffolding for an original message.
+
+From the repository root, preview the counts before authorizing an append:
+
+```bash
+PYTHONPATH=src python scripts/recover_hermes_session_gap.py \
+  --snapshot /path/to/private/snapshot.json --home /path/to/store
+```
+
+After reviewing that plan, apply to the same intended store:
+
+```bash
+PYTHONPATH=src python scripts/recover_hermes_session_gap.py \
+  --snapshot /path/to/private/snapshot.json --home /path/to/store --apply
+total-recall --home /path/to/store checkpoint --label session-record-recovery
+total-recall --home /path/to/store verify
+```
+
+The utility excludes generated summaries, tool-call messages, and explicitly
+unfinished assistant records. It skips content already represented in captured
+turns and checks recovery keys under the ledger lock to prevent replay duplicates.
+Recovered records are grouped by session in private `recovered_session_records`
+events with original message IDs, source timestamps, and a snapshot hash. The
+ledger timestamp records recovery time; existing ledger history is not rewritten.
+It does not create a checkpoint automatically. Regression coverage is in
+[`tests/test_session_gap_recovery.py`](../tests/test_session_gap_recovery.py).
+
 ## What Good Looks Like
 
 A healthy store has:
@@ -268,7 +354,8 @@ A healthy store has:
 - Latest checkpoint event count equals current ledger event count, or lag is understood and acceptable for the task.
 - Anchor exists for the latest checkpoint.
 - Open incident count is zero or known/triaged.
-- Derived index is fresh or rebuildable.
+- SQLite/FTS is current or rebuildable; optional external-index staleness is
+  understood and handled through explicit maintenance.
 - Knowledge graph has cited entities/edges and zero uncited authority claims.
 - Trust gate passes before release or handoff claims.
 - Backup archive exists before machine migration or risky work.

@@ -66,13 +66,14 @@ append-only ledger (hash chain)
   differs from the checkpoint, an anchor is missing, the anchor's checkpoint hash
   mismatches, or the anchor signature mismatches.
 
-During verification, Total Recall rebuilds derived indexes from the ledger *after*
-the authoritative checks. A tampered or stale index is overwritten from trusted
-ledger state rather than trusted directly.
+During verification, Total Recall refreshes SQLite/FTS from the chain-checked
+ledger snapshot. Optional LanceDB and QMD indexes refresh only through explicit
+`total-recall index rebuild` maintenance; verification never starts embedding.
+Derived indexes are not trusted as authority for the integrity verdict.
 
 ## Retrieval is derived, not authoritative
 
-Search runs over rebuildable indexes through a ladder, in order:
+Search runs over current, available indexes through a ladder, in order:
 
 ```text
 LanceDB vector-ish local index
@@ -83,8 +84,18 @@ lexical authority-artifact scan
 
 Everything under `index/` is a derived retrieval cache. It is rebuilt from
 `ledger/events.jsonl` and is never the authority for continuity, checkpoint, or
-rehydrate decisions. If an index is tampered with, verify overwrites it from the
-ledger. This is the point: a vector hit is a convenience, not a fact.
+rehydrate decisions. Verification refreshes SQLite/FTS; explicit maintenance
+rebuilds external indexes. A vector hit is a convenience, not a fact.
+
+Saves, checkpoints, and verification retain the canonical ledger lock. External
+maintenance captures a chain-checked snapshot under that lock, releases it, and
+then serializes expensive work under a separate maintenance lock. Recall does
+not wait for that maintenance lock: it skips busy or stale external indexes and
+uses SQLite/FTS or lexical fallback. Writes during a rebuild leave its snapshot
+stale, and a failed or interrupted build cannot be reported as fresh.
+
+See [index maintenance](operational-manual.md#index-maintenance) for commands and
+the distinction between external-index freshness and memory integrity.
 
 Generated reports under `reports/` are deliberately *excluded* from retrieval so
 that recall output cannot recursively become future memory input (no "summaries of

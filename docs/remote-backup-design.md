@@ -133,8 +133,8 @@ States:
 - `diverged`: event counts match but hashes differ, or the archive is missing
   checkpoint metadata. Do not auto-merge; use `sync fork-import`.
 
-The index layer is never used as authority. Verification can rebuild derived
-indexes from the ledger after import.
+The index layer is never used as authority. Verification refreshes SQLite/FTS
+from the ledger after import; LanceDB and QMD rebuilds are explicit maintenance.
 
 ## Travel Flow
 

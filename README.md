@@ -250,7 +250,19 @@ explicit status, export, backup, and manual inspection workflows, but they are
 excluded from retrieval so rehydrate output cannot recursively become future
 memory input.
 
-Search uses this ladder:
+Interactive saves and verification refresh SQLite/FTS only. External LanceDB
+and QMD indexes are refreshed explicitly with `total-recall index rebuild`.
+External rebuilds use a separate maintenance lock and a chain-checked ledger
+snapshot, so embedding cannot hold up saves or checkpoints. New writes during
+a rebuild leave that snapshot stale; failed or interrupted builds remain
+incomplete. Recall skips stale or busy external indexes and uses SQLite/FTS
+or lexical fallback. `TOTAL_RECALL_QMD_EMBED=1` still enables embeddings for
+explicit rebuilds.
+
+For backend-specific commands and freshness diagnostics, see
+[index maintenance](docs/operational-manual.md#index-maintenance).
+
+Search uses this ladder for current, available indexes:
 
 ```text
 LanceDB vector-ish local index
@@ -345,9 +357,9 @@ Verification fails closed when:
 - anchor checkpoint hash mismatches
 - anchor signature mismatches
 
-During verification, Total Recall rebuilds derived indexes from the ledger after
-the authoritative checks. A tampered or stale derived index is overwritten from
-trusted ledger state rather than trusted directly.
+During verification, Total Recall rebuilds SQLite/FTS from the chain-checked
+ledger after the authoritative checks. External index maintenance is explicit;
+derived indexes never become authority for integrity or continuity decisions.
 
 Device identity is separate from the store anchor key. New events include a
 hashed origin with the local device id, while device keys sign remote HEADs,

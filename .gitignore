@@ -24,3 +24,6 @@ build/
 
 # Internal implementation/planning docs — not for public repo
 /internal/
+
+# Private operator evidence is not a public fixture.
+/evidence/

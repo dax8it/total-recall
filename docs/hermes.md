@@ -291,6 +291,13 @@ confidence during prefetch.
 Automatic rehydration is still verified. If verification fails, the plugin
 returns a fail-closed warning instead of prior-memory content.
 
+The normal automatic path lets core `rehydrate()` own verification rather than
+running a duplicate full verification first. A stale-checkpoint failure may
+trigger checkpoint repair and a verified retry; integrity failures still fail
+closed. Interactive capture and recall do not start bulk LanceDB/QMD rebuilds.
+See [index maintenance](operational-manual.md#index-maintenance) for the explicit
+external-index workflow.
+
 ### What Gets Saved, When
 
 - Completed Hermes turns are written through `sync_turn()`.
@@ -347,8 +354,8 @@ TOTAL_RECALL_HOME=/path/to/store total-recall import total-recall-backup.tar.gz 
 ```
 
 `import` verifies the bundle manifest and rejects unsafe tar paths before
-copying files. `verify` rebuilds derived indexes from the ledger after
-authoritative checks pass.
+copying files. `verify` refreshes SQLite/FTS from the chain-checked ledger;
+LanceDB and QMD rebuilds require explicit maintenance.
 
 For a managed local dashboard and retention policy:
 
@@ -378,5 +385,11 @@ Common states:
 - `anchor_signature_mismatch`: treat the store as tampered until investigated.
 - `ledger_or_state_invalid`: do not rehydrate; inspect the ledger and restore
   from a known-good export if needed.
-- `index_not_found` or stale index: run `total-recall index rebuild`; indexes
-  are derived caches and can be rebuilt from the ledger.
+- `index_not_found` or stale SQLite/FTS index: run
+  `total-recall index rebuild --backend sqlite-fts`.
+- Stale LanceDB or QMD index: recall skips it and can still use local results.
+  Run `total-recall index rebuild --backend lancedb` or `--backend qmd` when
+  external maintenance is wanted; it is not required to repair a signature.
+
+For missing original session records in an otherwise valid store, see the
+[operator-controlled session recovery utility](operational-manual.md#recover-missing-hermes-session-records).
