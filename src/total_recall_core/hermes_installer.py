@@ -175,8 +175,10 @@ def plugin_yaml() -> str:
         'entrypoint: "__init__.py"\n'
         'provider_class: "TotalRecallMemoryProvider"\n'
         'requires_python: ">=3.11"\n'
-        "python_dependencies:\n"
-        f"  - total-recall-core=={__version__}\n"
+        "# total-recall-core is not published on PyPI. It is installed into the Hermes\n"
+        "# Python by scripts/install_hermes_plugin.sh (or loaded from the checkout by\n"
+        "# __init__.py), so it is not listed under python_dependencies: Hermes 0.21+\n"
+        "# auto-installs that list from PyPI and disables the plugin when it fails.\n"
         'description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, learning review, compiled truth, and explicit federation."\n'
         "tools:\n"
         "  - total_recall_search\n"

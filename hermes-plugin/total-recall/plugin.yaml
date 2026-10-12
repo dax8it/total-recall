@@ -3,8 +3,10 @@ version: 1.3.0
 entrypoint: "__init__.py"
 provider_class: "TotalRecallMemoryProvider"
 requires_python: ">=3.11"
-python_dependencies:
-  - total-recall-core==1.3.0
+# total-recall-core is not published on PyPI. It is installed into the Hermes
+# Python by scripts/install_hermes_plugin.sh (or loaded from the checkout by
+# __init__.py), so it is not listed under python_dependencies: Hermes 0.21+
+# auto-installs that list from PyPI and disables the plugin when it fails.
 description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, learning review, compiled truth, and explicit federation."
 tools:
   - total_recall_search
