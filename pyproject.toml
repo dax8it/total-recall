@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 authors = [{ name = "Alex Covo" }]
 license = { file = "LICENSE" }
 classifiers = [
-    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
     "Topic :: Software Development :: Libraries :: Python Modules",
@@ -22,7 +22,6 @@ dependencies = ["cryptography>=42"]
 Homepage = "https://github.com/dax8it/total-recall"
 Repository = "https://github.com/dax8it/total-recall"
 Issues = "https://github.com/dax8it/total-recall/issues"
-Commercial-Licensing = "https://github.com/dax8it/total-recall/blob/main/COMMERCIAL-LICENSE.md"
 
 [project.optional-dependencies]
 semantic = ["lancedb"]

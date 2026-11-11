@@ -8,11 +8,8 @@ By submitting a pull request, patch, issue comment containing code, or any other
 contribution intended for inclusion in this repository, you agree that:
 
 - you have the right to submit the contribution;
-- your contribution is licensed under `AGPL-3.0-or-later`;
-- you grant Alex Covo and the Total Recall maintainers a perpetual, worldwide,
-  non-exclusive, royalty-free license to use, reproduce, modify, distribute,
-  sublicense, and relicense your contribution as part of Total Recall, including
-  under separate commercial licenses.
+- your contribution is licensed under the MIT License, the same license as
+  the rest of Total Recall.
 
 Do not submit a contribution if you cannot agree to these terms.
 
