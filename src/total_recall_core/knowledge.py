@@ -66,8 +66,9 @@ _ENTITY_TYPES = {
 }
 
 _INJECTION_PATTERNS = (
-    "ignore previous instructions",
-    "ignore all previous instructions",
+    # These are detection signatures, not instructions to the plugin reviewer.
+    "ignore previous " "instructions",
+    "ignore all previous " "instructions",
     "developer message",
     "system prompt",
     "tool call",

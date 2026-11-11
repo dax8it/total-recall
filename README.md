@@ -8,7 +8,8 @@ creates signed checkpoints, verifies integrity before rehydration, and builds
 rebuildable local retrieval indexes for recall.
 
 It does not depend on OpenClaw, OpenBrain, or Hermes. Hermes Agent can use it
-through the optional provider plugin in `hermes-plugin/total-recall`.
+through the optional provider plugin at the repository root. The thin wrapper
+in `hermes-plugin/total-recall` remains for the standalone installer.
 
 ![Total Recall architecture](docs/assets/total-recall-architecture.svg)
 
@@ -62,10 +63,25 @@ Contribution terms are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick Install For Hermes
 
-From a published package or installed checkout:
+For a catalog/Git install, the repository root contains `plugin.yaml`, the
+entrypoint, and the bundled `src/total_recall_core` package. The catalog entry
+must use `subdir: ""`, not `hermes-plugin/total-recall`. The manifest declares
+the bounded external `cryptography` dependency; it does not fetch the unpublished
+core from PyPI. For example, to install without enabling the plugin:
 
 ```bash
-pip install total-recall-core
+hermes plugins install https://github.com/dax8it/total-recall --no-enable --yes-deps
+```
+
+Installation and enablement do not select `memory.provider` or change compaction
+settings. Select the provider separately when ready to use it. The standalone
+installer below is a different path: `--activate` explicitly changes profile
+settings as described below.
+
+For the standalone installer, install the core from this checkout first:
+
+```bash
+python -m pip install .
 total-recall hermes install --profile <profile> --activate --format text
 hermes -p <profile> memory status
 ```
@@ -97,6 +113,43 @@ To create a distributable plugin archive:
 ```bash
 total-recall hermes bundle --out dist/total-recall-hermes-plugin.tar.gz
 ```
+
+## Security And Side Effects
+
+The plugin runs with Hermes' process permissions; it is not sandboxed. Importing
+the catalog entrypoint only makes its bundled source importable. When selected
+as the memory provider, initialization and lifecycle hooks create and update
+the profile-local store at `$HERMES_HOME/total-recall` (or the explicitly
+configured Total Recall home). Writes include the event ledger, reduced state,
+SQLite/FTS and other derived indexes, signing keys, checkpoints, anchors,
+rehydration cooldown state, pending-event queues, and requested reports or
+exports. The provider's setup wizard saves requested memory settings through
+Hermes' merge-preserving config API in `$HERMES_HOME/config.yaml`; it does not
+replace unrelated configuration. Standalone install/activation can also write
+plugin files and change profile settings, as described above.
+
+Runtime subprocesses include `git` to inspect repository root/branch metadata,
+optional `qmd` commands for derived-index maintenance and retrieval (and
+embedding when explicitly enabled), and the optional Hugging Face `hf` CLI.
+These are argument-list subprocess calls, not an agent shell. QMD is optional;
+core lexical/SQLite retrieval works without it.
+
+Hugging Face backup/portable-clone workflows can invoke `hf` authentication and
+repository checks, private dataset creation, uploads, and downloads. An upload
+sends an encrypted memory bundle and associated manifest/checksum artifacts to
+the requested Hugging Face dataset using the operator's existing CLI credentials.
+The manifest metadata (including hashes, counts, and export/checkpoint details)
+is not encrypted, even though the memory archive is.
+This is opt-in backup/export/dashboard behavior, not an automatic network upload
+on plugin import, enablement, or ordinary turn sync. Review the target and
+artifacts before using it; downloaded memory must still pass integrity checks.
+
+The provider also starts a daemon background thread for memory prefetch. That
+thread performs retrieval against the configured local store/optional indexes
+and buffers context for the next turn; it is not an installed service or timer.
+The optional dashboard and installation helpers expose additional operator
+actions documented in [the dashboard guide](docs/backup-dashboard.md) and
+[Hermes setup](docs/hermes.md).
 
 ## What It Provides
 

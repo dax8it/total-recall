@@ -6,6 +6,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 
 class _FakeMemoryProvider:
     @property
@@ -177,9 +179,20 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     assert json.loads(provider.handle_tool_call("total_recall_loop_inbox", {"agent": "sparky"}))["count"] == 0
 
 
-def test_plugin_save_config_writes_profile_local_memory_provider_config(tmp_path, monkeypatch):
+def _install_fake_config_api(monkeypatch, config_path, save):
+    package = types.ModuleType("hermes_cli")
+    config = types.ModuleType("hermes_cli.config")
+    config.get_config_path = lambda: config_path
+    config.save_config = save
+    monkeypatch.setitem(sys.modules, "hermes_cli", package)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+
+
+def test_plugin_save_config_delegates_profile_local_memory_settings(tmp_path, monkeypatch):
     module = _load_plugin(monkeypatch)
     provider = module.TotalRecallMemoryProvider()
+    calls = []
+    _install_fake_config_api(monkeypatch, tmp_path / "config.yaml", lambda payload, **kwargs: calls.append((payload, kwargs)))
     provider.save_config(
         {
             "home": str(tmp_path / "custom-recall"),
@@ -189,11 +202,65 @@ def test_plugin_save_config_writes_profile_local_memory_provider_config(tmp_path
         str(tmp_path),
     )
 
-    text = (tmp_path / "config.yaml").read_text(encoding="utf-8")
-    assert "total-recall" in text
-    assert str(tmp_path / "custom-recall") in text
-    assert "false" in text.lower()
-    assert "0.82" in text
+    assert calls == [(
+        {"memory": {
+            "provider": "total-recall",
+            "total-recall": {
+                "home": str(tmp_path / "custom-recall"),
+                "auto_rehydrate": {"enabled": False, "context_threshold": 0.82},
+            },
+        }},
+        {"merge_existing": True},
+    )]
+
+
+def test_plugin_save_config_without_pyyaml_never_replaces_existing_yaml(tmp_path, monkeypatch):
+    module = _load_plugin(monkeypatch)
+    path = tmp_path / "config.yaml"
+    original = "model:\n  default: example/model\nplugins:\n  enabled: [other-plugin]\nmemory:\n  total-recall:\n    auto_rehydrate:\n      cooldown_seconds: 300\n"
+    path.write_text(original, encoding="utf-8")
+    calls = []
+    _install_fake_config_api(monkeypatch, path, lambda payload, **kwargs: calls.append((payload, kwargs)))
+    monkeypatch.setitem(sys.modules, "yaml", None)
+
+    module.TotalRecallMemoryProvider().save_config({"home": "custom-recall"}, str(tmp_path))
+
+    # This is a host-API contract test: Hermes owns the actual merge/write.
+    # The provider passes a partial update with merge_existing, not a stale full config.
+    assert calls == [(
+        {"memory": {"provider": "total-recall", "total-recall": {"home": "custom-recall"}}},
+        {"merge_existing": True},
+    )]
+    assert path.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("error", [ValueError("unreadable config"), ImportError("missing YAML backend")])
+def test_plugin_save_config_propagates_host_error_without_fallback(tmp_path, monkeypatch, error):
+    module = _load_plugin(monkeypatch)
+    path = tmp_path / "config.yaml"
+    original = "model:\n  default: example/model\n"
+    path.write_text(original, encoding="utf-8")
+
+    def fail_save(payload, *, merge_existing):
+        assert merge_existing is True
+        raise error
+
+    _install_fake_config_api(monkeypatch, path, fail_save)
+    with pytest.raises(type(error), match=str(error)):
+        module.TotalRecallMemoryProvider().save_config({"home": "custom-recall"}, str(tmp_path))
+    assert path.read_text(encoding="utf-8") == original
+
+
+def test_plugin_save_config_refuses_other_profile(tmp_path, monkeypatch):
+    module = _load_plugin(monkeypatch)
+    calls = []
+    _install_fake_config_api(monkeypatch, tmp_path / "active" / "config.yaml", lambda *args, **kwargs: calls.append(args))
+
+    with pytest.raises(ValueError, match="different Hermes profile"):
+        module.TotalRecallMemoryProvider().save_config({"home": "custom-recall"}, str(tmp_path / "other"))
+
+    assert calls == []
+    assert not (tmp_path / "other").exists()
 
 
 def test_plugin_pre_compress_and_session_switch_schedule_auto_rehydrate(tmp_path, monkeypatch):

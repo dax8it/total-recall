@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-dependencies = ["cryptography>=42"]
+dependencies = ["cryptography>=42,<51"]
 
 [project.urls]
 Homepage = "https://github.com/dax8it/total-recall"

@@ -172,6 +172,7 @@ def plugin_yaml() -> str:
     return (
         f"name: {PLUGIN_NAME}\n"
         f"version: {__version__}\n"
+        "license: MIT\n"
         'entrypoint: "__init__.py"\n'
         'provider_class: "TotalRecallMemoryProvider"\n'
         'requires_python: ">=3.11"\n'
