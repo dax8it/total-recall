@@ -63,6 +63,11 @@ Contribution terms are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick Install For Hermes
 
+Requires Hermes >=0.23.1. This is the oldest release tested, not a claim that
+older versions cannot work. CI runs the real config-save and secret-scope
+contracts against v0.23.1, pinned to commit
+`3b421578588243f920886e6fe79a6faa87ea026e`.
+
 For a catalog/Git install, use the self-contained `src/` directory. It contains
 `plugin.yaml`, the entrypoint, README, license, and `total_recall_core` package.
 The next catalog entry must use `subdir: "src"`, not the repository root or
@@ -76,6 +81,9 @@ enabling the plugin:
 ```bash
 hermes plugins install https://github.com/dax8it/total-recall/tree/main/src --no-enable --yes-deps
 ```
+
+This URL selects the `src/` payload on this repository's `main` branch, not a
+catalog entry. It does not depend on publication in the Hermes plugin catalog.
 
 Installation and enablement do not select `memory.provider` or change compaction
 settings. Select the provider separately when ready to use it. The standalone
@@ -154,9 +162,11 @@ Under Hermes, backup and portable-clone passphrases are read through
 `agent.secret_scope.get_secret`, which uses the active profile's secret scope.
 `TOTAL_RECALL_BACKUP_PASSPHRASE` and
 `TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE` are optional `config_schema` secrets in
-the catalog manifest. Missing scope errors propagate; a missing scoped value
-never falls back to another profile's environment. Only standalone use without
-the Hermes `agent` package reads these values from the environment. Explicit
+the catalog manifest. Missing scope errors propagate; the plugin adds no
+environment fallback of its own. Hermes may read the process environment in
+single-profile mode, but a missing scoped value in multiplexed mode does not
+fall back to another profile's environment. Only standalone use without the
+Hermes `agent` package reads these variables directly. Explicit
 passphrases supplied to the standalone API/CLI still take precedence. The
 dashboard uses the same passphrase route and no longer reads HF token variables
 to infer login status. It reports the HF CLI authentication check instead.

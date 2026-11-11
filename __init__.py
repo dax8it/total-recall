@@ -1,4 +1,4 @@
-"""Catalog entrypoint; the core ships in this plugin's src directory."""
+"""Catalog entrypoint for the bundled Total Recall core."""
 from __future__ import annotations
 
 import sys

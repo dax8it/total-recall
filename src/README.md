@@ -5,6 +5,10 @@ This is the self-contained catalog install directory. Set the catalog entry's
 source directory, environment-selected core, or PyPI copy of the core is needed.
 Hermes installs the declared `cryptography>=42,<51` dependency separately.
 
+Requires Hermes >=0.23.1, the oldest release tested. The repository's CI pins
+the real config-save and secret-scope tests to v0.23.1 at
+`3b421578588243f920886e6fe79a6faa87ea026e`.
+
 ## Provider tools
 
 `register(ctx)` registers a MemoryProvider, not direct plugin tools. Therefore
@@ -56,9 +60,11 @@ Optional backup and portable-clone passphrases are declared in `config_schema`
 with `type: secret`, `required: false` and their explicit environment names,
 `TOTAL_RECALL_BACKUP_PASSPHRASE` and
 `TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE`. Under Hermes, reads go through
-`agent.secret_scope.get_secret`. Missing scope errors are not bypassed, and a
-missing scoped value never falls back to a process-global value. Only standalone
-use without the Hermes `agent` package falls back to environment variables.
+`agent.secret_scope.get_secret`. Missing scope errors propagate; the plugin adds
+no environment fallback of its own. Hermes may read the process environment in
+single-profile mode, but a missing scoped value in multiplexed mode does not
+fall back to another profile's environment. Only standalone use without the
+Hermes `agent` package reads these variables directly.
 Explicit standalone API/CLI passphrases take precedence. The dashboard uses the
 same passphrase route and does not read raw HF token variables.
 

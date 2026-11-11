@@ -4,6 +4,7 @@ license: MIT
 entrypoint: "__init__.py"
 provider_class: "TotalRecallMemoryProvider"
 requires_python: ">=3.11"
+requires_hermes: ">=0.23.1"
 # For catalog installs use subdir: src and src/plugin.yaml, not this repo root.
 python_dependencies:
   - "cryptography>=42,<51"

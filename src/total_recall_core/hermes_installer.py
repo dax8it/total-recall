@@ -156,6 +156,7 @@ def plugin_yaml() -> str:
         'entrypoint: "__init__.py"\n'
         'provider_class: "TotalRecallMemoryProvider"\n'
         'requires_python: ">=3.11"\n'
+        'requires_hermes: ">=0.23.1"\n'
         "# total-recall-core is not published on PyPI. It is installed into the Hermes\n"
         "# Python by scripts/install_hermes_plugin.sh, so it is not listed under\n"
         "# python_dependencies: Hermes 0.21+\n"

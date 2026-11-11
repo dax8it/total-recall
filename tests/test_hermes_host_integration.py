@@ -125,6 +125,13 @@ try:
             raise AssertionError("unscoped read did not fail closed")
 finally:
     reset_multiplex_context(mode)
+# In single-profile mode Hermes itself may fall back to the environment.
+# The plugin delegates to that policy; it does not add its own fallback.
+token = set_secret_scope({})
+try:
+    assert all(get_secret(name) == "other-profile-value" for name in names)
+finally:
+    reset_secret_scope(token)
 print(json.dumps({"ok": True}))
 ''')
     assert result["ok"] is True

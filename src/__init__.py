@@ -1,4 +1,4 @@
-"""Catalog entrypoint for the self-contained src/ install directory."""
+"""Catalog entrypoint for the bundled Total Recall core."""
 from __future__ import annotations
 
 import sys

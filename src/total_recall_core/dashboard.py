@@ -3157,7 +3157,7 @@ _CONTROL_CENTER_HTML = r"""<!doctype html>
         'HF login': 'Whether the local HF CLI has an authenticated session. Token values are never shown.',
         'HF dataset': 'The private Hugging Face dataset id used for encrypted clone transport.',
         'HF token visibility': 'The dashboard reports only the auth source, never the token string.',
-        'Clone passphrase': 'Whether the local clone encryption passphrase is present in the environment. The passphrase value is never displayed.',
+        'Clone passphrase': 'Whether the local clone encryption passphrase is available through the active Hermes secret scope, or the environment in standalone mode. The passphrase value is never displayed.',
         'Latest encrypted clone': 'Most recent encrypted portable clone manifest found locally.',
         'Clone ledger point': 'The ledger event/hash captured by the encrypted clone manifest.',
         'Restore default': 'Restores should go to a test home first, then verify and Trust Gate before active replacement.',

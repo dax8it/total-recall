@@ -58,6 +58,7 @@ def test_hermes_installer_writes_clean_importable_bundle(tmp_path, monkeypatch):
     plugin_path = Path(installed["path"])
     assert (plugin_path / "__init__.py").is_file()
     assert (plugin_path / "plugin.yaml").is_file()
+    assert 'requires_hermes: ">=0.23.1"\n' in (plugin_path / "plugin.yaml").read_text()
     assert (plugin_path / "README.md").is_file()
     assert not list(plugin_path.rglob(".DS_Store"))
     assert not list(plugin_path.rglob("*.pyc"))

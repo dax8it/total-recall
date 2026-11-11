@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
@@ -16,6 +17,29 @@ from total_recall_core import TotalRecallConfig, TotalRecallCore
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_catalog_manifests_do_not_drift():
+    # Layout comments may differ; every declaration must otherwise match.
+    def declarations(path):
+        return "\n".join(
+            line for line in path.read_text(encoding="utf-8").splitlines()
+            if not line.lstrip().startswith("#")
+        )
+
+    assert declarations(ROOT / "plugin.yaml") == declarations(ROOT / "src/plugin.yaml")
+
+
+def test_catalog_entrypoints_do_not_drift():
+    root = (ROOT / "__init__.py").read_text(encoding="utf-8")
+    source = (ROOT / "src/__init__.py").read_text(encoding="utf-8")
+    # Only comments/formatting and this exact layout-dependent path may differ.
+    root_path = '_source = Path(__file__).resolve().parent / "src"'
+    source_path = '_source = Path(__file__).resolve().parent'
+    assert root.count(root_path) == 1
+    assert source.count(source_path) == 1
+    normalized = root.replace(root_path, source_path, 1)
+    assert ast.dump(ast.parse(normalized)) == ast.dump(ast.parse(source))
 
 
 @pytest.mark.parametrize("with_host", [False, True])
@@ -83,6 +107,7 @@ def test_catalog_manifest_declares_provider_tools_and_optional_secrets(monkeypat
     manifest = (directory / "plugin.yaml").read_text(encoding="utf-8")
     package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert "license: MIT\n" in manifest
+    assert 'requires_hermes: ">=0.23.1"\n' in manifest
     dependency = "cryptography>=42,<51"
     assert f'  - "{dependency}"' in manifest
     assert dependency in package["project"]["dependencies"]

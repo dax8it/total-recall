@@ -15,9 +15,26 @@ jobs:
           python-version: '3.11'
       - name: Privacy scan
         run: python scripts/privacy_scan.py
+      - name: Check out tested Hermes release
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 3b421578588243f920886e6fe79a6faa87ea026e # v0.23.1, our tested floor
+          path: .test-hermes
+          persist-credentials: false
       - name: Install package
-        run: python -m pip install -e . pytest
+        # Only the dependencies needed to import the real host contracts.
+        run: python -m pip install -e . pytest 'ruamel.yaml==0.18.16' 'python-dotenv==1.2.4' 'rich==14.3.4'
       - name: Run tests
-        run: python -m pytest -q
+        env:
+          TOTAL_RECALL_TEST_HERMES_SOURCE: ${{ github.workspace }}/.test-hermes
+          HOME: ${{ runner.temp }}/total-recall-tests/home
+          HERMES_HOME: ${{ runner.temp }}/total-recall-tests/hermes
+          XDG_CACHE_HOME: ${{ runner.temp }}/total-recall-tests/cache
+          TMPDIR: ${{ runner.temp }}/total-recall-tests/tmp
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: |
+          mkdir -p "$HOME" "$HERMES_HOME" "$XDG_CACHE_HOME" "$TMPDIR"
+          python -m pytest -q -rs
       - name: Install smoke
         run: scripts/install_smoke.sh
