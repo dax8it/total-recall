@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import types
 from pathlib import Path
@@ -28,11 +29,14 @@ def _install_fake_hermes_modules(monkeypatch):
     agent_mod = types.ModuleType("agent")
     memory_provider_mod = types.ModuleType("agent.memory_provider")
     memory_provider_mod.MemoryProvider = _FakeMemoryProvider
+    secret_scope_mod = types.ModuleType("agent.secret_scope")
+    setattr(secret_scope_mod, "get_secret", os.getenv)
     tools_mod = types.ModuleType("tools")
     registry_mod = types.ModuleType("tools.registry")
     registry_mod.tool_error = lambda msg: json.dumps({"ok": False, "error": msg})
     monkeypatch.setitem(sys.modules, "agent", agent_mod)
     monkeypatch.setitem(sys.modules, "agent.memory_provider", memory_provider_mod)
+    monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope_mod)
     monkeypatch.setitem(sys.modules, "tools", tools_mod)
     monkeypatch.setitem(sys.modules, "tools.registry", registry_mod)
 

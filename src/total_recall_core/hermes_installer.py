@@ -17,28 +17,8 @@ DEFAULT_CONTEXT_RISK_THRESHOLD = "0.55"
 
 PLUGIN_INIT = '''from __future__ import annotations
 
-import os
-import sys
-from pathlib import Path
-
-
-def _bootstrap_total_recall_core() -> None:
-    """Allow checkout installs while keeping the distributable plugin tiny."""
-    candidates = []
-    env_path = os.getenv("TOTAL_RECALL_CORE_SRC")
-    if env_path:
-        candidates.append(Path(env_path).expanduser())
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidates.append(parent / "src")
-    for candidate in candidates:
-        if (candidate / "total_recall_core").is_dir() and str(candidate) not in sys.path:
-            sys.path.insert(0, str(candidate))
-            return
-
-
-_bootstrap_total_recall_core()
-
+# Standalone installs use the core installed in Hermes' Python environment.
+# Catalog installs use src/__init__.py and its bundled core instead.
 from total_recall_core.hermes_provider import (  # noqa: E402,F401
     ALL_SCHEMAS,
     CHECKPOINT_SCHEMA,
@@ -177,10 +157,21 @@ def plugin_yaml() -> str:
         'provider_class: "TotalRecallMemoryProvider"\n'
         'requires_python: ">=3.11"\n'
         "# total-recall-core is not published on PyPI. It is installed into the Hermes\n"
-        "# Python by scripts/install_hermes_plugin.sh (or loaded from the checkout by\n"
-        "# __init__.py), so it is not listed under python_dependencies: Hermes 0.21+\n"
+        "# Python by scripts/install_hermes_plugin.sh, so it is not listed under\n"
+        "# python_dependencies: Hermes 0.21+\n"
         "# auto-installs that list from PyPI and disables the plugin when it fails.\n"
         'description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, learning review, compiled truth, and explicit federation."\n'
+        "provides_tools: []\n"
+        "config_schema:\n"
+        "  backup_passphrase:\n"
+        "    type: secret\n"
+        "    env: TOTAL_RECALL_BACKUP_PASSPHRASE\n"
+        "    required: false\n"
+        "  portable_clone_passphrase:\n"
+        "    type: secret\n"
+        "    env: TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE\n"
+        "    required: false\n"
+        "# Legacy provider inventory, not direct plugin registrations.\n"
         "tools:\n"
         "  - total_recall_search\n"
         "  - total_recall_status\n"

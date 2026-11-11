@@ -4,32 +4,20 @@ license: MIT
 entrypoint: "__init__.py"
 provider_class: "TotalRecallMemoryProvider"
 requires_python: ">=3.11"
-# Catalog subdir must be "": the installed repository includes src/total_recall_core.
-# Install only its external dependency; total-recall-core is not required from PyPI.
+# For catalog installs use subdir: src and src/plugin.yaml, not this repo root.
 python_dependencies:
   - "cryptography>=42,<51"
-description: "Total Recall - local-first Hermes continuity provider with ledger, signed checkpoints, fail-closed rehydrate, cited Knowledge Engine recall, freshness, temporal graph timeline, source ingest, learning review, and explicit federation."
-tools:
-  - total_recall_search
-  - total_recall_status
-  - total_recall_checkpoint
-  - total_recall_verify
-  - total_recall_trust_verify
-  - total_recall_learning_review
-  - total_recall_rehydrate
-  - total_recall_incidents
-  - total_recall_source_ingest
-  - total_recall_knowledge_query
-  - total_recall_knowledge_freshness
-  - total_recall_knowledge_status
-  - total_recall_knowledge_synthesis_status
-  - total_recall_knowledge_compiled_truth
-  - total_recall_knowledge_graph_inspect
-  - total_recall_knowledge_graph_timeline
-  - total_recall_federation_query
-  - total_recall_loop_inbox
-  - total_recall_loop_start
-  - total_recall_loop_note
-  - total_recall_loop_verify
-  - total_recall_loop_complete
-  - total_recall_handoff_export
+description: "Total Recall - local-first Hermes memory provider with 23 provider tools, signed checkpoints, cited recall and explicit federation."
+# register(ctx) registers a MemoryProvider, not ctx.register_tool tools.
+provides_tools: []
+config_schema:
+  backup_passphrase:
+    type: secret
+    env: TOTAL_RECALL_BACKUP_PASSPHRASE
+    required: false
+    description: "Optional passphrase for encrypted backup export and restore."
+  portable_clone_passphrase:
+    type: secret
+    env: TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE
+    required: false
+    description: "Optional passphrase for portable-clone export and restore."

@@ -15,6 +15,7 @@ from typing import Any, Dict, List
 from urllib.parse import parse_qs, urlparse
 
 from .api import TotalRecallConfig, TotalRecallCore
+from ._secret import get_secret
 
 
 def run_dashboard(
@@ -938,9 +939,7 @@ def _hf_status(core: TotalRecallCore) -> Dict[str, Any]:
         or os.getenv("HF_REPO_ID")
         or ""
     )
-    token_env_names = ["HF_TOKEN", "HUGGINGFACE_HUB_TOKEN", "HUGGING_FACE_HUB_TOKEN"]
-    token_env_present = any(bool(os.getenv(name)) for name in token_env_names)
-    passphrase_present = bool(os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE"))
+    passphrase_present = bool(get_secret("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE"))
     logged_in = False
     username = ""
     auth_detail = "HF CLI not found. Install/login before using Hugging Face transport."
@@ -962,10 +961,8 @@ def _hf_status(core: TotalRecallCore) -> Dict[str, Any]:
                 auth_detail = _redacted_line(result.stderr or result.stdout or "HF CLI is installed but not logged in.")
         except Exception as exc:
             auth_detail = f"HF CLI status check failed: {exc.__class__.__name__}"
-    if token_env_present:
-        token_source = "env-present"
-    elif logged_in:
-        token_source = "cli-cache"
+    if logged_in:
+        token_source = "hf-cli"
     else:
         token_source = "missing"
     if not hf_bin:

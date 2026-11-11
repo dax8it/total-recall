@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import threading
 import time
 from pathlib import Path
@@ -14,25 +13,8 @@ from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
 
-def _candidate_core_src_paths() -> List[Path]:
-    paths: List[Path] = []
-    env_path = os.getenv("TOTAL_RECALL_CORE_SRC")
-    if env_path:
-        paths.append(Path(env_path).expanduser())
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "src"
-        if (candidate / "total_recall_core").is_dir():
-            paths.append(candidate)
-    return paths
-
-
-for CORE_SRC in _candidate_core_src_paths():
-    if CORE_SRC.exists() and str(CORE_SRC) not in sys.path:
-        sys.path.insert(0, str(CORE_SRC))
-
 try:
-    from total_recall_core import TotalRecallConfig, TotalRecallCore
+    from . import TotalRecallConfig, TotalRecallCore
 except Exception as exc:  # pragma: no cover - surfaced by is_available/status
     TotalRecallConfig = None  # type: ignore[assignment]
     TotalRecallCore = None  # type: ignore[assignment]

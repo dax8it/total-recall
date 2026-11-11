@@ -28,6 +28,8 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+from ._secret import get_secret
+
 
 VERSION = "1.3.0"
 SIGNING_ALGORITHM = "ed25519-local-v1"
@@ -3277,7 +3279,7 @@ class TotalRecallCore:
         AES-GCM ciphertext envelope plus a non-secret manifest. The plaintext
         Total Recall export is written only to a temporary directory.
         """
-        secret = passphrase or os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", "")
+        secret = passphrase or get_secret("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE")
         if not secret:
             return {"ok": False, "error": "passphrase_required", "schema": PORTABLE_CLONE_SCHEMA_VERSION}
         provider_id = _safe_id(provider or "huggingface")
@@ -3389,7 +3391,7 @@ class TotalRecallCore:
         passphrase: str = "",
         replace: bool = False,
     ) -> Dict[str, Any]:
-        secret = passphrase or os.getenv("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE", "")
+        secret = passphrase or get_secret("TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE")
         if not secret:
             return {"ok": False, "error": "passphrase_required", "schema": PORTABLE_CLONE_SCHEMA_VERSION}
         encrypted_path = Path(bundle).expanduser()
@@ -4275,7 +4277,7 @@ class TotalRecallCore:
         }
 
     def _backup_passphrase_recipient(self, data_key: bytes, *, passphrase: str = "") -> Optional[Dict[str, Any]]:
-        secret = passphrase or os.getenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "")
+        secret = passphrase or get_secret("TOTAL_RECALL_BACKUP_PASSPHRASE")
         if not secret:
             return None
         salt = secrets.token_bytes(16)
@@ -4327,7 +4329,7 @@ class TotalRecallCore:
                     return {"ok": True, "data_key": data_key, "recipient": {"type": "device-x25519", "device_id": current_id}}
                 except Exception:
                     continue
-        secret = passphrase or os.getenv("TOTAL_RECALL_BACKUP_PASSPHRASE", "")
+        secret = passphrase or get_secret("TOTAL_RECALL_BACKUP_PASSPHRASE")
         if secret:
             for recipient in recipients:
                 if recipient.get("type") != "passphrase-pbkdf2":

@@ -63,20 +63,34 @@ Contribution terms are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Quick Install For Hermes
 
-For a catalog/Git install, the repository root contains `plugin.yaml`, the
-entrypoint, and the bundled `src/total_recall_core` package. The catalog entry
-must use `subdir: ""`, not `hermes-plugin/total-recall`. The manifest declares
-the bounded external `cryptography` dependency; it does not fetch the unpublished
-core from PyPI. For example, to install without enabling the plugin:
+For a catalog/Git install, use the self-contained `src/` directory. It contains
+`plugin.yaml`, the entrypoint, README, license, and `total_recall_core` package.
+The next catalog entry must use `subdir: "src"`, not the repository root or
+`hermes-plugin/total-recall`. This keeps `tests/`, `docs/`, `scripts/`, `uv.lock`,
+and the legacy wrapper out of the installed tree without removing them from the
+development checkout. The root entrypoint remains for checkout compatibility.
+The manifest declares the bounded external `cryptography` dependency; it does
+not fetch the unpublished core from PyPI. For example, to install without
+enabling the plugin:
 
 ```bash
-hermes plugins install https://github.com/dax8it/total-recall --no-enable --yes-deps
+hermes plugins install https://github.com/dax8it/total-recall/tree/main/src --no-enable --yes-deps
 ```
 
 Installation and enablement do not select `memory.provider` or change compaction
 settings. Select the provider separately when ready to use it. The standalone
 installer below is a different path: `--activate` explicitly changes profile
 settings as described below.
+
+The catalog-facing manifest declares `provides_tools: []`. `register(ctx)`
+registers a memory provider, not direct plugin tools. Hermes' validator compares
+`provides_tools` with direct tool registrations, so declaring the provider's
+23 schemas there would claim registrations that did not occur. When selected,
+the memory provider exposes those schemas through `get_tool_schemas()` and
+dispatches them through `handle_tool_call()`. They are listed in the
+[installed-plugin README](src/README.md). Any future catalog entry must also
+declare `capabilities.provides_tools: []`. These repository changes do not edit
+or submit a catalog entry.
 
 For the standalone installer, install the core from this checkout first:
 
@@ -127,6 +141,25 @@ exports. The provider's setup wizard saves requested memory settings through
 Hermes' merge-preserving config API in `$HERMES_HOME/config.yaml`; it does not
 replace unrelated configuration. Standalone install/activation can also write
 plugin files and change profile settings, as described above.
+
+The standalone installer may run the selected Hermes interpreter with
+`-m pip install --upgrade <core-source>` to install or upgrade the core and its
+dependencies. If pip is absent, it attempts `-m ensurepip --upgrade` first.
+These steps modify that Python environment and pip can contact package indexes
+or the supplied source URL. `core_install="skip"` disables that core-install
+step in the Python installer API. This is distinct from Hermes' catalog
+dependency installation and does not run on ordinary provider import.
+
+Under Hermes, backup and portable-clone passphrases are read through
+`agent.secret_scope.get_secret`, which uses the active profile's secret scope.
+`TOTAL_RECALL_BACKUP_PASSPHRASE` and
+`TOTAL_RECALL_PORTABLE_CLONE_PASSPHRASE` are optional `config_schema` secrets in
+the catalog manifest. Missing scope errors propagate; a missing scoped value
+never falls back to another profile's environment. Only standalone use without
+the Hermes `agent` package reads these values from the environment. Explicit
+passphrases supplied to the standalone API/CLI still take precedence. The
+dashboard uses the same passphrase route and no longer reads HF token variables
+to infer login status. It reports the HF CLI authentication check instead.
 
 Runtime subprocesses include `git` to inspect repository root/branch metadata,
 optional `qmd` commands for derived-index maintenance and retrieval (and
@@ -612,5 +645,15 @@ PYTHONDONTWRITEBYTECODE=1 python scripts/privacy_scan.py
 PYTHONDONTWRITEBYTECODE=1 ./scripts/install_smoke.sh
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python scripts/benchmark_total_recall.py --events 250 --queries 25
 ```
+
+The real-host integration tests additionally require an existing Hermes source
+checkout and its config dependencies on the test interpreter's import path.
+Set `TOTAL_RECALL_TEST_HERMES_SOURCE=/path/to/hermes-agent` when running pytest.
+These tests invoke the real `hermes_cli.config.save_config(merge_existing=True)`
+and `agent.secret_scope` in child processes with temporary `HOME`, `HERMES_HOME`,
+cache and temp directories. They do not invoke plugin install, validate or doctor.
+Without that explicit source path, the host integration tests skip; the standalone
+suite still runs. Place pytest's `--basetemp`, the parent test process's `HOME`,
+`HERMES_HOME`, and cache/temp environment paths in a disposable workspace too.
 
 For benchmark interpretation, see [docs/benchmarks.md](docs/benchmarks.md).

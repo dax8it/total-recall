@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -18,11 +19,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.mark.parametrize("with_host", [False, True])
-def test_catalog_entrypoint_loads_bundled_core_without_installed_package(tmp_path, with_host):
+@pytest.mark.parametrize("layout", ["root", "src"])
+def test_catalog_entrypoint_loads_bundled_core_without_installed_package(tmp_path, with_host, layout):
     plugin = tmp_path / "plugin"
     plugin.mkdir()
-    shutil.copy2(ROOT / "__init__.py", plugin / "__init__.py")
-    shutil.copytree(ROOT / "src" / "total_recall_core", plugin / "src" / "total_recall_core", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    source = ROOT if layout == "root" else ROOT / "src"
+    core_parent = plugin / "src" if layout == "root" else plugin
+    shutil.copy2(source / "__init__.py", plugin / "__init__.py")
+    shutil.copytree(ROOT / "src" / "total_recall_core", core_parent / "total_recall_core", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    for outside in (tmp_path / "src", tmp_path / "override"):
+        (outside / "total_recall_core").mkdir(parents=True)
+        (outside / "total_recall_core" / "__init__.py").write_text("raise AssertionError('outside core loaded')\n")
     code = '''
 import importlib.util, json, pathlib, sys, types
 root = pathlib.Path(sys.argv[1])
@@ -47,15 +54,17 @@ if sys.argv[2] == "True":
     assert provider.name == "total-recall"
     assert len(registered) == 1 and registered[0].name == "total-recall"
     import total_recall_core.hermes_provider as implementation
-    assert pathlib.Path(implementation.__file__).is_relative_to(root / "src")
+    assert pathlib.Path(implementation.__file__).is_relative_to(pathlib.Path(sys.argv[3]))
     assert len(provider.get_tool_schemas()) > 0
+    assert str(root.parent / "src") not in sys.path
+    assert str(root.parent / "override") not in sys.path
 print(json.dumps({"ok": True}))
 '''
     env = os.environ.copy()
     env.pop("PYTHONPATH", None)
-    env.pop("TOTAL_RECALL_CORE_SRC", None)
+    env["TOTAL_RECALL_CORE_SRC"] = str(tmp_path / "override")
     result = subprocess.run(
-        [sys.executable, "-P", "-B", "-c", code, str(plugin), str(with_host)],
+        [sys.executable, "-P", "-B", "-c", code, str(plugin), str(with_host), str(core_parent)],
         cwd=tmp_path,
         text=True,
         capture_output=True,
@@ -66,13 +75,12 @@ print(json.dumps({"ok": True}))
     assert json.loads(result.stdout) == {"ok": True}
 
 
-def test_catalog_manifest_declares_license_bounded_dependency_and_all_tools(monkeypatch):
-    # The manifest is deliberately a root plugin: a subdirectory-only install
-    # would omit the bundled source. Full Hermes validation belongs to its host.
+@pytest.mark.parametrize("directory", [ROOT, ROOT / "src"])
+def test_catalog_manifest_declares_provider_tools_and_optional_secrets(monkeypatch, directory):
     from test_hermes_plugin import _load_plugin
 
     module = _load_plugin(monkeypatch)
-    manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
+    manifest = (directory / "plugin.yaml").read_text(encoding="utf-8")
     package = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     assert "license: MIT\n" in manifest
     dependency = "cryptography>=42,<51"
@@ -80,8 +88,43 @@ def test_catalog_manifest_declares_license_bounded_dependency_and_all_tools(monk
     assert dependency in package["project"]["dependencies"]
     assert 'entrypoint: "__init__.py"' in manifest
     assert not any("total-recall-core" in line for line in manifest.splitlines() if line.startswith("  - "))
-    tools = {line.removeprefix("  - ") for line in manifest.splitlines() if line.startswith("  - total_recall_")}
-    assert tools == {schema["name"] for schema in module.ALL_SCHEMAS}
+    assert "provides_tools: []\n" in manifest
+    assert "\ntools:\n" not in manifest
+    for name in ("BACKUP", "PORTABLE_CLONE"):
+        assert f"type: secret\n    env: TOTAL_RECALL_{name}_PASSPHRASE\n    required: false" in manifest
+    # A context exposing only memory registration proves register() does not
+    # claim direct tool registrations. The provider's schemas are documented.
+    import types
+    providers = []
+    module.register(types.SimpleNamespace(register_memory_provider=providers.append))
+    assert len(providers) == 1
+    tools = {schema["name"] for schema in providers[0].get_tool_schemas()}
+    documented = set(re.findall(r"^- `(total_recall_\w+)`$", (ROOT / "src" / "README.md").read_text(), re.MULTILINE))
+    assert tools == documented
+    assert len(tools) == 23
+
+
+def test_catalog_subdirectory_excludes_development_tree():
+    source = ROOT / "src"
+    for excluded in ("tests", "docs", "scripts", "uv.lock", "hermes-plugin"):
+        assert (ROOT / excluded).exists(), f"development checkout lost {excluded}"
+        assert not (source / excluded).exists()
+    for required in ("plugin.yaml", "__init__.py", "README.md", "LICENSE", "total_recall_core/__init__.py"):
+        assert (source / required).is_file()
+        assert not (source / required).is_symlink()
+    assert (source / "LICENSE").read_bytes() == (ROOT / "LICENSE").read_bytes()
+
+
+@pytest.mark.parametrize("layout", ["root", "src"])
+def test_catalog_missing_bundle_does_not_load_a_site_package(tmp_path, layout):
+    source = ROOT if layout == "root" else ROOT / "src"
+    shutil.copy2(source / "__init__.py", tmp_path / "__init__.py")
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", "import runpy, sys; runpy.run_path(sys.argv[1])", str(tmp_path / "__init__.py")],
+        cwd=tmp_path, text=True, capture_output=True, check=False,
+    )
+    assert result.returncode != 0
+    assert "missing its bundled core" in result.stderr
 
 
 @pytest.mark.parametrize("middle", ["previous", "all previous", None])
