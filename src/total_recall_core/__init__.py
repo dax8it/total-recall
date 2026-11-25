@@ -6,6 +6,6 @@ __all__ = [
     "api",
     "cli",
 ]
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 from .api import TotalRecallConfig, TotalRecallCore

@@ -128,7 +128,7 @@ For managed Hermes 0.23.1 or newer, install or update from a tag with the
 Total Recall 1.4.0 or later CLI:
 
 ```bash
-total-recall hermes release v1.4.0 --rebuild
+total-recall hermes release v1.4.1 --rebuild
 hermes -p <profile> memory status
 total-recall hermes doctor --hermes-python /path/to/active/venv/bin/python
 ```

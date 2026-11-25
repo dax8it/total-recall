@@ -165,7 +165,7 @@ def install_release(*, tag: str, hermes_home: str, source: str, profiles: list[s
               "releasePath": str(releases / tag), "current": str(current)}
     try:
         if not TAG.fullmatch(tag):
-            raise ValueError("Pass an exact release tag such as v1.4.0, not a branch or commit.")
+            raise ValueError("Pass an exact release tag such as v1.4.1, not a branch or commit.")
         if any(not PROFILE.fullmatch(name) or name == "default" or not (home / "profiles" / name / "config.yaml").is_file()
                for name in profiles):
             raise ValueError("--link-profile requires an existing named Hermes profile.")

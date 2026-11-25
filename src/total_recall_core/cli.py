@@ -447,7 +447,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     hermes_install.add_argument("--core-source", default="", help="Path or pip spec for installing total-recall-core into Hermes Python. Defaults to this checkout when available, otherwise total-recall-core==version.")
     hermes_release = hermes_sub.add_parser("release", help="Install or switch to an exact Total Recall release tag.")
-    hermes_release.add_argument("tag", help="Exact Git tag, for example v1.4.0.")
+    hermes_release.add_argument("tag", help="Exact Git tag, for example v1.4.1.")
     hermes_release.add_argument("--hermes-home", default="", help="Hermes root to install into. Defaults to ~/.hermes.")
     hermes_release.add_argument("--source", default="", help="Git repository URL or path. Defaults to dax8it/total-recall on GitHub.")
     hermes_release.add_argument("--link-profile", action="append", default=[], help="Point an existing named profile at the shared release. Repeat as needed.")

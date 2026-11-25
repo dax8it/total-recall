@@ -7,19 +7,20 @@ incidents written by the core.
 
 ## Install a tagged release
 
-Total Recall 1.4.0 adds capture stall reporting, recall after failed verification,
-and redacted tool activity in captured turns. The supported Hermes floor is
-0.23.1. Use a tagged release with managed Hermes so a dependency rebuild never
-packages changes from your development checkout.
+Total Recall 1.4.1 uses an incremental full-text index for automatic recall. It
+retains capture stall reporting, recall after failed verification, and redacted
+tool activity in captured turns. The supported Hermes floor is 0.23.1. Use a
+tagged release with managed Hermes so a dependency rebuild never packages
+changes from your development checkout.
 
 Run this from a Total Recall 1.4.0 or later CLI:
 
 ```bash
-total-recall hermes release v1.4.0 --rebuild
+total-recall hermes release v1.4.1 --rebuild
 ```
 
 The command fetches the exact tag from `dax8it/total-recall`. It puts a detached
-source copy in `~/.hermes/total-recall-releases/v1.4.0` and switches the
+source copy in `~/.hermes/total-recall-releases/v1.4.1` and switches the
 `current` symlink to that copy. Hermes PM builds the core from that directory.
 Use `--hermes-home` to set a different Hermes root, or `--source` to fetch from
 a trusted local Git clone. No GitHub Release asset is required. Tags are treated

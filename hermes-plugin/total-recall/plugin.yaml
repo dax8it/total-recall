@@ -1,5 +1,5 @@
 name: total-recall
-version: 1.4.0
+version: 1.4.1
 license: MIT
 entrypoint: "__init__.py"
 provider_class: "TotalRecallMemoryProvider"

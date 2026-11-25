@@ -1,8 +1,8 @@
 [project]
 name = "total-recall-hermes-provider"
-version = "1.4.0"
+version = "1.4.1"
 requires-python = ">=3.11"
-dependencies = ["total-recall-core==1.4.0"]
+dependencies = ["total-recall-core==1.4.1"]
 
 [tool.uv]
 package = false

@@ -8,7 +8,7 @@ Total Recall is not just a vector database, notebook, or chat history search too
 
 | Job | Command or surface | What you get |
 |---|---|---|
-| Install or update a Hermes release | `total-recall hermes release v1.4.0 --rebuild` | Hermes PM builds from a pinned tag |
+| Install or update a Hermes release | `total-recall hermes release v1.4.1 --rebuild` | Hermes PM builds from a pinned tag |
 | See if memory is safe to trust | `total-recall verify` / `total-recall trust verify` | fail-closed integrity verdicts with reports |
 | Rehydrate an agent after restart/compaction | `total-recall rehydrate --session-id ... --query ...` | cited context only after verification passes |
 | Search local memory | `total-recall search "query"` | local cited results from ledger-derived indexes |
@@ -431,7 +431,7 @@ total-recall backup status --out-dir ~/total-recall-backups
 ### Install for Hermes
 
 ```bash
-total-recall hermes release v1.4.0 --rebuild
+total-recall hermes release v1.4.1 --rebuild
 hermes -p filippo memory status
 ```
 
