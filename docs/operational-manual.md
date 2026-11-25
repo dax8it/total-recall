@@ -160,8 +160,11 @@ does not load secrets or inspect Hermes process environments.
 To enable it for the first time, run the preview command with `--enable-macos`
 as the logged-in Mac user. For an existing checkout-based LaunchAgent, first
 select the release and confirm the watcher runs in preview mode. After approval,
-back up the plist and change only the script argument. Run each command in order
-and stop on errors:
+back up the plist and change only the script argument. Use PlistBuddy to set the
+existing array entry; `plutil -replace ProgramArguments.2` can insert a second
+script path instead. Run each command in order and stop on errors. Before
+`bootstrap`, check that `ProgramArguments` shows exactly one watcher script
+path, under `total-recall-releases/current`:
 
 ```bash
 watch="$HOME/.hermes/total-recall-releases/current/scripts/hermes_capture_watch.py"
@@ -169,8 +172,9 @@ plist="$HOME/Library/LaunchAgents/io.total-recall.capture-watch.plist"
 domain="gui/$(id -u)"
 cp -p -n "$plist" "$plist.before-release"
 launchctl bootout "$domain/io.total-recall.capture-watch"
-plutil -replace ProgramArguments.2 -string "$watch" "$plist"
+/usr/libexec/PlistBuddy -c "Set :ProgramArguments:2 $watch" "$plist"
 plutil -lint "$plist"
+plutil -extract ProgramArguments json -o - "$plist"
 launchctl bootstrap "$domain" "$plist"
 launchctl print "$domain/io.total-recall.capture-watch"
 ```
