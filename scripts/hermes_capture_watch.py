@@ -114,6 +114,12 @@ def launch_agent(root: Path) -> dict:
 def enable(root: Path) -> None:
     if sys.platform != "darwin":
         raise RuntimeError("the launch agent is available only on macOS")
+    checkout = Path(__file__).resolve().parents[1]
+    if not (checkout / ".git").is_dir():
+        raise RuntimeError("enable from the primary Total Recall checkout after merge, not a linked worktree or source copy")
+    python = Path(sys.executable)
+    if any((parent / ".git").is_file() for candidate in (python, python.resolve()) for parent in candidate.parents):
+        raise RuntimeError("use a stable Python outside linked worktrees to enable the launch agent")
     path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist"
     path.parent.mkdir(parents=True, exist_ok=True)
     Path(Path.home(), "Library", "Logs").mkdir(parents=True, exist_ok=True)

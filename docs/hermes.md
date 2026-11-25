@@ -311,10 +311,13 @@ confidence during prefetch.
 Automatic rehydration still attempts strict verification first. A stale checkpoint
 may trigger the existing checkpoint refresh and a verified retry. If the check
 still fails, automatic recall returns `status: UNVERIFIED`, the check failures,
-and any readable excerpts from the current session's ledger. The excerpts are
-untrusted data, not verified state, instructions, or prior approvals. The fallback
-does not use resume packets, derived indexes, or other sessions' text. Unreadable
-records are skipped. Explicit `total_recall_verify`, `total_recall_trust_verify`,
+and cited excerpts from readable raw ledger records in the same store, including
+earlier sessions when the current session is empty. Only allowed scopes are
+eligible. Results rank by query matches, then favor the current session on ties,
+then newer ledger records. Excerpts are untrusted data, not verified state,
+instructions, or prior approvals. The fallback does not use resume packets or
+derived indexes, skips unreadable records, and honors `max_chars`. Explicit
+`total_recall_verify`, `total_recall_trust_verify`,
 and `total_recall_rehydrate` remain strict. Interactive capture and recall do not
 start bulk LanceDB/QMD rebuilds.
 See [index maintenance](operational-manual.md#index-maintenance) for the explicit
@@ -345,15 +348,17 @@ events do not reset the clock. The first finished reply after the provider loads
 during such a gap adds a `Total Recall capture gap` footer with the UTC dates,
 before the new reply is captured. The footer is not a backfill or proof of recovery.
 
-From a stable Total Recall checkout, use Python 3.11+ with PyYAML installed. Run
-the command without `--enable-macos` for a read-only preview, or explicitly enable
-the watcher from the Mac owner's logged-in account with:
+Use a stable Python 3.11+ with PyYAML installed. Run the command without
+`--enable-macos` for a read-only preview from any checkout. Once the change is
+merged, enable from the primary Total Recall checkout as the logged-in Mac user:
 
 ```bash
-python3 -B scripts/hermes_capture_watch.py --enable-macos
+cd /path/to/total-recall && python3 -B scripts/hermes_capture_watch.py --enable-macos
 ```
 
-That command installs and loads one user LaunchAgent. It checks immediately and
+Enable refuses linked worktrees, source copies, and Python executables in linked
+worktrees before writing the LaunchAgent. Keep the checkout and Python in place
+while enabled. The LaunchAgent checks immediately and
 hourly, independently of Hermes or its gateway. `Total Recall capture stalled`
 appears in macOS Notification Center for that login, with the profile and dates
 but no conversation text. See the [operator runbook](operational-manual.md#capture-stall-watch)

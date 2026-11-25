@@ -59,8 +59,9 @@ For Hermes operators, collapse compaction and rehydration into one visible **con
 ```text
 When context enters the risk zone, save/checkpoint/verify before old chat is lost.
 After compaction, reset, resume, or restart, treat only verified Total Recall as
-authority. Automatic recall may offer labeled, unverified excerpts after a failed
-check. Do not treat those excerpts as evidence of an approval or completed work.
+authority. After a failed check, automatic recall may offer labeled, ledger-cited
+excerpts from allowed scopes in the same store, including earlier sessions.
+Do not treat those excerpts as evidence of an approval or completed work.
 ```
 
 If the Hermes profile exposes both `compression.threshold` and
@@ -125,7 +126,9 @@ that select `memory.provider: total-recall`. It follows a static absolute
 `memory.total-recall.home` or uses that profile's `total-recall` directory. It
 does not load secrets or inspect Hermes process environments.
 
-To enable, add `--enable-macos` to that command as the logged-in Mac user.
+After merging, run `python3 -B scripts/hermes_capture_watch.py --enable-macos`
+from the primary Total Recall checkout as the logged-in Mac user. Enable refuses
+linked worktrees, source copies, and Python executables in linked worktrees.
 Keep the checkout and Python path stable while it is enabled. The command will
 not overwrite an existing agent. The watch requests one macOS Notification
 Center alert per profile per stall, and rearms after capture progress. Allow

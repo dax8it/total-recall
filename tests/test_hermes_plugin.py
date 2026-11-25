@@ -364,6 +364,32 @@ def test_plugin_auto_rehydrate_salvages_context_but_explicit_tools_stay_strict(t
     assert "capture continues" in output.read_text(encoding="utf-8")
 
 
+def test_plugin_unverified_new_session_recalls_only_allowed_ledger_events(tmp_path, monkeypatch):
+    from total_recall_core import TotalRecallConfig, TotalRecallCore
+
+    module = _load_plugin(monkeypatch)
+    store = tmp_path / "total-recall"
+    writer = TotalRecallCore(TotalRecallConfig(home=store, allowed_scopes=("private", "restricted")))
+    allowed = writer.ingest(kind="note", text="release forecast from last session", session_id="earlier")
+    forbidden = writer.ingest(kind="note", text="release forecast embargoed", session_id="earlier", scope="restricted")
+    assert writer.checkpoint(session_id="earlier")["ok"]
+    with writer.ledger_file.open("ab") as ledger:
+        ledger.write(b"{invalid-json}\n")
+
+    reader = TotalRecallCore(TotalRecallConfig(home=store, allowed_scopes=("private",)))
+    provider = module.TotalRecallMemoryProvider()
+    provider.initialize("empty-session", hermes_home=str(tmp_path))
+    monkeypatch.setattr(provider, "_core", lambda: reader)
+    monkeypatch.setattr(provider, "_auto_rehydrate_config", lambda: {"max_chars": 550})
+    auto = provider.prefetch("release forecast", session_id="empty-session")
+
+    assert len(auto) <= 550
+    assert "status: UNVERIFIED" in auto and "ledger_or_state_invalid" in auto
+    assert f"\"release forecast from last session\" [source: ledger:{allowed['event']['event_id']}]" in auto
+    assert "embargoed" not in auto and forbidden["event"]["event_id"] not in auto
+    assert '"session_id":"empty-session"' not in writer.ledger_file.read_text(encoding="utf-8")
+
+
 def test_plugin_queues_writes_when_remote_lease_held_by_other_device(tmp_path, monkeypatch):
     from total_recall_core import TotalRecallConfig, TotalRecallCore
 

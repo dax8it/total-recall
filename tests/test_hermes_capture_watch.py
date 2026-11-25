@@ -68,19 +68,49 @@ def test_watch_delivery_is_local_retries_errors_and_dedupes(tmp_path, monkeypatc
     assert len(calls) == 3
 
 
-def test_enable_writes_only_requested_user_launch_agent(tmp_path, monkeypatch):
-    monkeypatch.setenv("HOME", str(tmp_path))
+@pytest.fixture
+def mac_watch(tmp_path, monkeypatch):
+    checkout = tmp_path / "primary"
+    (checkout / ".git").mkdir(parents=True)
+    script = checkout / "scripts" / WATCH.name
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(watch.sys, "platform", "darwin")
+    monkeypatch.setattr(watch, "__file__", str(script))
+    monkeypatch.setattr(watch.sys, "executable", str(tmp_path / "stable-python"))
     calls = []
     monkeypatch.setattr(watch.subprocess, "run", lambda args, **kwargs: calls.append(args))
-    root = tmp_path / ".hermes"
+    return script, home, calls
+
+
+def test_enable_writes_only_requested_user_launch_agent(mac_watch):
+    script, home, calls = mac_watch
+    root = home / ".hermes"
     watch.enable(root)
-    path = tmp_path / "Library" / "LaunchAgents" / (watch.LABEL + ".plist")
+    path = home / "Library" / "LaunchAgents" / (watch.LABEL + ".plist")
     plist = plistlib.loads(path.read_bytes())
     assert plist["RunAtLoad"] is True and plist["StartInterval"] == 3600
-    assert plist["ProgramArguments"][-4:] == [str(WATCH), "--hermes-root", str(root), "--notify"]
+    assert plist["ProgramArguments"][-4:] == [str(script), "--hermes-root", str(root), "--notify"]
     assert calls[0][:2] == ["/bin/launchctl", "bootstrap"] and calls[0][-1] == str(path)
     assert calls[1][:2] == ["/bin/launchctl", "print"]
     assert not root.exists()
     with pytest.raises(FileExistsError):
         watch.enable(root)
+
+
+@pytest.mark.parametrize("transient", ["script", "python"])
+def test_enable_refuses_worktree_paths_before_any_side_effect(tmp_path, monkeypatch, mac_watch, transient):
+    _, home, calls = mac_watch
+    worktree = tmp_path / "linked-worktree"
+    worktree.mkdir()
+    (worktree / ".git").write_text("gitdir: ../primary/.git/worktrees/linked-worktree\n", encoding="utf-8")
+    if transient == "script":
+        monkeypatch.setattr(watch, "__file__", str(worktree / "scripts" / WATCH.name))
+        message = "enable from the primary Total Recall checkout"
+    else:
+        monkeypatch.setattr(watch.sys, "executable", str(worktree / ".venv" / "bin" / "python"))
+        message = "use a stable Python outside linked worktrees"
+    with pytest.raises(RuntimeError, match=message):
+        watch.enable(home / ".hermes")
+    assert not home.exists()
+    assert not calls

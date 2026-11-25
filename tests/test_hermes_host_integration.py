@@ -214,7 +214,8 @@ reloaded = load_memory_provider("total-recall")
 reloaded.initialize("new-chat", hermes_home=str(home))
 recall = reloaded.prefetch("Hello", session_id="new-chat")
 assert "status: UNVERIFIED" in recall and "anchor_signature_mismatch" in recall
-assert "Hello." in recall and "earlier captured fixture" not in recall
+assert "Hello." in recall and "earlier captured fixture" in recall
+assert recall.index("Hello.") < recall.index("earlier captured fixture")
 db.close()
 print(json.dumps({"ok": True}))
 ''')
