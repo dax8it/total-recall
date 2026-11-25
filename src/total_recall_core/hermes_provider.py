@@ -16,6 +16,7 @@ from tools.registry import tool_error
 
 from .api import TurnAppendBlocked
 from .hermes_capture import capture_gap
+from .turn_capture import ToolActivity, capture_tool_activity, turn_text
 
 logger = logging.getLogger(__name__)
 
@@ -460,63 +461,61 @@ class TotalRecallMemoryProvider(MemoryProvider):
         self._prefetch_thread = threading.Thread(target=_worker, daemon=True)
         self._prefetch_thread.start()
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(
+        self, user_content: str, assistant_content: str, *, session_id: str = "",
+        messages: list[dict[str, Any]] | None = None, turn_author: dict[str, Any] | None = None,
+    ) -> None:
         if not user_content.strip() and not assistant_content.strip():
             return
-        if self._read_only:
+
+        sid = session_id or self._session_id
+        metadata = {"provider": "hermes.total-recall"}
+        tool_activity = capture_tool_activity(messages or [])
+
+        def queue(reason: str) -> None:
             self._queue_pending_event(
-                kind="turn",
-                text=f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}".strip(),
-                session_id=session_id or self._session_id,
-                source="hermes.sync_turn",
-                metadata={"provider": "hermes.total-recall", "queued_reason": "lease_read_only"},
+                kind="turn", text=turn_text(user_content, assistant_content),
+                session_id=sid, source="hermes.sync_turn",
+                metadata={**metadata, "queued_reason": reason}, tool_activity=tool_activity,
             )
+
+        if self._read_only:
+            queue("lease_read_only")
             return
         try:
             self._core().sync_turn(
                 user_content,
                 assistant_content,
-                session_id=session_id or self._session_id,
-                metadata={"provider": "hermes.total-recall"},
+                session_id=sid, metadata=metadata, tool_activity=tool_activity,
             )
         except TurnAppendBlocked as exc:
             # The append definitely did not start. Never queue an ambiguous
             # exception from after an append: that could duplicate a turn.
-            self._queue_pending_event(
-                kind="turn",
-                text=f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}".strip(),
-                session_id=session_id or self._session_id,
-                source="hermes.sync_turn",
-                metadata={"provider": "hermes.total-recall", "queued_reason": "ledger_unreadable"},
-            )
+            queue("ledger_unreadable")
             logger.warning("total-recall sync_turn queued: %s", exc)
         except Exception as exc:
             logger.warning("total-recall sync_turn failed: %s", exc)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        text_parts = []
-        for msg in messages[-24:]:
-            content = msg.get("content")
-            role = msg.get("role", "unknown")
-            if isinstance(content, str) and content.strip():
-                text_parts.append(f"{role}: {content.strip()[:1200]}")
-        if not text_parts:
+        if not messages:
             return
+        metadata = {"message_count": len(messages)}
         if self._read_only:
             self._queue_pending_event(
                 kind="session_end",
-                text="\n".join(text_parts),
+                text="Hermes session ended.",
                 session_id=self._session_id,
                 source="hermes.on_session_end",
-                metadata={"queued_reason": "lease_read_only"},
+                metadata={**metadata, "queued_reason": "lease_read_only"},
             )
             return
         try:
             self._core().ingest(
                 kind="session_end",
-                text="\n".join(text_parts),
+                text="Hermes session ended.",
                 session_id=self._session_id,
                 source="hermes.on_session_end",
+                metadata=metadata,
             )
             self._core().checkpoint(session_id=self._session_id, label="session_end")
         except Exception as exc:
@@ -574,7 +573,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
             if self._read_only:
                 self._queue_pending_event(
                     kind="pre_compress",
-                    text=query,
+                    text="Hermes is preparing context compaction.",
                     session_id=self._session_id,
                     source="hermes.on_pre_compress",
                     metadata={"message_count": len(messages), "queued_reason": "lease_read_only"},
@@ -582,7 +581,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
             else:
                 core.ingest(
                     kind="pre_compress",
-                    text=query,
+                    text="Hermes is preparing context compaction.",
                     session_id=self._session_id,
                     source="hermes.on_pre_compress",
                     metadata={"message_count": len(messages)},
@@ -1009,7 +1008,10 @@ class TotalRecallMemoryProvider(MemoryProvider):
             return ""
         return "[Total Recall Lease]\nstatus: READ_ONLY\n" + self._lease_warning
 
-    def _queue_pending_event(self, *, kind: str, text: str, session_id: str, source: str, metadata: Dict[str, Any]) -> None:
+    def _queue_pending_event(
+        self, *, kind: str, text: str, session_id: str, source: str, metadata: Dict[str, Any],
+        tool_activity: ToolActivity | None = None,
+    ) -> None:
         path = Path(self._configured_home()) / "state" / "pending_events.jsonl"
         payload = {
             "schema": "total-recall-pending-event-v1",
@@ -1020,6 +1022,8 @@ class TotalRecallMemoryProvider(MemoryProvider):
             "source": source,
             "metadata": metadata or {},
         }
+        if tool_activity:
+            payload["tool_activity"] = tool_activity
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as fh:

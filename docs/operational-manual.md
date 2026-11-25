@@ -116,6 +116,37 @@ total-recall rehydrate --session-id demo --query "verification before rehydratio
 The explicit CLI and Hermes tool return cited rehydration only after verification
 passes. The automatically injected Hermes fallback is a separate path.
 
+### Read a captured turn
+
+Find the event by its `ledger:` citation in `ledger/events.jsonl`. A Hermes turn
+stores both full redacted text strings under `text`. If Hermes supplied tool
+messages, `tool_activity` lists calls and results in order. For a packed turn,
+read `tool_activity.bz2_base64`, then base64-decode, bzip2-decompress, and parse
+the JSON list. Packing starts at 1,024 JSON bytes and is used only if smaller.
+
+A result's `size_bytes` and `sha256` cover the full content Hermes handed to the
+provider after redaction, not the first 96 UTF-8 bytes in `excerpt`. String
+results are hashed as UTF-8. Structured results use UTF-8 JSON with sorted
+keys and no extra whitespace. If Hermes already spilled or redacted the
+result, the byte count and hash describe what reached the provider.
+
+To look for the full stored message, use the original profile's `state.db` and
+the event's `session_id`. Match the result's `message_uid` to
+`messages.message_uid`, or use `row_id` as `messages.id`. If compaction moved
+the message, look for the same UID in the session lineage. Without either ID,
+match `call_id` to `messages.tool_call_id` and use `timestamp` to disambiguate.
+If Hermes supplied no timestamp, `message_index` is the position in the
+provider's message list, not a SQLite row ID. A deleted or never-persisted
+message cannot be recovered from a pointer. Total Recall does not perform
+these DB lookups during capture or recall.
+
+SQLite search and its lexical fallback match the tool names, the first 256
+UTF-8 bytes of each argument's JSON encoding, and the stored result excerpts.
+Search returns the turn text and ledger citation, not the tool payload. The
+knowledge graph and optional derived indexes still use turn text alone.
+Session end and pre-compression events now record a marker and message count
+instead of copies of the transcript. This changes new writes only.
+
 ### Capture stall watch
 
 Run `python3 -B scripts/hermes_capture_watch.py` from the Total Recall checkout

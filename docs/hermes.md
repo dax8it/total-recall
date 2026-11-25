@@ -325,16 +325,29 @@ external-index workflow.
 
 ### What Gets Saved, When
 
-- Completed Hermes turns are written through `sync_turn()`.
+- `sync_turn()` saves both redacted text strings in full. On Hermes versions
+  that supply redacted `messages`, it also saves the current turn's tool calls
+  and results. It does not copy calls from earlier turns in the same transcript.
+- Each call records its name, arguments, and call ID. Each result records a
+  UTF-8 excerpt of up to 96 bytes, the full byte count and SHA-256 of the
+  redacted content, and the message reference Hermes supplied. Total Recall
+  does not fetch transcript text from `state.db`.
+- Tool activity is an ordered list of calls and results. Starting at 1,024
+  JSON bytes, Total Recall stores the whole list losslessly as bzip2 and base64
+  if that makes the ledger line smaller. It does not cap the number of calls
+  or truncate arguments. See [turn records](operational-manual.md#read-a-captured-turn)
+  for the format and lookup rules.
 - A failed recall check does not disable capture. If a malformed ledger prevents
   an append from even starting, the provider queues the turn in
   `state/pending_events.jsonl` rather than writing through the damaged record.
   Pending turns are not ledger captures; the watchdog continues to see a stall.
-- Before compaction, Hermes calls `on_pre_compress(messages)` and Total Recall
-  writes a `pre_compress` event with recent decisions, blockers, file paths,
-  approvals, and next actions.
+- Before compaction, Hermes calls `on_pre_compress(messages)`. Total Recall uses
+  the recent text to find context for the compactor, but writes only a marker
+  and message count.
 - Session switches/resets/resumes are written as session lifecycle events.
-- Session end writes a `session_end` event and creates a checkpoint.
+- Session end writes a marker and message count, then creates a checkpoint.
+  Neither boundary stores another transcript excerpt. Earlier events stay
+  unchanged and verify in the same chain as new events.
 - Manual `total_recall_checkpoint` / `total-recall checkpoint` creates a fresh
   checkpoint when a handoff or risky operation needs a hard boundary.
 

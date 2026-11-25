@@ -29,12 +29,13 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ._secret import get_secret
+from .turn_capture import ToolActivity, tool_search_terms, turn_text
 
 
 VERSION = "1.3.0"
 SIGNING_ALGORITHM = "ed25519-local-v1"
 LEGACY_SIGNING_ALGORITHM = "hmac-sha256-local-v1"
-INDEX_SCHEMA_VERSION = "total-recall-sqlite-fts-v1"
+INDEX_SCHEMA_VERSION = "total-recall-sqlite-fts-v2"
 LANCEDB_INDEX_SCHEMA_VERSION = "total-recall-lancedb-derived-v1"
 QMD_INDEX_SCHEMA_VERSION = "total-recall-qmd-derived-v1"
 EMBEDDING_DIMENSIONS = 128
@@ -628,12 +629,15 @@ class TotalRecallCore:
         scope: str = "private",
         source: str = "manual",
         metadata: Optional[Dict[str, Any]] = None,
+        tool_activity: Optional[ToolActivity] = None,
     ) -> Dict[str, Any]:
         if scope not in self.config.allowed_scopes:
             raise ValueError(f"scope '{scope}' is not allowed")
-        text = str(text or "").strip()
-        if not text:
+        text = str(text or "")
+        if not text.strip():
             raise ValueError("text is required")
+        if kind != "turn" or source != "hermes.sync_turn":
+            text = text.strip()
 
         with self._locked():
             try:
@@ -659,6 +663,8 @@ class TotalRecallCore:
                 "origin": self._event_origin(source=source),
                 "prev_hash": previous_hash,
             }
+            if tool_activity:
+                base["tool_activity"] = tool_activity
             event_hash = sha256_json(base)
             event = {**base, "hash": event_hash}
             with self.ledger_file.open("a", encoding="utf-8") as fh:
@@ -1953,14 +1959,15 @@ class TotalRecallCore:
         *,
         session_id: str = "default",
         metadata: Optional[Dict[str, Any]] = None,
+        tool_activity: Optional[ToolActivity] = None,
     ) -> Dict[str, Any]:
-        text = f"User: {user_content.strip()}\nAssistant: {assistant_content.strip()}".strip()
         return self.ingest(
             kind="turn",
-            text=text,
+            text=turn_text(user_content, assistant_content),
             session_id=session_id,
             source="hermes.sync_turn",
             metadata=metadata or {},
+            tool_activity=tool_activity,
         )
 
     def reduce_state(self, *, write: bool = False) -> Dict[str, Any]:
@@ -2953,6 +2960,7 @@ class TotalRecallCore:
                 "text": event.get("text", ""),
                 "source_ref": f"ledger:{event.get('event_id')}",
                 "metadata": event.get("metadata") or {},
+                "tool_terms": tool_search_terms(event),
             })
 
         # Reports are generated audit artifacts. They can contain prior search
@@ -2981,7 +2989,8 @@ class TotalRecallCore:
 
         scored = []
         for item in candidates:
-            haystack = str(item.get("text") or "").lower()
+            tool_terms = item.pop("tool_terms", "")
+            haystack = (str(item.get("text") or "") + "\n" + tool_terms).lower()
             score = sum(1 for term in terms if term in haystack) if terms else 1
             if query and query.lower() in haystack:
                 score += 2
@@ -5195,6 +5204,7 @@ class TotalRecallCore:
                     scope TEXT NOT NULL,
                     source_ref TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    tool_terms TEXT NOT NULL,
                     metadata_json TEXT NOT NULL
                 )
                 """
@@ -5202,7 +5212,7 @@ class TotalRecallCore:
             conn.execute(
                 """
                 CREATE VIRTUAL TABLE documents_fts
-                USING fts5(text, content='documents', content_rowid='id')
+                USING fts5(text, tool_terms, content='documents', content_rowid='id')
                 """
             )
             conn.execute("CREATE INDEX documents_scope_idx ON documents(scope)")
@@ -5210,11 +5220,13 @@ class TotalRecallCore:
             conn.execute("CREATE INDEX documents_timestamp_idx ON documents(timestamp)")
 
             for event in events:
+                text = str(event.get("text") or "")
+                tool_terms = tool_search_terms(event)
                 cursor = conn.execute(
                     """
                     INSERT INTO documents
-                      (kind, item_id, timestamp, session_id, scope, source_ref, text, metadata_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      (kind, item_id, timestamp, session_id, scope, source_ref, text, tool_terms, metadata_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         "event",
@@ -5223,13 +5235,14 @@ class TotalRecallCore:
                         event.get("session_id") or "default",
                         event.get("scope") or "private",
                         f"ledger:{event.get('event_id')}",
-                        str(event.get("text") or ""),
+                        text,
+                        tool_terms,
                         canonical_json(event.get("metadata") or {}),
                     ),
                 )
                 conn.execute(
-                    "INSERT INTO documents_fts(rowid, text) VALUES (?, ?)",
-                    (cursor.lastrowid, str(event.get("text") or "")),
+                    "INSERT INTO documents_fts(rowid, text, tool_terms) VALUES (?, ?, ?)",
+                    (cursor.lastrowid, text, tool_terms),
                 )
 
             meta = {

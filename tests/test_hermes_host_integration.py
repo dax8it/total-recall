@@ -220,3 +220,86 @@ db.close()
 print(json.dumps({"ok": True}))
 ''')
     assert result["ok"] is True
+
+
+def test_real_hermes_sync_archives_redacted_tools_and_indexes_the_turn(tmp_path):
+    result = _run_host(tmp_path, r'''
+import base64, bz2, hashlib, inspect, json, os, pathlib, sqlite3, sys
+from agent.memory_manager import MemoryManager
+from agent.redact import redact_for_egress
+from hermes_state import SessionDB
+from total_recall_core import TotalRecallConfig, TotalRecallCore
+from total_recall_core.hermes_provider import TotalRecallMemoryProvider
+
+assert pathlib.Path(inspect.getfile(MemoryManager)).resolve() == pathlib.Path(sys.argv[1]) / "agent/memory_manager.py"
+home = pathlib.Path(os.environ["HERMES_HOME"])
+manager = MemoryManager()
+manager.add_provider(TotalRecallMemoryProvider())
+manager.initialize_all("fixture-chat", hermes_home=str(home))
+
+def call(name, call_id, arguments):
+    return {"role": "assistant", "tool_calls": [
+        {"type": "function", "id": call_id, "function": {"name": name, "arguments": arguments}},
+    ]}
+
+user = "Check the release manifest."
+reply = "The manifest lists twelve release files.  \n"
+args = '{"path":"docs/release.json"}'
+output = "cerulean manifest: 12 files"
+db = SessionDB(home / "state.db")
+db.create_session("fixture-chat", "desktop")
+db.append_message("fixture-chat", "tool", output, tool_name="read_file", tool_call_id="call_manifest")
+with sqlite3.connect(home / "state.db") as conn:
+    row_id, = conn.execute("SELECT id FROM messages WHERE tool_call_id = ?", ("call_manifest",)).fetchone()
+db.close()
+
+fixture_token = "sk-" + "DemonstrationTokenNoAccount012345"
+long_args = {"query": "argneedle", "source": "release-state " * 200, "token": fixture_token}
+raw_result = "untrusted output " + fixture_token + (" café" * 100)
+clean_result = redact_for_egress(raw_result, urls=True).encode("utf-8")
+messages = [
+    {"role": "user", "content": "Older turn"},
+    call("not_current", "call_old", '{"old":true}'),
+    {"role": "tool", "tool_call_id": "call_old", "content": "old output never re-archived"},
+    {"role": "user", "content": user},
+    call("read_file", "call_manifest", args),
+    {"role": "tool", "tool_call_id": "call_manifest", "content": output, "_row_id": row_id},
+    {"role": "user", "content": "Keep going", "display_kind": "steer"},
+    {"role": "user", "content": "Also check the cache", "api_content": "[Context from the interrupted assistant response]..."},
+    call("search_files", "call_cache", long_args),
+    {"role": "tool", "tool_call_id": "call_cache", "content": raw_result, "timestamp": 1795600000.5},
+    {"role": "assistant", "content": reply},
+]
+manager.sync_all(user, reply, session_id="fixture-chat", messages=messages)
+assert manager.flush_pending(timeout=10)
+
+core = TotalRecallCore(TotalRecallConfig(home=home / "total-recall"))
+line, = core.ledger_file.read_text(encoding="utf-8").splitlines()
+assert fixture_token not in line and "not_current" not in line and "old output" not in line
+event = json.loads(line)
+assert event["text"] == f"User: {user}\nAssistant: {reply}"
+assert event["source"] == "hermes.sync_turn" and event["session_id"] == "fixture-chat"
+packed = event["tool_activity"]["bz2_base64"]
+decoded = bz2.decompress(base64.b64decode(packed))
+assert fixture_token.encode() not in decoded and b"not_current" not in decoded and b"old output" not in decoded
+first_call, first_result, second_call, second_result = json.loads(decoded)
+assert first_call == {"kind": "call", "name": "read_file", "call_id": "call_manifest", "arguments": args}
+assert first_result == {"kind": "result", "call_id": "call_manifest", "row_id": row_id,
+                        "excerpt": output, "size_bytes": len(output), "sha256": hashlib.sha256(output.encode()).hexdigest()}
+with sqlite3.connect(home / "state.db") as conn:
+    found, = conn.execute("SELECT id FROM messages WHERE id = ? AND session_id = ? AND role = 'tool' AND tool_call_id = ?",
+                          (first_result["row_id"], event["session_id"], first_result["call_id"])).fetchone()
+    assert found == row_id
+assert second_call == {"kind": "call", "name": "search_files", "call_id": "call_cache",
+                       "arguments": {**long_args, "token": redact_for_egress(fixture_token, urls=True)}}
+assert second_result == {"kind": "result", "call_id": "call_cache", "timestamp": 1795600000.5,
+                         "excerpt": clean_result[:96].decode("utf-8", errors="ignore"),
+                         "size_bytes": len(clean_result), "sha256": hashlib.sha256(clean_result).hexdigest()}
+for term in ("read_file", "release.json", "cerulean", "argneedle"):
+    hit = core.search(term, session_id="fixture-chat")["results"][0]
+    assert hit["id"] == event["event_id"] and "sqlite-fts" in hit["backend_sources"]
+    assert hit["text"] == event["text"] and "tool_activity" not in hit
+manager.shutdown_all()
+print(json.dumps({"ok": True}))
+''')
+    assert result["ok"] is True

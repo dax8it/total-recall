@@ -312,6 +312,37 @@ def test_legacy_events_without_origin_still_verify(tmp_path):
     assert state["memories"][0]["origin"] == {}
 
 
+def test_pre_tool_capture_ledger_and_new_turn_verify_together(tmp_path):
+    from total_recall_core.turn_capture import capture_tool_activity
+
+    core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
+    # Exact bytes written by the previous implementation.
+    old_line = (
+        b'{"event_id":"evt_20261125T171009Z_232ff775","hash":"8891dbb2dd12ca547c97269e7cc56d2a502afbcf64b5ffdb55ec46330782685f",'
+        b'"kind":"turn","metadata":{},"origin":{"harness":"hermes"},"prev_hash":null,"scope":"private","session_id":"old-chat",'
+        b'"source":"hermes.sync_turn","text":"User: Old fixture question\\nAssistant: Old fixture answer","timestamp":"2026-11-25T17:10:09Z"}\n'
+    )
+    core.ledger_file.parent.mkdir(parents=True, exist_ok=True)
+    core.ledger_file.write_bytes(old_line)
+    assert core.checkpoint(session_id="old-chat")["ok"]
+    old_check = core.verify(session_id="old-chat", receipts=True)
+    assert old_check["ok"]
+
+    activity = capture_tool_activity([
+        {"role": "assistant", "tool_calls": [{"id": "r1", "function": {"name": "list_files", "arguments": {}}}]},
+        {"role": "tool", "tool_call_id": "r1", "message_uid": "result-uid", "content": [{"type": "text", "text": "résumé"}]},
+    ])
+    new = core.sync_turn("List the directory", "Found the résumé", session_id="new-chat", tool_activity=activity)["event"]
+    assert new["prev_hash"] == json.loads(old_line)["hash"]
+    assert new["tool_activity"][1]["excerpt"] == '[{"text":"résumé","type":"text"}]'
+    assert core.ledger_file.read_bytes().startswith(old_line)
+    old_again = core.verify(session_id="old-chat", receipts=True)
+    assert old_again["ok"] and old_again["checkpoint"] == old_check["checkpoint"]
+    assert old_again["currentEventCount"] == 2
+    assert core.checkpoint(session_id="new-chat")["ok"]
+    assert core.verify(session_id="new-chat", receipts=True)["ok"]
+
+
 def test_device_registry_crud(tmp_path):
     core = TotalRecallCore(TotalRecallConfig(home=tmp_path, enable_lancedb=False, enable_qmd=False))
 

@@ -281,6 +281,18 @@ def test_plugin_pre_compress_and_session_switch_schedule_auto_rehydrate(tmp_path
     assert "Total Recall" in block
     assert "src/app.py" in block
 
+    boundary_messages = [{"role": "user", "content": "uncaptured lifecycle-only text"}]
+    provider.on_pre_compress(boundary_messages)
+    provider.on_session_end(boundary_messages)
+    core = provider._core()
+    compaction, session_end = list(map(json.loads, core.ledger_file.read_bytes().splitlines()))[-2:]
+    assert compaction["kind"] == "pre_compress"
+    assert compaction["text"] == "Hermes is preparing context compaction."
+    assert session_end["kind"] == "session_end"
+    assert session_end["text"] == "Hermes session ended."
+    assert compaction["metadata"] == session_end["metadata"] == {"message_count": 1}
+    assert core.verify(session_id="s1")["checkpoint"]["label"] == "session_end"
+
     provider.on_session_switch("s2", parent_session_id="s1", reset=True, reason="new_session")
     auto = provider.prefetch("continue from prior work", session_id="s2")
     assert "Total Recall Auto Rehydrate" in auto
@@ -359,9 +371,14 @@ def test_plugin_auto_rehydrate_salvages_context_but_explicit_tools_stay_strict(t
         assert response["ok"] is False, response
         assert "context_block" not in response
 
-    restarted.sync_turn("capture continues", "recorded", session_id="s1")
+    restarted.sync_turn("capture continues", "recorded", session_id="s1", messages=[
+        {"role": "tool", "tool_call_id": "t1", "content": "tool output", "message_uid": "result-uid"},
+    ])
     output = tmp_path / "total-recall" / "state" / "pending_events.jsonl" if damage == "malformed" else ledger
-    assert "capture continues" in output.read_text(encoding="utf-8")
+    captured = json.loads(output.read_bytes().splitlines()[-1])
+    assert "capture continues" in captured["text"]
+    assert captured["tool_activity"][0]["message_uid"] == "result-uid"
+    assert captured["tool_activity"][0]["excerpt"] == "tool output"
 
 
 def test_plugin_unverified_new_session_recalls_only_allowed_ledger_events(tmp_path, monkeypatch):
