@@ -9,6 +9,8 @@ import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any, Dict
+from urllib.parse import urlsplit
+from urllib.request import url2pathname
 
 from . import __version__
 
@@ -394,6 +396,30 @@ def _append_wrapper_candidates(candidates: list[Path], hermes_path: Path) -> Non
         _append_python_candidate(candidates, Path(match).expanduser())
 
 
+def _stale_checkout_file(payload: Dict[str, Any]) -> str | None:
+    checkout_url = payload.get("checkoutUrl")
+    if not checkout_url or not payload.get("packagePath"):
+        return None
+    url = urlsplit(checkout_url)
+    if url.scheme != "file" or url.netloc not in {"", "localhost"}:
+        return None
+    source = Path(url2pathname(url.path)) / "src" / "total_recall_core"
+    if not (source / "__init__.py").is_file():
+        return None
+    installed = Path(payload["packagePath"]).parent
+    for pattern in ("**/*.py", "fixtures/*.jsonl"):
+        paths = {path.relative_to(source) for path in source.glob(pattern)}
+        paths.update(path.relative_to(installed) for path in installed.glob(pattern))
+        for path in sorted(paths):
+            try:
+                if (source / path).read_bytes() == (installed / path).read_bytes():
+                    continue
+            except OSError:
+                pass
+            return path.as_posix()
+    return None
+
+
 def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: str = "") -> Dict[str, Any]:
     resolution = resolve_hermes_python(hermes_bin=hermes_bin, hermes_python=hermes_python)
     if not resolution.get("ok"):
@@ -408,39 +434,65 @@ def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: st
     python = str(resolution["hermesPython"])
     code = (
         "import json, sys\n"
+        "from importlib.metadata import PackageNotFoundError, distribution\n"
         "payload = {'python': sys.executable}\n"
         "try:\n"
         "    import total_recall_core as tr\n"
         "    payload.update({'importable': True, 'version': getattr(tr, '__version__', None)})\n"
+        "    from total_recall_core.hermes_provider import TotalRecallMemoryProvider\n"
+        "    if not TotalRecallMemoryProvider().is_available():\n"
+        "        raise RuntimeError('Total Recall provider is not available')\n"
         "except Exception as exc:\n"
-        "    payload.update({'importable': False, 'error': f'{type(exc).__name__}: {exc}'})\n"
+        "    payload['error'] = f'{type(exc).__name__}: {exc}'\n"
+        "else:\n"
+        "    payload['providerAvailable'] = True\n"
+        "    payload['packagePath'] = tr.__file__\n"
+        "    try:\n"
+        "        origin = json.loads(distribution('total-recall-core').read_text('direct_url.json') or '{}')\n"
+        "        if 'dir_info' in origin and not origin['dir_info'].get('editable') and origin['url'].startswith('file:///'):\n"
+        "            payload['checkoutUrl'] = origin['url']\n"
+        "    except (PackageNotFoundError, OSError, ValueError, KeyError, TypeError, AttributeError):\n"
+        "        pass\n"
         "print(json.dumps(payload))\n"
     )
-    completed = subprocess.run([python, "-c", code], text=True, capture_output=True, check=False)
+    completed = subprocess.run([python, "-IB", "-c", code], text=True, capture_output=True, check=False)
     payload = _json_from_stdout(completed.stdout)
     importable = bool(payload.get("importable"))
+    provider_available = bool(payload.get("providerAvailable"))
     installed_version = payload.get("version")
     version_ok = installed_version == __version__
-    ok = completed.returncode == 0 and importable and version_ok
-    if ok:
+    error = payload.get("error") or completed.stderr.strip() or "probe returned no result"
+    loaded = completed.returncode == 0 and importable and provider_available and version_ok
+    rebuild = ["Rebuild total-recall-core in Hermes Python and rerun doctor."]
+    stale = _stale_checkout_file(payload) if loaded else None
+    if stale:
+        status = "STALE_CHECKOUT_BUILD"
+        message = f"Installed Total Recall core differs from its source checkout: {stale}"
+        next_steps = rebuild
+    elif loaded:
         status = "AVAILABLE"
-        message = f"total-recall-core {installed_version} is importable in Hermes Python."
+        message = f"Total Recall provider {installed_version} is available in Hermes Python."
         next_steps: list[str] = []
+    elif importable and not provider_available:
+        status = "PROVIDER_IMPORT_FAILED"
+        message = f"Hermes Python cannot load the Total Recall provider: {error}"
+        next_steps = rebuild
     elif importable:
         status = "VERSION_MISMATCH"
         message = f"Hermes Python has total-recall-core {installed_version}; {__version__} is required."
         next_steps = ["Run `total-recall hermes install --core-install always --profile <profile> --activate`."]
     else:
         status = "MISSING"
-        message = "Hermes Python cannot import total_recall_core."
-        next_steps = ["Run `total-recall hermes install --profile <profile> --activate`."]
+        message = f"Hermes Python cannot import total_recall_core: {error}"
+        next_steps = rebuild
     return {
-        "ok": ok,
+        "ok": loaded and not stale,
         "status": status,
         "hermesPython": python,
         "requiredVersion": __version__,
         "installedVersion": installed_version,
         "importable": importable,
+        "providerAvailable": provider_available,
         "versionOk": version_ok,
         "message": message,
         "nextSteps": next_steps,

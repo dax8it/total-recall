@@ -17,8 +17,8 @@ hermes -p <profile> memory status
 ```
 
 The installer auto-detects Hermes' Python from the `hermes` wrapper, checks
-whether `total_recall_core` imports there, and runs pip in that same
-environment only when the package is missing or the version is stale. It then
+whether the Total Recall provider imports there, and runs pip in that same
+environment if the provider cannot load or the version does not match. It then
 writes a clean plugin bundle to:
 
 ```text
@@ -76,6 +76,26 @@ nonstandard homes, pass `--hermes-home /path/to/hermes-home`. If auto-detection
 cannot find Hermes' Python, pass `--hermes-python /path/to/hermes/venv/bin/python`.
 For offline installs, pass `--core-source /path/to/total_recall_core.whl` or a
 checkout path.
+
+### Rebuild a Hermes PM checkout install
+
+`hermes-plugin/total-recall/pyproject.toml` declares the dependency for a plugin
+symlink into this checkout. Its relative path points to the repository root.
+Do not copy that declaration into a standalone bundle or use it for a catalog install.
+
+After changing the core in that checkout, run `hermes pm repair` to rebuild the
+recorded environment without changing the profile's provider selection. The
+core's uv cache keys include its source and packaged fixtures, so the rebuild
+picks up edits even when the version has not changed. Existing Hermes processes
+may still need a restart to use the new environment.
+
+Run `total-recall hermes doctor --hermes-python /path/to/active/venv/bin/python`
+if the managed launcher does not expose its virtual environment to auto-detection.
+Use the active environment's interpreter, not the launcher's standalone tool
+Python. Doctor returns a nonzero exit code and prints the import error if the
+provider cannot load. For a non-editable install from a local checkout, it also
+reports source files that differ from the installed copy. Doctor does not open
+the live ledger or prove turn capture.
 
 ## Optional QMD Symlink
 

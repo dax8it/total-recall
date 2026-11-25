@@ -37,3 +37,13 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 total_recall_core = ["fixtures/*.jsonl"]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "README.md" },
+    { file = "LICENSE" },
+    { file = "src/total_recall_core/**/*.py" },
+    { file = "src/total_recall_core/fixtures/*.jsonl" },
+    { git = { commit = true } },
+]

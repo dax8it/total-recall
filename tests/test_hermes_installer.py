@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -127,6 +128,55 @@ def test_hermes_python_detection_reads_wrapper_exec(tmp_path):
     assert result["hermesPython"] == str(hermes_python)
 
 
+def test_hermes_doctor_rejects_broken_provider_and_stale_checkout(tmp_path):
+    hermes_home = tmp_path / "hermes"
+    assert hermes_installer.install_plugin(hermes_home=str(hermes_home), core_install="skip")["ok"]
+    core = tmp_path / "total_recall_core"
+    core.mkdir()
+    (core / "__init__.py").write_text('__version__ = "1.3.0"\n', encoding="utf-8")
+    (core / "hermes_provider.py").write_text(
+        "from ._secret import available\n\n"
+        "class TotalRecallMemoryProvider:\n"
+        "    def is_available(self):\n"
+        "        return available\n",
+        encoding="utf-8",
+    )
+    hermes_python = tmp_path / "python"
+    hermes_python.write_text(
+        f"#!{sys.executable}\nimport sys\nexec(sys.argv[-1])\n", encoding="utf-8",
+    )
+    hermes_python.chmod(0o755)
+    cli_env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    args = [
+        sys.executable, "-m", "total_recall_core.cli", "hermes", "doctor",
+        "--hermes-home", str(hermes_home), "--hermes-python", str(hermes_python), "--format", "json",
+    ]
+    broken = subprocess.run(args, env=cli_env, capture_output=True, text=True, check=False)
+    assert broken.returncode == 1, broken.stdout + broken.stderr
+    broken_core = json.loads(broken.stdout)["core"]
+    assert broken_core["status"] == "PROVIDER_IMPORT_FAILED"
+    assert "No module named 'total_recall_core._secret'" in broken_core["message"]
+
+    (core / "_secret.py").write_text("available = True\n", encoding="utf-8")
+    repaired = subprocess.run(args, env=cli_env, capture_output=True, text=True, check=False)
+    assert repaired.returncode == 0, repaired.stdout + repaired.stderr
+    assert json.loads(repaired.stdout)["core"]["status"] == "AVAILABLE"
+
+    checkout = tmp_path / "checkout"
+    source = checkout / "src" / "total_recall_core"
+    shutil.copytree(core, source)
+    metadata = tmp_path / "total_recall_core-1.3.0.dist-info"
+    metadata.mkdir()
+    (metadata / "direct_url.json").write_text(json.dumps({"url": checkout.as_uri(), "dir_info": {}}))
+    (source / "_secret.py").write_text("available = True\n# unbuilt change\n", encoding="utf-8")
+    stale = subprocess.run(args, env=cli_env, capture_output=True, text=True, check=False)
+    assert stale.returncode == 1, stale.stdout + stale.stderr
+    stale_core = json.loads(stale.stdout)["core"]
+    assert stale_core["status"] == "STALE_CHECKOUT_BUILD"
+    assert stale_core["providerAvailable"] is True
+    assert stale_core["message"].endswith(": _secret.py")
+
+
 def test_hermes_core_auto_installs_when_missing(tmp_path):
     state = tmp_path / "installed.json"
     calls = tmp_path / "calls.jsonl"
@@ -144,9 +194,9 @@ from pathlib import Path
 state = Path({str(state)!r})
 calls = Path({str(calls)!r})
 calls.open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
-if sys.argv[1:2] == ["-c"]:
+if sys.argv[1:3] == ["-IB", "-c"]:
     if state.exists():
-        print(json.dumps({{"python": sys.executable, "importable": True, "version": "1.3.0"}}))
+        print(json.dumps({{"python": sys.executable, "importable": True, "providerAvailable": True, "version": "1.3.0"}}))
     else:
         print(json.dumps({{"python": sys.executable, "importable": False, "error": "ModuleNotFoundError: No module named total_recall_core"}}))
 elif sys.argv[1:4] == ["-m", "pip", "--version"]:
