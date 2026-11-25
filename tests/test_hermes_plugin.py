@@ -320,14 +320,16 @@ def test_plugin_auto_rehydrate_verifies_once(tmp_path, monkeypatch):
     provider.initialize("s1", hermes_home=str(tmp_path))
     provider.sync_turn("bounded rehydrate marker", "stored", session_id="s1")
     provider.handle_tool_call("total_recall_checkpoint", {"session_id": "s1"})
-    original_verify = TotalRecallCore.verify
+    ledger = provider._core().ledger_file
+    ledger.write_text(json.dumps(json.loads(ledger.read_text())) + "\n", encoding="utf-8")
+    original_verify = TotalRecallCore._inspect_checkpoint_locked
     verifications = []
 
     def counted_verify(core, **kwargs):
         verifications.append(kwargs)
         return original_verify(core, **kwargs)
 
-    monkeypatch.setattr(TotalRecallCore, "verify", counted_verify)
+    monkeypatch.setattr(TotalRecallCore, "_inspect_checkpoint_locked", counted_verify)
     provider.on_turn_start(1, "continue", context_usage_ratio=0.8)
     auto = provider.prefetch("bounded rehydrate marker", session_id="s1")
 

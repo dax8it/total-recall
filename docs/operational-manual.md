@@ -59,8 +59,9 @@ For Hermes operators, collapse compaction and rehydration into one visible **con
 ```text
 When context enters the risk zone, save/checkpoint/verify before old chat is lost.
 After compaction, reset, resume, or restart, treat only verified Total Recall as
-authority. After a failed check, automatic recall may offer labeled, ledger-cited
-excerpts from allowed scopes in the same store, including earlier sessions.
+authority. Automatic recall can cite earlier sessions from the same store. It
+marks records newer than the signed checkpoint as UNVERIFIED. If verification
+fails, all returned excerpts are UNVERIFIED.
 Do not treat those excerpts as evidence of an approval or completed work.
 ```
 
@@ -69,6 +70,13 @@ If the Hermes profile exposes both `compression.threshold` and
 number for the simplest mental model. If they differ, the higher rehydrate
 threshold is just an extra high-context safety net; Hermes compaction hooks still
 write pre-compaction continuity.
+
+If a reply says `Total Recall automatic recall did not finish in time`, that
+turn received no Total Recall excerpts. The provider returns the notice before
+Hermes' eight-second prefetch deadline. It does not wait for another store writer,
+refresh the checkpoint, or rebuild either SQLite index during prefetch. This is
+not a capture-gap notice. For a turn that needs verified history, use the
+explicit verify or rehydrate tool before relying on prior context.
 
 ## First 10 Minutes
 
@@ -354,6 +362,15 @@ ledger during the build, the completed snapshot is reported as stale. Failed
 or interrupted builds remain incomplete. Timed-out QMD jobs receive bounded
 cleanup of their owned process group. Do not cancel unrelated jobs or edit
 index metadata to make a health check pass.
+
+Knowledge index rebuilds stage a new database in
+`knowledge/index/.knowledge.sqlite.<pid>.<nonce>.tmp`. An interrupted rebuild
+can leave that file and its `-journal` behind. They are not the active
+`knowledge.sqlite` and do not contain authoritative records. To reclaim space,
+confirm the active database is present and no process is using the exact
+staging files. Remove only those confirmed orphaned files and their matching
+journals. Do not remove an in-use staging file, the active database, or any
+sidecar of the active database.
 
 Saves still perform local state reduction and SQLite/FTS work, so this is not
 a constant-time or instant-save guarantee. The bounded native repair test

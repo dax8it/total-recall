@@ -96,6 +96,74 @@ print(json.dumps({"ok": True, "save_config_source": inspect.getfile(save_config)
     assert Path(result["config"]).is_relative_to(tmp_path)
 
 
+def test_first_turn_recall_on_real_hermes_with_large_store(tmp_path):
+    result = _run_host(tmp_path, r'''
+import hashlib, json, os, pathlib, time
+from agent.memory_manager import MemoryManager
+from total_recall_core import TotalRecallConfig, TotalRecallCore
+from total_recall_core.api import canonical_json, sha256_json
+from total_recall_core.hermes_provider import TotalRecallMemoryProvider
+
+home = pathlib.Path(os.environ["HERMES_HOME"])
+store = home / "total-recall"
+core = TotalRecallCore(TotalRecallConfig(home=store))
+marker = "cerulean continuity marker"
+padding = (" ".join(f"fixture{i:04x}" for i in range(650)) + " ")[:6800]
+previous = None
+with core.ledger_file.open("w", encoding="utf-8") as ledger:
+    for i in range(16898):
+        event = {"event_id": f"evt_{i}", "prev_hash": previous, "kind": "turn", "scope": "private",
+                 "session_id": f"earlier-{i // 12}", "timestamp": "2026-11-24T07:23:59Z",
+                 "text": f"{marker if i == 16896 else 'synthetic discussion'} {padding}",
+                 "metadata": {"fixture": i}}
+        event["hash"] = previous = sha256_json(event)
+        ledger.write(canonical_json(event) + "\n")
+assert core.ledger_file.stat().st_size >= 117_000_000
+signed = core.checkpoint(session_id="earlier")
+checkpoint_file = pathlib.Path(signed["checkpointFile"])
+anchor_file = pathlib.Path(signed["anchor"]["anchorFile"])
+with core.ledger_file.open("a", encoding="utf-8") as ledger:
+    for scope in ("private", "restricted"):
+        event = {"event_id": f"evt_unsigned_{scope}", "prev_hash": previous, "kind": "turn", "scope": scope,
+                 "session_id": "earlier", "timestamp": "2026-11-25T07:23:59Z", "text": f"{scope} unsigned marker"}
+        event["hash"] = previous = sha256_json(event)
+        ledger.write(canonical_json(event) + "\n")
+
+def fingerprints():
+    results = []
+    for path in (core.ledger_file, checkpoint_file, anchor_file):
+        with path.open("rb") as handle:
+            results.append((path.stat().st_mtime_ns, hashlib.file_digest(handle, "sha256").hexdigest()))
+    return results
+
+before = fingerprints()
+for i in range(3422):
+    path = checkpoint_file.parent / f"checkpoint_old_{i:04}.json"
+    path.write_text('{}')
+    os.utime(path, (1, 1))
+assert not core.index_file.exists()
+for sid in ("fresh-chat", "another-fresh-chat"):
+    manager = MemoryManager()
+    manager.add_provider(TotalRecallMemoryProvider())
+    manager.initialize_all(sid, hermes_home=str(home))
+    manager.on_turn_start(1, marker)
+    start = time.monotonic()
+    recall = manager.prefetch_all(marker, session_id=sid)
+    elapsed = time.monotonic() - start
+    signed, unsigned = recall.split("After the signed checkpoint\n", 1)
+    assert "status: PASS" in signed and "[source: ledger:evt_16896]" in signed, (elapsed, recall)
+    assert "evt_unsigned" not in signed
+    assert "status: UNVERIFIED" in unsigned and "[source: ledger:evt_unsigned_private]" in unsigned
+    assert "evt_unsigned_restricted" not in recall
+    assert elapsed < 5.0, elapsed
+assert not core.index_file.exists()
+assert len(list(checkpoint_file.parent.glob('*.json'))) == 3423
+assert fingerprints() == before
+print(json.dumps({"ok": True}))
+''')
+    assert result["ok"] is True
+
+
 def test_passphrases_use_real_hermes_scope_and_fail_closed(tmp_path):
     result = _run_host(tmp_path, r'''
 import json, os
@@ -302,6 +370,75 @@ for term in ("read_file", "release.json", "cerulean", "argneedle"):
     assert hit["id"] == event["event_id"] and "sqlite-fts" in hit["backend_sources"]
     assert hit["text"] == event["text"] and "tool_activity" not in hit
 manager.shutdown_all()
+print(json.dumps({"ok": True}))
+''')
+    assert result["ok"] is True
+
+
+def test_recall_timeout_reaches_the_same_final_reply_on_real_hermes(tmp_path):
+    result = _run_host(tmp_path, r'''
+import json, logging, os, pathlib, shutil, sys, threading, time
+from types import SimpleNamespace
+from unittest.mock import patch
+from agent.memory_manager import MemoryManager
+from agent.turn_context import _memory_turn_start_and_prefetch
+from agent.turn_finalizer import apply_llm_output_transform
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+from plugins.memory import load_memory_provider
+from total_recall_core import TotalRecallConfig, TotalRecallCore
+
+root = pathlib.Path(sys.argv[2])
+home = pathlib.Path(os.environ["HERMES_HOME"])
+(home / "config.yaml").write_text("memory:\n  provider: total-recall\n")
+plugin = home / "plugins" / "total-recall"
+shutil.copytree(root / "hermes-plugin/total-recall", plugin)
+provider = load_memory_provider("total-recall")
+assert provider is not None
+core = TotalRecallCore(TotalRecallConfig(home=home / "total-recall"))
+core.ingest(kind="note", text="earlier completed work", session_id="earlier")
+core.checkpoint(session_id="earlier")
+manager = MemoryManager()
+manager.add_provider(provider)
+manager.initialize_all("fresh-chat", hermes_home=str(home))
+agent = SimpleNamespace(session_id="fresh-chat", model="offline-fixture", platform="desktop",
+                        _memory_manager=manager, _user_turn_count=1)
+logger = logging.getLogger("test")
+started, release = threading.Event(), threading.Event()
+read_snapshot = TotalRecallCore._automatic_recall_snapshot
+
+def slow_snapshot(self, **kw):
+    started.set()
+    assert release.wait(4)
+    return read_snapshot(self, **kw)
+
+query = "Find earlier completed work"
+with patch("total_recall_core.hermes_provider._RECALL_BUDGET_SECONDS", 0.2), patch.object(
+    TotalRecallCore, "_automatic_recall_snapshot", slow_snapshot,
+):
+    start = time.monotonic()
+    recall = _memory_turn_start_and_prefetch(agent, query, None, "")
+    assert started.is_set() and time.monotonic() - start < 2
+    assert "status: UNVERIFIED" in recall and "did not finish in time" in recall
+    assert "[source:" not in recall and "earlier completed work" not in recall
+    token = set_hermes_home_override(home / "other-profile")
+    try:
+        other_agent = SimpleNamespace(session_id=agent.session_id, model=agent.model, platform="desktop")
+        other_reply, other_transformed, _ = apply_llm_output_transform(other_agent, "Other.", turn_id="one", logger=logger)
+    finally:
+        reset_hermes_home_override(token)
+    assert not other_transformed and other_reply == "Other."
+    first, transformed, _ = apply_llm_output_transform(agent, "First.", turn_id="one", logger=logger)
+    assert transformed and first.startswith("First.\n\nTotal Recall automatic recall did not finish in time.")
+    workers = [t for t in threading.enumerate() if t.name == "total-recall-bounded-prefetch"]
+    release.set()
+    for worker in workers:
+        worker.join(3)
+        assert not worker.is_alive()
+
+agent._user_turn_count = 2
+assert "earlier completed work" in _memory_turn_start_and_prefetch(agent, query, None, "")
+second, transformed, _ = apply_llm_output_transform(agent, "Next.", turn_id="two", logger=logger)
+assert second == "Next." and not transformed
 print(json.dumps({"ok": True}))
 ''')
     assert result["ok"] is True
