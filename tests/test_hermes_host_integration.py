@@ -226,7 +226,6 @@ def test_real_hermes_sync_archives_redacted_tools_and_indexes_the_turn(tmp_path)
     result = _run_host(tmp_path, r'''
 import base64, bz2, hashlib, inspect, json, os, pathlib, sqlite3, sys
 from agent.memory_manager import MemoryManager
-from agent.redact import redact_for_egress
 from hermes_state import SessionDB
 from total_recall_core import TotalRecallConfig, TotalRecallCore
 from total_recall_core.hermes_provider import TotalRecallMemoryProvider
@@ -254,9 +253,12 @@ with sqlite3.connect(home / "state.db") as conn:
 db.close()
 
 fixture_token = "sk-" + "DemonstrationTokenNoAccount012345"
+# Both supported hosts mask this fixture the same way. Keep the expected
+# bytes independent of the host redactor API.
+redacted_token = "sk-Dem...2345"
 long_args = {"query": "argneedle", "source": "release-state " * 200, "token": fixture_token}
 raw_result = "untrusted output " + fixture_token + (" café" * 100)
-clean_result = redact_for_egress(raw_result, urls=True).encode("utf-8")
+clean_result = raw_result.replace(fixture_token, redacted_token).encode("utf-8")
 messages = [
     {"role": "user", "content": "Older turn"},
     call("not_current", "call_old", '{"old":true}'),
@@ -291,7 +293,7 @@ with sqlite3.connect(home / "state.db") as conn:
                           (first_result["row_id"], event["session_id"], first_result["call_id"])).fetchone()
     assert found == row_id
 assert second_call == {"kind": "call", "name": "search_files", "call_id": "call_cache",
-                       "arguments": {**long_args, "token": redact_for_egress(fixture_token, urls=True)}}
+                       "arguments": {**long_args, "token": redacted_token}}
 assert second_result == {"kind": "result", "call_id": "call_cache", "timestamp": 1795600000.5,
                          "excerpt": clean_result[:96].decode("utf-8", errors="ignore"),
                          "size_bytes": len(clean_result), "sha256": hashlib.sha256(clean_result).hexdigest()}
