@@ -124,13 +124,21 @@ Total Recall plugs into Hermes Agent (by Nous Research) as an optional memory
 provider. The plugin is a thin adapter over `total-recall-core`; all authoritative
 continuity stays in the local ledger, checkpoints, and anchors.
 
+For managed Hermes 0.23.1 or newer, install or update from a tag with the
+Total Recall 1.4.0 or later CLI:
+
 ```bash
-total-recall hermes install --profile <profile> --activate --format text
+total-recall hermes release v1.4.0 --rebuild
 hermes -p <profile> memory status
-total-recall hermes doctor
+total-recall hermes doctor --hermes-python /path/to/active/venv/bin/python
 ```
 
-From a checkout:
+The pinned source lives under `~/.hermes/total-recall-releases/`. If you already
+have Total Recall installed, see the [migration instructions](hermes.md#install-a-tagged-release)
+for `--migrate`, `--link-profile`, and restart guidance. The release command
+leaves config and data alone. For a fresh profile, select the provider yourself.
+
+For development from a checkout, not a managed release:
 
 ```bash
 ./scripts/install_hermes_plugin.sh --profile <profile> --activate --format text

@@ -104,7 +104,7 @@ def deliver(problems: dict[str, tuple[str, str, str]], state: Path) -> None:
 def launch_agent(root: Path) -> dict:
     return {
         "Label": LABEL,
-        "ProgramArguments": [sys.executable, "-B", str(Path(__file__).resolve()), "--hermes-root", str(root), "--notify"],
+        "ProgramArguments": [sys.executable, "-B", os.path.abspath(__file__), "--hermes-root", str(root), "--notify"],
         "RunAtLoad": True,
         "StartInterval": HOUR,
         "StandardErrorPath": str(Path.home() / "Library" / "Logs" / f"{LABEL}.log"),
@@ -115,6 +115,9 @@ def enable(root: Path) -> None:
     if sys.platform != "darwin":
         raise RuntimeError("the launch agent is available only on macOS")
     checkout = Path(__file__).resolve().parents[1]
+    release_launcher = root / "total-recall-releases" / "current" / "scripts" / Path(__file__).name
+    if checkout.parent.name == "total-recall-releases" and Path(os.path.abspath(__file__)) != release_launcher:
+        raise RuntimeError(f"enable from {release_launcher} so the watchdog follows release switches")
     if not (checkout / ".git").is_dir():
         raise RuntimeError("enable from the primary Total Recall checkout after merge, not a linked worktree or source copy")
     python = Path(sys.executable)

@@ -446,6 +446,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ensure total-recall-core is importable in Hermes Python. auto checks first, always reinstalls/upgrades, skip only writes the plugin bundle.",
     )
     hermes_install.add_argument("--core-source", default="", help="Path or pip spec for installing total-recall-core into Hermes Python. Defaults to this checkout when available, otherwise total-recall-core==version.")
+    hermes_release = hermes_sub.add_parser("release", help="Install or switch to an exact Total Recall release tag.")
+    hermes_release.add_argument("tag", help="Exact Git tag, for example v1.4.0.")
+    hermes_release.add_argument("--hermes-home", default="", help="Hermes root to install into. Defaults to ~/.hermes.")
+    hermes_release.add_argument("--source", default="", help="Git repository URL or path. Defaults to dax8it/total-recall on GitHub.")
+    hermes_release.add_argument("--link-profile", action="append", default=[], help="Point an existing named profile at the shared release. Repeat as needed.")
+    hermes_release.add_argument("--migrate", action="store_true", help="Keep backups of existing Total Recall plugin paths and replace them with release links.")
+    hermes_release.add_argument("--rebuild", action="store_true", help="Sync Hermes PM from the selected provider paths after switching the release. Does not restart Hermes.")
+    hermes_release.add_argument("--hermes-bin", default="hermes")
+    hermes_release.add_argument("--dry-run", action="store_true", help="Preview link changes without fetching or building.")
+    hermes_release.add_argument("--format", choices=["json", "text"], default="text")
     hermes_status = hermes_sub.add_parser("status")
     hermes_status.add_argument("--hermes-home", default="")
     hermes_status.add_argument("--plugin-dir", default="")
@@ -499,6 +509,16 @@ def _print_hermes(payload: dict, *, fmt: str) -> int:
         return _print(payload)
     state = "ready" if payload.get("ok") else "needs attention"
     print(f"Total Recall Hermes setup: {state}")
+    if payload.get("error") or payload.get("message"):
+        print(payload.get("error") or payload["message"])
+    if payload.get("source"):
+        print(f"Source: {payload['source']['message']}")
+    if payload.get("releasePath"):
+        print(f"Release copy: {payload['releasePath']}")
+    if payload.get("backup"):
+        print(f"Previous plugin paths: {payload['backup']}")
+    if payload.get("rebuild", {}).get("returncode") == 0:
+        print("Hermes PM repair: completed")
     core = payload.get("core") or {}
     if core:
         print(f"Core runtime: {core.get('message') or core.get('status') or 'not checked'}")
@@ -1156,6 +1176,14 @@ def _handle_hermes(args: argparse.Namespace) -> int:
         from . import hermes_installer
 
     sub = args.hermes_command or "status"
+    if sub == "release":
+        from total_recall_core.hermes_release import REPOSITORY, install_release
+
+        return _print_hermes(install_release(
+            tag=args.tag, hermes_home=args.hermes_home, source=args.source or REPOSITORY,
+            profiles=args.link_profile, migrate=args.migrate, rebuild=args.rebuild,
+            hermes_bin=args.hermes_bin, dry_run=args.dry_run,
+        ), fmt=args.format)
     if sub == "install":
         return _print_hermes(
             hermes_installer.install_plugin(

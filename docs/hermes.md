@@ -5,11 +5,57 @@ This guide installs Total Recall as a Hermes Agent memory provider named
 authoritative continuity remains in the local ledger, checkpoints, anchors, and
 incidents written by the core.
 
-## One-Command Install
+## Install a tagged release
 
-Install the core package into the Python environment Hermes actually uses,
-write the plugin bundle, select it for the profile, and verify it
-with one command:
+Total Recall 1.4.0 adds capture stall reporting, recall after failed verification,
+and redacted tool activity in captured turns. The supported Hermes floor is
+0.23.1. Use a tagged release with managed Hermes so a dependency rebuild never
+packages changes from your development checkout.
+
+Run this from a Total Recall 1.4.0 or later CLI:
+
+```bash
+total-recall hermes release v1.4.0 --rebuild
+```
+
+The command fetches the exact tag from `dax8it/total-recall`. It puts a detached
+source copy in `~/.hermes/total-recall-releases/v1.4.0` and switches the
+`current` symlink to that copy. Hermes PM builds the core from that directory.
+Use `--hermes-home` to set a different Hermes root, or `--source` to fetch from
+a trusted local Git clone. No GitHub Release asset is required. Tags are treated
+as immutable, and an earlier installed tag can be selected again the same way.
+
+For an existing installation, preview with `--dry-run --migrate`. Add
+`--link-profile NAME` for each named profile that should use the shared release.
+`--migrate` keeps previous plugin paths in a `migration-*` directory beside the
+releases. The release command does not modify profile settings, stores, or
+ledgers. For a new profile, set `memory.provider` to `total-recall` separately
+before asking PM to build its dependency.
+
+To upgrade, run `total-recall hermes release NEW_TAG --rebuild`. Omit
+`--link-profile` after the initial migration. The command does not restart any
+process. `--rebuild` makes PM read the current provider selection; `hermes pm
+repair` alone replays the previous dependency graph and cannot switch sources.
+If PM sync fails after the pointer switches, do not restart Hermes. Fix the
+sync error and repeat the command, or select the previous cached tag and
+rebuild. After a successful build, check the release before restarting:
+
+```bash
+total-recall hermes doctor --hermes-python /path/to/active/venv/bin/python
+```
+
+Doctor checks the selected plugin, exact Git tag and commit, and the installed
+core's origin and source bytes. It reports development checkouts, untagged
+commits, and local changes. It checks the Python you pass, not the interpreter
+already loaded in a running process. On a managed launcher, use
+`hermes --run-module site` to identify the active environment. For a named
+profile's plugin paths, pass `--hermes-home ~/.hermes/profiles/NAME` to doctor.
+
+## Standalone and development installs
+
+Use the following installer for a standalone copy or local development, not for
+a pinned managed release. It installs the core package into Hermes' Python,
+writes the plugin bundle, selects it for the profile, and checks the result:
 
 ```bash
 total-recall hermes install --profile <profile> --activate --format text
@@ -361,18 +407,19 @@ events do not reset the clock. The first finished reply after the provider loads
 during such a gap adds a `Total Recall capture gap` footer with the UTC dates,
 before the new reply is captured. The footer is not a backfill or proof of recovery.
 
-Use a stable Python 3.11+ with PyYAML installed. Run the command without
-`--enable-macos` for a read-only preview from any checkout. Once the change is
-merged, enable from the primary Total Recall checkout as the logged-in Mac user:
+Use a stable Python 3.11+ with PyYAML installed. Run without `--enable-macos`
+for a read-only preview. To install a new LaunchAgent, run this as the logged-in
+Mac user after selecting a release:
 
 ```bash
-cd /path/to/total-recall && python3 -B scripts/hermes_capture_watch.py --enable-macos
+python3 -B ~/.hermes/total-recall-releases/current/scripts/hermes_capture_watch.py --enable-macos
 ```
 
-Enable refuses linked worktrees, source copies, and Python executables in linked
-worktrees before writing the LaunchAgent. Keep the checkout and Python in place
-while enabled. The LaunchAgent checks immediately and
-hourly, independently of Hermes or its gateway. `Total Recall capture stalled`
+Keep the `current` path and the Python executable in place. The LaunchAgent
+follows later release switches at the next check. If the agent already exists,
+use the [migration commands](operational-manual.md#capture-stall-watch) instead.
+The LaunchAgent checks immediately and hourly, independently of Hermes or its
+gateway. `Total Recall capture stalled`
 appears in macOS Notification Center for that login, with the profile and dates
 but no conversation text. See the [operator runbook](operational-manual.md#capture-stall-watch)
 for scope, diagnostics, and how to stop the watch.

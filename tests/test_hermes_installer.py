@@ -10,7 +10,7 @@ import tarfile
 import types
 from pathlib import Path
 
-from total_recall_core import hermes_installer, qmd_installer
+from total_recall_core import __version__, hermes_installer, qmd_installer
 
 
 class _FakeMemoryProvider:
@@ -133,7 +133,7 @@ def test_hermes_doctor_rejects_broken_provider_and_stale_checkout(tmp_path):
     assert hermes_installer.install_plugin(hermes_home=str(hermes_home), core_install="skip")["ok"]
     core = tmp_path / "total_recall_core"
     core.mkdir()
-    (core / "__init__.py").write_text('__version__ = "1.3.0"\n', encoding="utf-8")
+    (core / "__init__.py").write_text(f'__version__ = "{__version__}"\n', encoding="utf-8")
     (core / "hermes_provider.py").write_text(
         "from ._secret import available\n\n"
         "class TotalRecallMemoryProvider:\n"
@@ -144,9 +144,9 @@ def test_hermes_doctor_rejects_broken_provider_and_stale_checkout(tmp_path):
     # The fake import needs its own distribution metadata too. Otherwise
     # Hermes' real interpreter can attach its installed build's source URL
     # to the fixture's module and report a stale checkout before we create one.
-    metadata = tmp_path / "total_recall_core-1.3.0.dist-info"
+    metadata = tmp_path / f"total_recall_core-{__version__}.dist-info"
     metadata.mkdir()
-    (metadata / "METADATA").write_text("Name: total-recall-core\nVersion: 1.3.0\n", encoding="utf-8")
+    (metadata / "METADATA").write_text(f"Name: total-recall-core\nVersion: {__version__}\n", encoding="utf-8")
     hermes_python = tmp_path / "python"
     hermes_python.write_text(
         f"#!{sys.executable}\nimport sys\nexec(sys.argv[-1])\n", encoding="utf-8",
@@ -200,7 +200,7 @@ calls = Path({str(calls)!r})
 calls.open("a", encoding="utf-8").write(json.dumps(sys.argv[1:]) + "\\n")
 if sys.argv[1:3] == ["-IB", "-c"]:
     if state.exists():
-        print(json.dumps({{"python": sys.executable, "importable": True, "providerAvailable": True, "version": "1.3.0"}}))
+        print(json.dumps({{"python": sys.executable, "importable": True, "providerAvailable": True, "version": {__version__!r}}}))
     else:
         print(json.dumps({{"python": sys.executable, "importable": False, "error": "ModuleNotFoundError: No module named total_recall_core"}}))
 elif sys.argv[1:4] == ["-m", "pip", "--version"]:

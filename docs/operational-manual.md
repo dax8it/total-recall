@@ -8,7 +8,7 @@ Total Recall is not just a vector database, notebook, or chat history search too
 
 | Job | Command or surface | What you get |
 |---|---|---|
-| Install as Hermes memory | `total-recall hermes install --profile <profile> --activate` | Hermes uses Total Recall as the MemoryProvider |
+| Install or update a Hermes release | `total-recall hermes release v1.4.0 --rebuild` | Hermes PM builds from a pinned tag |
 | See if memory is safe to trust | `total-recall verify` / `total-recall trust verify` | fail-closed integrity verdicts with reports |
 | Rehydrate an agent after restart/compaction | `total-recall rehydrate --session-id ... --query ...` | cited context only after verification passes |
 | Search local memory | `total-recall search "query"` | local cited results from ledger-derived indexes |
@@ -149,7 +149,7 @@ instead of copies of the transcript. This changes new writes only.
 
 ### Capture stall watch
 
-Run `python3 -B scripts/hermes_capture_watch.py` from the Total Recall checkout
+Run `python3 -B ~/.hermes/total-recall-releases/current/scripts/hermes_capture_watch.py`
 to preview alerts without writing state or notifying anyone. A detected problem
 exits with code 1. The watcher reads the default home and named profiles under
 `~/.hermes`; use `--hermes-root` for a different root. It only inspects profiles
@@ -157,12 +157,28 @@ that select `memory.provider: total-recall`. It follows a static absolute
 `memory.total-recall.home` or uses that profile's `total-recall` directory. It
 does not load secrets or inspect Hermes process environments.
 
-After merging, run `python3 -B scripts/hermes_capture_watch.py --enable-macos`
-from the primary Total Recall checkout as the logged-in Mac user. Enable refuses
-linked worktrees, source copies, and Python executables in linked worktrees.
-Keep the checkout and Python path stable while it is enabled. The command will
-not overwrite an existing agent. The watch requests one macOS Notification
-Center alert per profile per stall, and rearms after capture progress. Allow
+To enable it for the first time, run the preview command with `--enable-macos`
+as the logged-in Mac user. For an existing checkout-based LaunchAgent, first
+select the release and confirm the watcher runs in preview mode. After approval,
+back up the plist and change only the script argument. Run each command in order
+and stop on errors:
+
+```bash
+watch="$HOME/.hermes/total-recall-releases/current/scripts/hermes_capture_watch.py"
+plist="$HOME/Library/LaunchAgents/io.total-recall.capture-watch.plist"
+domain="gui/$(id -u)"
+cp -p -n "$plist" "$plist.before-release"
+launchctl bootout "$domain/io.total-recall.capture-watch"
+plutil -replace ProgramArguments.2 -string "$watch" "$plist"
+plutil -lint "$plist"
+launchctl bootstrap "$domain" "$plist"
+launchctl print "$domain/io.total-recall.capture-watch"
+```
+
+If the service is not loaded, skip `bootout`. Restore the backed-up plist if
+the change fails. The launcher follows `current`, so later release switches do
+not require a plist edit. The watch requests one macOS Notification Center
+alert per profile per stall, and rearms after capture progress. Allow
 notifications for Script Editor or the sender shown by macOS and check Focus
 settings. The app does not send email, Telegram, or any network notification.
 If an alert says the check itself needs attention, run the preview and check
@@ -378,11 +394,12 @@ total-recall backup status --out-dir ~/total-recall-backups
 ### Install for Hermes
 
 ```bash
-total-recall hermes install --profile filippo --activate --format text
+total-recall hermes release v1.4.0 --rebuild
 hermes -p filippo memory status
 ```
 
-If running from a checkout:
+For the first switch from checkout or standalone installs, follow the [release
+migration instructions](hermes.md#install-a-tagged-release). For development only:
 
 ```bash
 ./scripts/install_hermes_plugin.sh --profile filippo --activate --format text

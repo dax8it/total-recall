@@ -420,13 +420,14 @@ def _stale_checkout_file(payload: Dict[str, Any]) -> str | None:
     return None
 
 
-def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: str = "") -> Dict[str, Any]:
+def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: str = "",
+                                required_version: str = __version__) -> Dict[str, Any]:
     resolution = resolve_hermes_python(hermes_bin=hermes_bin, hermes_python=hermes_python)
     if not resolution.get("ok"):
         return {
             "ok": False,
             "status": resolution.get("status", "HERMES_PYTHON_NOT_FOUND"),
-            "requiredVersion": __version__,
+            "requiredVersion": required_version,
             "resolution": resolution,
             "message": resolution.get("message", "Hermes Python could not be resolved."),
             "nextSteps": resolution.get("nextSteps", []),
@@ -460,7 +461,7 @@ def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: st
     importable = bool(payload.get("importable"))
     provider_available = bool(payload.get("providerAvailable"))
     installed_version = payload.get("version")
-    version_ok = installed_version == __version__
+    version_ok = installed_version == required_version
     error = payload.get("error") or completed.stderr.strip() or "probe returned no result"
     loaded = completed.returncode == 0 and importable and provider_available and version_ok
     rebuild = ["Rebuild total-recall-core in Hermes Python and rerun doctor."]
@@ -479,7 +480,7 @@ def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: st
         next_steps = rebuild
     elif importable:
         status = "VERSION_MISMATCH"
-        message = f"Hermes Python has total-recall-core {installed_version}; {__version__} is required."
+        message = f"Hermes Python has total-recall-core {installed_version}; {required_version} is required."
         next_steps = ["Run `total-recall hermes install --core-install always --profile <profile> --activate`."]
     else:
         status = "MISSING"
@@ -489,10 +490,11 @@ def check_core_in_hermes_python(*, hermes_bin: str = "hermes", hermes_python: st
         "ok": loaded and not stale,
         "status": status,
         "hermesPython": python,
-        "requiredVersion": __version__,
+        "requiredVersion": required_version,
         "installedVersion": installed_version,
         "importable": importable,
         "providerAvailable": provider_available,
+        "checkoutUrl": payload.get("checkoutUrl"),
         "versionOk": version_ok,
         "message": message,
         "nextSteps": next_steps,
@@ -842,18 +844,43 @@ def status(
     hermes_python: str = "",
     check_core: bool = True,
 ) -> Dict[str, Any]:
+    from .hermes_release import PLUGIN, runtime_source_root, source_provenance
+
     path = installed_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
     compatibility = compatibility_plugin_path(hermes_home=hermes_home, plugin_dir=plugin_dir)
     validation = validate_plugin_bundle(path, strict_clean=False) if path.exists() else {"ok": False, "missing": ["plugin_directory"], "path": str(path)}
     compatibility_validation = validate_plugin_bundle(compatibility, strict_clean=False) if compatibility.exists() or compatibility.is_symlink() else {"ok": False, "missing": ["compatibility_plugin_directory"], "path": str(compatibility)}
-    core = check_core_in_hermes_python(hermes_bin=hermes_bin, hermes_python=hermes_python) if check_core else {
+    selected = compatibility if compatibility.exists() else path
+    source = source_provenance(selected) if selected.exists() else None
+    release = source if source and source["kind"] == "release" else None
+    core = check_core_in_hermes_python(
+        hermes_bin=hermes_bin, hermes_python=hermes_python,
+        required_version=release["tag"][1:] if release else __version__,
+    ) if check_core else {
         "ok": True,
         "status": "SKIPPED",
         "message": "Core runtime check skipped.",
     }
     compatibility_installed = compatibility.exists() or compatibility.is_symlink()
     compatibility_ours = compatibility_installed and _looks_like_total_recall_plugin(compatibility)
-    ready = bool(validation.get("ok")) and bool(compatibility_validation.get("ok")) and bool(core.get("ok")) and bool(compatibility_ours)
+    core_root = runtime_source_root(core)
+    if source and source["kind"] == "untracked_copy" and core_root is not None and (core_root / ".git").exists():
+        core_source = source_provenance(core_root / PLUGIN)
+        source = {**source, "coreSource": core_source, "message": f"{source['message']} Core source: {core_source['message']}"}
+    release_steps = []
+    if source and source["kind"] in {"modified_release", "untagged_commit", "invalid_release", "unknown"}:
+        release_steps.append("Select a clean tagged release before restarting Hermes.")
+    elif path.exists() and compatibility.exists() and path.resolve() != compatibility.resolve() and (
+        release or source_provenance(path)["kind"] in {"release", "modified_release", "untagged_commit", "invalid_release"}
+    ):
+        release_steps.append("The two plugin paths resolve to different sources. Relink both to the same release.")
+    elif release and check_core and (not core.get("ok") or core_root != Path(release["root"])):
+        release_steps.append(f"Hermes is not verified to be running this tag. Repeat `total-recall hermes release {release['tag']} --rebuild` and check the active Hermes Python.")
+        if core.get("ok"):
+            core.update(ok=False, status="RELEASE_SOURCE_MISMATCH",
+                        message="Installed core was not built from the selected release copy.")
+    ready = (bool(validation.get("ok")) and bool(compatibility_validation.get("ok"))
+             and bool(core.get("ok")) and bool(compatibility_ours) and not release_steps)
     return {
         "ok": ready,
         "ready": ready,
@@ -868,7 +895,8 @@ def status(
         "validation": validation,
         "compatibilityValidation": compatibility_validation,
         "core": core,
-        "nextSteps": _status_next_steps(validation=validation, compatibility_validation=compatibility_validation, core=core, compatibility_ours=bool(compatibility_ours)),
+        "source": source,
+        "nextSteps": release_steps or _status_next_steps(validation=validation, compatibility_validation=compatibility_validation, core=core, compatibility_ours=bool(compatibility_ours)),
     }
 
 
