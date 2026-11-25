@@ -96,69 +96,108 @@ print(json.dumps({"ok": True, "save_config_source": inspect.getfile(save_config)
     assert Path(result["config"]).is_relative_to(tmp_path)
 
 
-def test_first_turn_recall_on_real_hermes_with_large_store(tmp_path):
+def test_indexed_resume_and_flat_prefetch_on_real_hermes(tmp_path):
     result = _run_host(tmp_path, r'''
-import hashlib, json, os, pathlib, time
+import hashlib, json, os, statistics, time
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 from agent.memory_manager import MemoryManager
+from agent.turn_context import _memory_turn_start_and_prefetch
 from total_recall_core import TotalRecallConfig, TotalRecallCore
 from total_recall_core.api import canonical_json, sha256_json
+from total_recall_core.automatic_index import AutomaticIndex, ledger_position
 from total_recall_core.hermes_provider import TotalRecallMemoryProvider
 
-home = pathlib.Path(os.environ["HERMES_HOME"])
-store = home / "total-recall"
-core = TotalRecallCore(TotalRecallConfig(home=store))
-marker = "cerulean continuity marker"
+home = Path(os.environ["HERMES_HOME"])
+marker = "zafiroartifact"
+core = TotalRecallCore(TotalRecallConfig(home=home / "total-recall"))
+core.sync_turn("Decision: Always preserve the cobalt release plan", "Next action: validate the sample.",
+               session_id="earlier", tool_activity=[{"kind": "call", "name": marker, "arguments": {}}])
+core.ingest(kind="note", text=marker, session_id="earlier", scope="internal")
+core = TotalRecallCore(TotalRecallConfig(home=core.home, allowed_scopes=("private",)))
+checkpoint = core.checkpoint(session_id="earlier", label="session_end")
+assert checkpoint["resumePacket"]["ok"]
+checkpoint_file = Path(checkpoint["checkpointFile"])
+anchor_file = Path(checkpoint["anchor"]["anchorFile"])
+initial_hash = checkpoint["checkpoint"]["last_event_hash"]
+protected = (checkpoint_file, anchor_file)
+fingerprints = [hashlib.sha256(p.read_bytes()).hexdigest() for p in protected]
+index = AutomaticIndex(core)
+
+def agent_for_store():
+    provider = TotalRecallMemoryProvider()
+    provider._core = lambda: core
+    manager = MemoryManager()
+    manager.add_provider(provider)
+    manager.initialize_all("earlier", hermes_home=str(home))
+    return provider, SimpleNamespace(session_id="earlier", model="offline-fixture", platform="desktop",
+                                     _memory_manager=manager, _user_turn_count=0)
+
+def measure(agent, query):
+    agent._user_turn_count += 1
+    start = time.monotonic()
+    block = _memory_turn_start_and_prefetch(agent, query, None, "")
+    return time.monotonic() - start, block
+
+provider, agent = agent_for_store()
+elapsed, first = measure(agent, marker)
+assert elapsed < 5.5
+assert "status: PASS" in first and "Resume Packet Authority" in first
+assert "Deterministic next actions" in first and "validate the sample" in first
+# The query matches the captured tool name, not the recalled turn text.
+assert 'Always preserve the cobalt release plan' in first.split('Resume Packet Authority')[0], first
+assert '[source: ledger:' in first
+assert '"zafiroartifact"' not in first
+
+with patch.object(AutomaticIndex, '_project', side_effect=AssertionError('steady turns must not scan the ledger')):
+    small = [measure(agent, marker)[0] for _ in range(5)]
+
+# Grow the same store to 117 MB, leaving a legacy FTS index and resume
+# packet exactly as an existing installation would have on first startup.
+previous = initial_hash
 padding = (" ".join(f"fixture{i:04x}" for i in range(650)) + " ")[:6800]
-previous = None
-with core.ledger_file.open("w", encoding="utf-8") as ledger:
+with core.ledger_file.open("a", encoding="utf-8") as ledger:
     for i in range(16898):
         event = {"event_id": f"evt_{i}", "prev_hash": previous, "kind": "turn", "scope": "private",
                  "session_id": f"earlier-{i // 12}", "timestamp": "2026-11-24T07:23:59Z",
-                 "text": f"{marker if i == 16896 else 'synthetic discussion'} {padding}",
-                 "metadata": {"fixture": i}}
+                 "text": f"synthetic discussion {padding}", "metadata": {"fixture": i}}
         event["hash"] = previous = sha256_json(event)
         ledger.write(canonical_json(event) + "\n")
 assert core.ledger_file.stat().st_size >= 117_000_000
-signed = core.checkpoint(session_id="earlier")
-checkpoint_file = pathlib.Path(signed["checkpointFile"])
-anchor_file = pathlib.Path(signed["anchor"]["anchorFile"])
-with core.ledger_file.open("a", encoding="utf-8") as ledger:
-    for scope in ("private", "restricted"):
-        event = {"event_id": f"evt_unsigned_{scope}", "prev_hash": previous, "kind": "turn", "scope": scope,
-                 "session_id": "earlier", "timestamp": "2026-11-25T07:23:59Z", "text": f"{scope} unsigned marker"}
-        event["hash"] = previous = sha256_json(event)
-        ledger.write(canonical_json(event) + "\n")
+provider, agent = agent_for_store()
+elapsed, during = measure(agent, marker)
+assert elapsed < 5.5 and "status: UNVERIFIED" in during and "status: PASS" not in during, (elapsed, during)
+assert "Resume Packet Authority" in during and "validate the sample" in during
+assert 'Always preserve the cobalt release plan' in during.split('Resume Packet Authority')[0]
+assert provider._index_thread is not None
+provider._index_thread.join(25)
+assert not provider._index_thread.is_alive()
+position = ledger_position(core)
+assert index.cursor(position)["offset"] == position.size
 
-def fingerprints():
-    results = []
-    for path in (core.ledger_file, checkpoint_file, anchor_file):
-        with path.open("rb") as handle:
-            results.append((path.stat().st_mtime_ns, hashlib.file_digest(handle, "sha256").hexdigest()))
-    return results
+provider, agent = agent_for_store()
+with patch.object(AutomaticIndex, '_project', side_effect=AssertionError('steady turns must not scan the ledger')):
+    elapsed, first = measure(agent, marker)
+    assert elapsed < 5.5 and "status: PASS" in first and "Resume Packet Authority" in first
+    # Include both a selective term and one present in every added record.
+    large = [measure(agent, marker)[0] for _ in range(5)]
+    broad = [measure(agent, 'synthetic discussion')[0] for _ in range(3)]
+assert max(small + large + broad) < 0.7, (small, large, broad)
+assert statistics.median(large) - statistics.median(small) < 0.1, (small, large)
 
-before = fingerprints()
-for i in range(3422):
-    path = checkpoint_file.parent / f"checkpoint_old_{i:04}.json"
-    path.write_text('{}')
-    os.utime(path, (1, 1))
-assert not core.index_file.exists()
-for sid in ("fresh-chat", "another-fresh-chat"):
-    manager = MemoryManager()
-    manager.add_provider(TotalRecallMemoryProvider())
-    manager.initialize_all(sid, hermes_home=str(home))
-    manager.on_turn_start(1, marker)
-    start = time.monotonic()
-    recall = manager.prefetch_all(marker, session_id=sid)
-    elapsed = time.monotonic() - start
-    signed, unsigned = recall.split("After the signed checkpoint\n", 1)
-    assert "status: PASS" in signed and "[source: ledger:evt_16896]" in signed, (elapsed, recall)
-    assert "evt_unsigned" not in signed
-    assert "status: UNVERIFIED" in unsigned and "[source: ledger:evt_unsigned_private]" in unsigned
-    assert "evt_unsigned_restricted" not in recall
-    assert elapsed < 5.0, elapsed
-assert not core.index_file.exists()
-assert len(list(checkpoint_file.parent.glob('*.json'))) == 3423
-assert fingerprints() == before
+for i in range(50):
+    provider.sync_turn(f"ultraviolet suffix {i}", "new", session_id="earlier")
+project = AutomaticIndex._project
+advances = []
+def observed(self, conn, ledger, **kw):
+    advances.append((kw['offset'], kw['end']))
+    return project(self, conn, ledger, **kw)
+with patch.object(AutomaticIndex, '_project', observed):
+    elapsed, latest = measure(agent, 'ultraviolet suffix 49')
+assert elapsed < 0.7 and "status: UNVERIFIED" in latest and "ultraviolet suffix 49" in latest
+assert advances == [(position.size, core.ledger_file.stat().st_size)], advances
+assert [hashlib.sha256(p.read_bytes()).hexdigest() for p in protected] == fingerprints
 print(json.dumps({"ok": True}))
 ''')
     assert result["ok"] is True
@@ -386,6 +425,7 @@ from agent.turn_finalizer import apply_llm_output_transform
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from plugins.memory import load_memory_provider
 from total_recall_core import TotalRecallConfig, TotalRecallCore
+from total_recall_core.automatic_recall import AutomaticRecall
 
 root = pathlib.Path(sys.argv[2])
 home = pathlib.Path(os.environ["HERMES_HOME"])
@@ -404,16 +444,16 @@ agent = SimpleNamespace(session_id="fresh-chat", model="offline-fixture", platfo
                         _memory_manager=manager, _user_turn_count=1)
 logger = logging.getLogger("test")
 started, release = threading.Event(), threading.Event()
-read_snapshot = TotalRecallCore._automatic_recall_snapshot
+read_snapshot = AutomaticRecall.lookup
 
-def slow_snapshot(self, **kw):
+def slow_snapshot(self, *args, **kw):
     started.set()
     assert release.wait(4)
-    return read_snapshot(self, **kw)
+    return read_snapshot(self, *args, **kw)
 
 query = "Find earlier completed work"
 with patch("total_recall_core.hermes_provider._RECALL_BUDGET_SECONDS", 0.2), patch.object(
-    TotalRecallCore, "_automatic_recall_snapshot", slow_snapshot,
+    AutomaticRecall, "lookup", slow_snapshot,
 ):
     start = time.monotonic()
     recall = _memory_turn_start_and_prefetch(agent, query, None, "")

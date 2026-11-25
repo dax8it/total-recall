@@ -17,6 +17,8 @@ from agent.memory_provider import MemoryProvider
 from tools.registry import tool_error
 
 from .api import TurnAppendBlocked
+from .automatic_index import AutomaticIndex, INLINE_BUILD_BYTES, InvalidLedger, ledger_position
+from .automatic_recall import AutomaticRecall
 from .hermes_capture import capture_gap
 from .turn_capture import ToolActivity, capture_tool_activity, turn_text
 
@@ -397,6 +399,10 @@ class TotalRecallMemoryProvider(MemoryProvider):
         self._hermes_home = ""
         self._home = ""
         self._recall_worker_lock = threading.Lock()
+        self._index_thread: threading.Thread | None = None
+        self._invalid_generation: tuple[Path, list[int]] | None = None
+        self._automatic = AutomaticRecall()
+        self._resume_session = ""
         self._pending_rehydrate: Dict[str, Any] | None = None
         self._turn_number = 0
         self._compression_count = 0
@@ -412,6 +418,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id or "default"
+        self._resume_session = self._session_id
         self._hermes_home = str(kwargs.get("hermes_home") or os.getenv("HERMES_HOME") or Path.home() / ".hermes")
         self._home = self._configured_home()
         # Do not make successful verification a prerequisite for loading the
@@ -449,8 +456,53 @@ class TotalRecallMemoryProvider(MemoryProvider):
             return warning
         reason = str(pending["reason"]) if pending else "turn_prefetch"
         query = query or (str(pending["query"]) if pending else "")
+        if reason == "turn_prefetch" and self._resume_session == sid:
+            reason = "startup_or_gateway_restart"
         context = self._bounded_recall(query, session_id=sid, reason=reason)
         return (warning + "\n\n" + context).strip() if warning else context
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        # The host queues the previous query. Prepare the index, not a result
+        # ranked for the wrong prompt.
+        self._start_index_catchup(self._core())
+
+    def _start_index_catchup(self, core: TotalRecallCore) -> None:
+        if self._index_thread is not None and self._index_thread.is_alive():
+            return
+
+        def catch_up() -> None:
+            generation = None
+            try:
+                index = AutomaticIndex(core)
+                # One off-lock rebuild even if two providers discover the
+                # same legacy store at once.
+                with core._index_locked(blocking=False) as acquired:
+                    if not acquired:
+                        return
+                    with core._locked(shared=True, blocking=False):
+                        position = ledger_position(core)
+                        generation = (core.home, position.generation)
+                        if generation == self._invalid_generation:
+                            return
+                        cursor = index.cursor(position)
+                    if cursor is None:
+                        index.rebuild()
+                    while True:
+                        with core._locked(blocking=False):
+                            position = ledger_position(core)
+                            cursor = index.cursor(position)
+                            if not cursor or cursor["offset"] == position.size:
+                                return
+                            index.advance_locked(position, cursor, deadline=time.monotonic() + 1.0)
+            except InvalidLedger:
+                # Appending to a corrupt prefix cannot repair it. Don't start
+                # a new full scan until a different generation is observed.
+                self._invalid_generation = generation
+            except (OSError, ValueError, sqlite3.Error, KeyError, TypeError) as exc:
+                logger.debug("total-recall index catch-up deferred: %s", type(exc).__name__)
+
+        self._index_thread = threading.Thread(target=catch_up, name="total-recall-index-catchup", daemon=True)
+        self._index_thread.start()
 
     def _bounded_recall(self, query: str, *, session_id: str, reason: str) -> str:
         deadline = time.monotonic() + _RECALL_BUDGET_SECONDS
@@ -511,6 +563,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
                 user_content,
                 assistant_content,
                 session_id=sid, metadata=metadata, tool_activity=tool_activity,
+                _defer_projection=True,
             )
         except TurnAppendBlocked as exc:
             # The append definitely did not start. Never queue an ambiguous
@@ -548,6 +601,7 @@ class TotalRecallMemoryProvider(MemoryProvider):
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         old = self._session_id
         self._session_id = new_session_id or "default"
+        self._resume_session = self._session_id
         reason = str(kwargs.get("reason") or ("new_session" if reset else "session_switch"))
         try:
             if self._read_only:
@@ -1058,38 +1112,60 @@ class TotalRecallMemoryProvider(MemoryProvider):
     def _read_recall(self, query: str, *, session_id: str, reason: str, deadline: float) -> tuple[str, bool]:
         cfg = self._auto_rehydrate_config()
         core = self._core()
-        if core.ledger_file.stat().st_size == 0:
+        size = core.ledger_file.stat().st_size
+        if size == 0:
             return "", False
         header = "[Total Recall Auto Rehydrate]\n"
         trigger = f"reason: {reason}\nsession_id: {session_id}\n"
         budget = max(len(header + "status: UNVERIFIED\n"), int(cfg.get("max_chars", 5000)))
-        enabled = cfg.get("enabled", True)
-        failures, details, events = [], {}, None
-        if enabled:
-            failures, details, events = core._automatic_recall_snapshot(session_id=session_id, deadline=deadline)
-
-        def excerpts(records: Iterable[Dict[str, Any]], max_chars: int) -> str:
-            return self._recall_excerpts(
-                records, query=query, session_id=session_id, allowed_scopes=core.config.allowed_scopes,
-                max_chars=max_chars, deadline=deadline,
-            )
-
-        if failures or not enabled:
-            failure_text = ", ".join(failures) if failures else "automatic verification disabled"
-            warning = header + "status: UNVERIFIED\n" + trigger + f"failures: {failure_text}\n" + _UNTRUSTED
-            records = events if events is not None else self._read_unverified_ledger(core.ledger_file, deadline=deadline)
+        enabled = bool(cfg.get("enabled", True))
+        resume = session_id if enabled and (self._resume_session == session_id or reason in {
+            "after_resume", "after_new_session", "after_compaction",
+        }) else ""
+        recall = self._automatic.lookup(core, query, session_id=session_id, resume_session=resume,
+                                        deadline=deadline, session_only=not enabled)
+        if recall.catching_up:
+            self._start_index_catchup(core)
+        if resume and (recall.packet or not recall.catching_up):
+            self._resume_session = ""
+        details = recall.verification if enabled else {}
+        if details:
+            header += "status: PASS\nverified: signed ledger prefix (not reduced state)\n" + trigger
+            header += f"checkpoint: {details['checkpointFile']}\nanchor: {details['anchorFile']}\n"
+            if any(not signed for signed, _, _ in recall.rows) or recall.packet:
+                header += "Items marked UNVERIFIED are outside the signed prefix or derived packet material.\n" + _UNTRUSTED
+        else:
+            failure = recall.failure if enabled else "automatic verification disabled"
+            header += "status: UNVERIFIED\n" + trigger + f"failures: {failure}\n" + _UNTRUSTED
+        if not recall.rows and not recall.packet and recall.catching_up and size <= INLINE_BUILD_BYTES:
+            # Retain the degraded-store fallback, but never linearly scan a
+            # large ledger on the turn path.
+            records = self._read_unverified_ledger(core.ledger_file, deadline=deadline)
             if not enabled:
                 records = (event for event in records if event.get("session_id") == session_id)
-            return warning[:budget] + excerpts(records, budget - len(warning)), False
-
-        count = details["checkpointEventCount"]
-        assert events is not None
-        header += "status: PASS\nverified: signed ledger prefix (not reduced state)\n" + trigger
-        header += f"checkpoint: {details['checkpointFile']}\nanchor: {details['anchorFile']}\n\n"
-        tail_header = "\n\nAfter the signed checkpoint\nstatus: UNVERIFIED\n" + _UNTRUSTED
-        tail = excerpts(events[count:], min(1200, budget // 3) - len(tail_header))
-        tail = tail_header + tail if tail else ""
-        return header[:budget] + excerpts(events[:count], budget - len(header) - len(tail)) + tail, True
+            return header[:budget] + self._recall_excerpts(
+                records, query=query, session_id=session_id, allowed_scopes=core.config.allowed_scopes,
+                max_chars=budget - len(header), deadline=deadline,
+            ), False
+        if not recall.rows and not recall.packet and recall.catching_up:
+            raise TimeoutError("no automatic recall available while index catches up")
+        room = max(0, budget - len(header))
+        packet_room = room * 2 // 3 if recall.packet and recall.rows else room if recall.packet else 0
+        parts = [header.rstrip()]
+        for signed, event_id, text in recall.rows:
+            if not re.fullmatch(r"[\w-]{1,128}", event_id, flags=re.ASCII):
+                continue
+            label = "status: UNVERIFIED — " if details and not signed else ""
+            citation = f'" [source: ledger:{event_id}]'
+            chars = min(500, room - packet_room - len(label) - len(citation) - 3)
+            if chars < 24:
+                break
+            line = label + '"' + " ".join(text.split())[:chars] + citation
+            parts.append(line)
+            room -= len(line) + 1
+        if recall.packet and room > 2:
+            parts.append("\n" + recall.packet[:room - 2])
+        return "\n".join(parts)[:budget], bool(details)
 
     @staticmethod
     def _read_unverified_ledger(path: Path, *, deadline: float) -> Iterator[Dict[str, Any]]:

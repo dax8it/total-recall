@@ -73,10 +73,26 @@ write pre-compaction continuity.
 
 If a reply says `Total Recall automatic recall did not finish in time`, that
 turn received no Total Recall excerpts. The provider returns the notice before
-Hermes' eight-second prefetch deadline. It does not wait for another store writer,
-refresh the checkpoint, or rebuild either SQLite index during prefetch. This is
-not a capture-gap notice. For a turn that needs verified history, use the
-explicit verify or rehydrate tool before relying on prior context.
+Hermes' eight-second prefetch deadline; it does not wait for another store writer.
+This is not a capture-gap notice. For a turn that needs verified history, use
+explicit verify or rehydrate before relying on prior context.
+
+Hermes automatic recall uses a disposable local FTS projection under
+`automatic-recall/`. On the first use of a large existing store, it hash-checks
+the ledger and builds this projection in the background. Until that finishes,
+any excerpts from the old index and session resume packet are `UNVERIFIED`.
+No migration step rewrites the ledger, a checkpoint, or an anchor. The cache
+is not portable or needed in backups: a restored store can rebuild it from the
+ledger. Normal capture appends update only the byte position; the projection
+indexes the new records without re-reading prior ones. Explicit operations
+still rebuild or verify their own state from the authority files.
+
+Automatic `PASS` covers the signed prefix only. Newer excerpts and derived
+resume-packet text are labeled `UNVERIFIED`, and a ledger edit outside the
+normal append path invalidates the saved position. If the legacy index is
+absent on a large store, the first request may get the same-turn notice until
+the background build completes. There is no need to recreate a checkpoint to
+make this projection catch up.
 
 ## First 10 Minutes
 

@@ -16,7 +16,6 @@ import sqlite3
 import subprocess
 import tarfile
 import tempfile
-import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -648,6 +647,7 @@ class TotalRecallCore:
         source: str = "manual",
         metadata: Optional[Dict[str, Any]] = None,
         tool_activity: Optional[ToolActivity] = None,
+        _defer_projection: bool = False,
     ) -> Dict[str, Any]:
         if scope not in self.config.allowed_scopes:
             raise ValueError(f"scope '{scope}' is not allowed")
@@ -658,8 +658,11 @@ class TotalRecallCore:
             text = text.strip()
 
         with self._locked():
+            from .automatic_index import append_events, ledger_position
+
+            position = ledger_position(self)
             try:
-                previous_hash = self._last_event_hash()
+                previous_hash = position.head if _defer_projection and position.tracked else self._last_event_hash()
                 if source == "hermes.sync_turn" and self.ledger_file.stat().st_size:
                     with self.ledger_file.open("rb") as ledger:
                         ledger.seek(-1, 2)
@@ -685,8 +688,9 @@ class TotalRecallCore:
                 base["tool_activity"] = tool_activity
             event_hash = sha256_json(base)
             event = {**base, "hash": event_hash}
-            with self.ledger_file.open("a", encoding="utf-8") as fh:
-                fh.write(canonical_json(event) + "\n")
+            append_events(self, position, [event])
+            if _defer_projection:
+                return {"ok": True, "event": event}
             state = self.reduce_state(write=True)
             self._rebuild_index_locked(state=state, backends=("sqlite-fts",))
         return {"ok": True, "event": event, "stateHash": state["state_hash"]}
@@ -750,6 +754,9 @@ class TotalRecallCore:
             }
 
         with self._locked():
+            from .automatic_index import append_events, ledger_position
+
+            position = ledger_position(self)
             previous_hash = self._last_event_hash()
             written_events = []
             for event_base in events:
@@ -760,10 +767,9 @@ class TotalRecallCore:
                 }
                 event_hash = sha256_json(base)
                 event = {**base, "hash": event_hash}
-                with self.ledger_file.open("a", encoding="utf-8") as fh:
-                    fh.write(canonical_json(event) + "\n")
                 previous_hash = event_hash
                 written_events.append(event)
+            append_events(self, position, written_events)
             state = self.reduce_state(write=True)
             self._rebuild_index_locked(state=state, backends=("sqlite-fts",))
 
@@ -1978,6 +1984,7 @@ class TotalRecallCore:
         session_id: str = "default",
         metadata: Optional[Dict[str, Any]] = None,
         tool_activity: Optional[ToolActivity] = None,
+        _defer_projection: bool = False,
     ) -> Dict[str, Any]:
         return self.ingest(
             kind="turn",
@@ -1986,6 +1993,7 @@ class TotalRecallCore:
             source="hermes.sync_turn",
             metadata=metadata or {},
             tool_activity=tool_activity,
+            _defer_projection=_defer_projection,
         )
 
     def reduce_state(self, *, write: bool = False) -> Dict[str, Any]:
@@ -2098,106 +2106,54 @@ class TotalRecallCore:
             return self._verify_locked(session_id=session_id, checkpoint_file=checkpoint_file, receipts=receipts)
 
     def _verify_locked(self, *, session_id: Optional[str] = None, checkpoint_file: Optional[str] = None, receipts: bool = False) -> Dict[str, Any]:
-        failures, details, events, state = self._inspect_checkpoint_locked(
-            session_id=session_id, checkpoint_file=checkpoint_file,
-        )
-        if "checkpoint" not in details:
-            return self._verification_result(False, failures, details, session_id=session_id)
-        if "ledger_or_state_invalid" not in ",".join(failures):
-            try:
-                details["indexRebuild"] = self._rebuild_index_locked(state=state, events=events)
-            except Exception as exc:
-                details.setdefault("warnings", []).append(f"index_rebuild_failed:{exc}")
-        if receipts:
-            receipt_check = self._verify_receipts_against_events(state)
-            details["receipts"] = receipt_check
-            if not receipt_check.get("ok"):
-                failures.append("receipt_lineage_mismatch")
-        return self._verification_result(not failures, failures, details, session_id=session_id)
-
-    def _automatic_recall_snapshot(
-        self, *, session_id: str, deadline: float,
-    ) -> tuple[List[str], Dict[str, Any], Optional[List[Dict[str, Any]]]]:
-        if time.monotonic() >= deadline:
-            raise TimeoutError("automatic recall budget expired before ledger scan")
-        with self._locked(shared=True, blocking=False):
-            failures, details, events, _ = self._inspect_checkpoint_locked(session_id=session_id, deadline=deadline)
-        return failures, details, events
-
-    def _inspect_checkpoint_locked(
-        self, *, session_id: Optional[str], checkpoint_file: Optional[str] = None,
-        deadline: Optional[float] = None,
-    ) -> tuple[List[str], Dict[str, Any], Optional[List[Dict[str, Any]]], Dict[str, Any]]:
-        if checkpoint_file:
-            checkpoint_path = Path(checkpoint_file).expanduser()
-        else:
-            checkpoint_path = self._select_checkpoint(session_id)
+        checkpoint_path = Path(checkpoint_file).expanduser() if checkpoint_file else self._select_checkpoint(session_id)
         failures: List[str] = []
         details: Dict[str, Any] = {"checkpointFile": str(checkpoint_path) if checkpoint_path else None}
 
         if not checkpoint_path or not checkpoint_path.exists():
             failures.append("checkpoint_not_found")
-            return failures, details, None, {}
+            return self._verification_result(False, failures, details, session_id=session_id)
 
         try:
             checkpoint = self._read_json(checkpoint_path)
             details["checkpoint"] = checkpoint
         except Exception as exc:
             failures.append(f"checkpoint_unreadable:{exc}")
-            return failures, details, None, {}
+            return self._verification_result(False, failures, details, session_id=session_id)
 
         expected_hash = checkpoint.get("checkpoint_hash")
         actual_hash = sha256_json({k: v for k, v in checkpoint.items() if k != "checkpoint_hash"})
         if actual_hash != expected_hash:
             failures.append("checkpoint_hash_mismatch")
-        if deadline is not None:
-            if checkpoint.get("checkpoint_id") != checkpoint_path.stem:
-                failures.append("checkpoint_id_mismatch")
-            if failures:
-                return failures, details, None, {}
 
         state: Dict[str, Any] = {}
         current_state: Dict[str, Any] = {}
         events: Optional[List[Dict[str, Any]]] = None
         try:
-            if deadline is None:
-                events = self._read_events(verify_chain=True)
-                current_state = self._state_from_events(events)
-            else:
-                events = self._read_events(verify_chain=True, deadline=deadline)
+            events = self._read_events(verify_chain=True)
+            current_state = self._state_from_events(events)
             checkpoint_event_count = int(checkpoint.get("event_count") or -1)
             details["stateHash"] = current_state.get("state_hash")
             details["currentStateHash"] = current_state.get("state_hash")
-            details["currentEventCount"] = len(events)
-            details["currentLastEventHash"] = events[-1]["hash"] if events else None
+            details["currentEventCount"] = current_state.get("event_count")
+            details["currentLastEventHash"] = current_state.get("last_event_hash")
             details["checkpointEventCount"] = checkpoint_event_count
             if checkpoint_event_count < 0 or checkpoint_event_count > len(events):
                 failures.append("checkpoint_event_count_invalid")
                 state = current_state
-            elif deadline is not None:
-                # Prefetch emits ledger excerpts, not a reduced-state claim.
-                # The signed head binds exactly this prefix of the hash chain.
-                if checkpoint_event_count != checkpoint.get("event_count"):
-                    failures.append("event_count_mismatch")
-                checkpoint_head = events[checkpoint_event_count - 1]["hash"] if checkpoint_event_count else None
-                if checkpoint_head != checkpoint.get("last_event_hash"):
-                    failures.append("last_event_hash_mismatch")
             else:
                 state = current_state if checkpoint_event_count == len(events) else self._state_from_events(events[:checkpoint_event_count])
             details["checkpointStateHash"] = state.get("state_hash")
-            if len(events) != checkpoint_event_count:
+            if current_state.get("event_count") != checkpoint_event_count:
                 details.setdefault("warnings", []).append("checkpoint_stale")
-                details["checkpointLagEvents"] = len(events) - checkpoint_event_count
-            if deadline is None:
-                if state.get("state_hash") != checkpoint.get("state_hash"):
-                    failures.append("state_hash_mismatch")
-                if state.get("event_count") != checkpoint.get("event_count"):
-                    failures.append("event_count_mismatch")
-                if state.get("last_event_hash") != checkpoint.get("last_event_hash"):
-                    failures.append("last_event_hash_mismatch")
+                details["checkpointLagEvents"] = current_state.get("event_count", 0) - checkpoint_event_count
+            if state.get("state_hash") != checkpoint.get("state_hash"):
+                failures.append("state_hash_mismatch")
+            if state.get("event_count") != checkpoint.get("event_count"):
+                failures.append("event_count_mismatch")
+            if state.get("last_event_hash") != checkpoint.get("last_event_hash"):
+                failures.append("last_event_hash_mismatch")
         except Exception as exc:
-            if deadline is not None and isinstance(exc, TimeoutError):
-                raise
             failures.append(f"ledger_or_state_invalid:{exc}")
 
         anchor_path = self.home / "anchors" / f"{checkpoint.get('checkpoint_id')}.json"
@@ -2210,14 +2166,23 @@ class TotalRecallCore:
                 details["anchor"] = anchor
                 if anchor.get("checkpoint_hash") != expected_hash:
                     failures.append("anchor_checkpoint_hash_mismatch")
-                signature_ok = (self._verify_anchor_signature(anchor) if deadline is None
-                                else self._verify_anchor_signature(anchor, create_key=False))
-                if not signature_ok:
+                if not self._verify_anchor_signature(anchor):
                     failures.append("anchor_signature_mismatch")
             except Exception as exc:
                 failures.append(f"anchor_unreadable:{exc}")
 
-        return failures, details, events, current_state or state
+        if "ledger_or_state_invalid" not in ",".join(failures):
+            try:
+                details["indexRebuild"] = self._rebuild_index_locked(state=current_state or state, events=events)
+            except Exception as exc:
+                details.setdefault("warnings", []).append(f"index_rebuild_failed:{exc}")
+        if receipts:
+            receipt_check = self._verify_receipts_against_events(current_state or state)
+            details["receipts"] = receipt_check
+            if not receipt_check.get("ok"):
+                failures.append("receipt_lineage_mismatch")
+
+        return self._verification_result(not failures, failures, details, session_id=session_id)
 
     def rehydrate(
         self,
@@ -2605,11 +2570,12 @@ class TotalRecallCore:
         verification: Dict[str, Any],
         packet_file: str,
         char_budget: int,
+        status: str = "PASS",
     ) -> str:
         budget = max(1000, int(char_budget or 8000))
         header = [
             "[Total Recall Resume Packet Authority]",
-            "status: PASS",
+            f"status: {status}",
             f"session_id: {packet.get('session_id')}",
             f"packet: {packet_file}",
             f"checkpoint: {packet.get('checkpoint_id')} ({verification.get('checkpointFile')})",
@@ -2636,6 +2602,7 @@ class TotalRecallCore:
             lines.extend(turn_lines)
         else:
             lines.append("- No turn events found in the selected resume packet.")
+        loops_start = len(lines)
         lines.extend(["", "Open loops:"])
         open_loops = packet.get("open_loops") or []
         if open_loops:
@@ -2643,6 +2610,7 @@ class TotalRecallCore:
                 lines.append(f"- {loop.get('loop_id')}: {loop.get('goal')} [{loop.get('phase')}]")
         else:
             lines.append("- No open loops.")
+        action_start = len(lines)
         lines.extend(["", "Deterministic next actions:"])
         next_actions = packet.get("next_actions") or []
         if next_actions:
@@ -2650,12 +2618,18 @@ class TotalRecallCore:
                 lines.append(f"- {action}")
         else:
             lines.append("- No explicit next/todo/blocker/decision lines extracted.")
+        action_end = len(lines)
         freshness = packet.get("freshness") or {}
         if freshness:
             lines.extend(["", "Freshness summary:", canonical_json(freshness)])
         truth = str(packet.get("compiled_truth_excerpt") or "").strip()
         if truth:
             lines.extend(["", "Compiled-truth excerpt:", truth[:4000]])
+        if status == "UNVERIFIED":
+            # Automatic context has to leave room for indexed query results.
+            # Put the resume packet's decisions/blockers before verbatim turns.
+            lines = (header + lines[action_start:action_end] + lines[loops_start:action_start]
+                     + [""] + lines[len(header):loops_start] + lines[action_end:])
         return "\n".join(lines)
 
     def _resume_freshness_summary(self) -> Dict[str, Any]:
@@ -5832,6 +5806,7 @@ class TotalRecallCore:
             "continuation",
             "handoff",
             "index",
+            "automatic-recall",
             "keys",
             "devices",
             "knowledge/index",
@@ -5892,29 +5867,25 @@ class TotalRecallCore:
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
-    def _read_events(self, *, verify_chain: bool, deadline: Optional[float] = None) -> List[Dict[str, Any]]:
+    def _read_events(self, *, verify_chain: bool) -> List[Dict[str, Any]]:
         events: List[Dict[str, Any]] = []
         prev: Optional[str] = None
         if not self.ledger_file.exists():
             return events
-        # Leave explicit verification on the canonical parsed-object path.
-        source = self.ledger_file.open("rb") if deadline is not None else self.ledger_file.open(encoding="utf-8")
-        with source as ledger:
-            for line_no, line in enumerate(ledger, start=1):
-                if deadline is not None and time.monotonic() >= deadline:
-                    raise TimeoutError("automatic recall budget expired during ledger scan")
-                if not line.strip():
-                    continue
-                event = json.loads(line)
-                event_hash = event.get("hash")
-                if verify_chain:
-                    raw_match = isinstance(line, bytes) and _ledger_line_matches_hash(line, event_hash)
-                    if not raw_match and event_hash != sha256_json({k: v for k, v in event.items() if k != "hash"}):
-                        raise ValueError(f"ledger hash mismatch at line {line_no}")
-                    if event.get("prev_hash") != prev:
-                        raise ValueError(f"ledger prev_hash mismatch at line {line_no}")
-                prev = event_hash
-                events.append(event)
+        # JSONL records end at LF, not Unicode separators inside JSON strings.
+        for line_no, line in enumerate(self.ledger_file.read_text(encoding="utf-8").split("\n"), start=1):
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            event_hash = event.get("hash")
+            base = {k: v for k, v in event.items() if k != "hash"}
+            if verify_chain:
+                if event_hash != sha256_json(base):
+                    raise ValueError(f"ledger hash mismatch at line {line_no}")
+                if event.get("prev_hash") != prev:
+                    raise ValueError(f"ledger prev_hash mismatch at line {line_no}")
+            prev = event_hash
+            events.append(event)
         return events
 
     def _last_event_hash(self) -> Optional[str]:

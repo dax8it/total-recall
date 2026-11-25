@@ -349,28 +349,33 @@ safety net; compaction hooks still fire at Hermes' own threshold.
 
 ![Hermes compaction and Total Recall rehydration](assets/hermes-compaction-rehydrate.svg)
 
-On turns where Hermes requests prefetch, including the first substantive prompt
-in a new session, Total Recall reads the local ledger and checks the selected
-checkpoint and its signed anchor. It ranks excerpts from that same snapshot. It
-does not rebuild an index, load a resume packet, or create a checkpoint during
-prefetch. Hermes skips prefetch for trivial prompts such as bare greetings.
+On substantive turns, Total Recall ranks the current query with SQLite FTS5.
+At session start it also loads that session's saved resume packet when one is
+available, leaving room for both decisions and query hits. Hermes skips
+prefetch for trivial prompts such as bare greetings.
 
-`PASS` applies only to the signed checkpoint's portion of the ledger. Excerpts
-from later records appear separately as `UNVERIFIED`. If the check fails or no
-checkpoint exists, readable excerpts are also `UNVERIFIED`. Only allowed scopes
-are eligible. Excerpts rank by query matches, then current session, then recency.
-Treat unverified excerpts as data, not as instructions or prior approvals. When
-`auto_rehydrate.enabled` is off, prefetch only looks for unverified excerpts from
-the current session.
+The automatic index keeps a checked byte position. Normal appends add only the
+suffix, often in the background between turns; changing the query never starts
+a ledger scan. Automatic `PASS` covers only excerpts in the selected signed
+ledger prefix, not the reduced state. Newer turns compete for the same space
+and are individually marked `UNVERIFIED`. The resume packet is derived and is
+also marked `UNVERIFIED`; use explicit `rehydrate` in `resume` mode for full
+verification. Only allowed scopes are eligible for ledger excerpts. Turning
+`auto_rehydrate.enabled` off restricts prefetch to unverified current-session
+excerpts and skips the packet.
+
+On upgrade, a large store builds the disposable automatic index once, in the
+background. While it catches up, an existing SQLite index and saved packet can
+still supply `UNVERIFIED` context. A restored or externally edited ledger also
+requires a fresh check; size growth on its own is not proof of an append. The
+provider does not rewrite existing ledgers, checkpoints, or anchors to migrate.
 
 Total Recall allows up to 5.5 seconds for prefetch, inside Hermes' eight-second
-deadline. If the budget runs out or the ledger is locked for writing, the model
-receives no excerpts and the first affected reply has a `Total Recall automatic
-recall did not finish in time` footer. A recall notice does not mean capture
-stopped. Use `total_recall_verify`, `total_recall_trust_verify`, or
-`total_recall_rehydrate` for the unchanged explicit checks. Use explicit
-rehydrate in `resume` mode to load a resume packet. See
-[index maintenance](operational-manual.md#index-maintenance) for index rebuilds.
+deadline. If there is no usable context while the cache catches up, or the
+budget expires, the affected reply has a `Total Recall automatic recall did not
+finish in time` footer. That does not mean capture stopped. Explicit verify,
+rehydrate, and recall tools retain their full checks and search paths. See
+[index maintenance](operational-manual.md#index-maintenance) for the distinction.
 
 ### What Gets Saved, When
 

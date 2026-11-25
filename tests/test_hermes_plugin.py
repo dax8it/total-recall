@@ -312,8 +312,8 @@ def test_plugin_context_threshold_auto_rehydrate(tmp_path, monkeypatch):
     assert "reason: context_usage_threshold" in auto
 
 
-def test_plugin_auto_rehydrate_verifies_once(tmp_path, monkeypatch):
-    from total_recall_core import TotalRecallCore
+def test_plugin_auto_rehydrate_rechecks_anchor_without_rescanning(tmp_path, monkeypatch):
+    from total_recall_core.automatic_index import AutomaticIndex
 
     module = _load_plugin(monkeypatch)
     provider = module.TotalRecallMemoryProvider()
@@ -322,20 +322,42 @@ def test_plugin_auto_rehydrate_verifies_once(tmp_path, monkeypatch):
     provider.handle_tool_call("total_recall_checkpoint", {"session_id": "s1"})
     ledger = provider._core().ledger_file
     ledger.write_text(json.dumps(json.loads(ledger.read_text())) + "\n", encoding="utf-8")
-    original_verify = TotalRecallCore._inspect_checkpoint_locked
-    verifications = []
-
-    def counted_verify(core, **kwargs):
-        verifications.append(kwargs)
-        return original_verify(core, **kwargs)
-
-    monkeypatch.setattr(TotalRecallCore, "_inspect_checkpoint_locked", counted_verify)
     provider.on_turn_start(1, "continue", context_usage_ratio=0.8)
     auto = provider.prefetch("bounded rehydrate marker", session_id="s1")
 
     assert "status: PASS" in auto
     assert "bounded rehydrate marker" in auto
-    assert len(verifications) == 1
+    monkeypatch.setattr(AutomaticIndex, "_project", lambda *args, **kw: pytest.fail("unexpected index rescan"))
+    anchor_path = next((tmp_path / "total-recall" / "anchors").glob("*.json"))
+    anchor = json.loads(anchor_path.read_text())
+    anchor["signature"] = "invalid"
+    anchor_path.write_text(json.dumps(anchor))
+    provider.on_turn_start(2, "bounded rehydrate marker")
+    auto = provider.prefetch("bounded rehydrate marker", session_id="s1")
+    assert "status: PASS" not in auto
+    assert "status: UNVERIFIED" in auto and "anchor_signature_mismatch" in auto
+
+
+def test_plugin_does_not_trust_a_rewritten_prefix_after_a_normal_append(tmp_path, monkeypatch):
+    module = _load_plugin(monkeypatch)
+    provider = module.TotalRecallMemoryProvider()
+    provider.initialize("s1", hermes_home=str(tmp_path))
+    provider.sync_turn("prior receipts intact", "stored", session_id="s1")
+    core = provider._core()
+    assert core.checkpoint(session_id="s1")["ok"]
+    assert "status: PASS" in provider.prefetch("prior receipts", session_id="s1")
+
+    # Keep the inode, byte length, and mtime of the old prefix. A subsequent
+    # cooperating append must not turn the untracked edit into trusted growth.
+    ledger = core.ledger_file
+    before = ledger.stat()
+    ledger.write_bytes(ledger.read_bytes().replace(b"intact", b"edited"))
+    os.utime(ledger, ns=(before.st_atime_ns, before.st_mtime_ns))
+    provider.sync_turn("new appends still capture", "stored", session_id="s1")
+    auto = provider.prefetch("prior receipts", session_id="s1")
+    assert "status: PASS" not in auto
+    assert "status: UNVERIFIED" in auto and "ledger hash mismatch" in auto
+    assert not core.verify(session_id="s1")["ok"]
 
 
 @pytest.mark.parametrize("damage", ["anchor", "hash", "malformed"])
