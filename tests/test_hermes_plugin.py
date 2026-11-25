@@ -60,7 +60,7 @@ def test_plugin_lifecycle_sync_prefetch_and_tools(tmp_path, monkeypatch):
     assert provider.name == "total-recall"
     assert provider.is_available() is True
     assert "Total Recall is active" in provider.system_prompt_block()
-    assert {schema["name"] for schema in provider.get_tool_schemas()} >= {
+    assert {schema["name"] for schema in provider.get_tool_schemas()} == {
         "total_recall_search",
         "total_recall_status",
         "total_recall_checkpoint",
@@ -324,7 +324,8 @@ def test_plugin_auto_rehydrate_verifies_once(tmp_path, monkeypatch):
     assert len(verifications) == 1
 
 
-def test_plugin_auto_rehydrate_fails_closed_on_tampered_anchor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("damage", ["anchor", "hash", "malformed"])
+def test_plugin_auto_rehydrate_salvages_context_but_explicit_tools_stay_strict(tmp_path, monkeypatch, damage):
     module = _load_plugin(monkeypatch)
     provider = module.TotalRecallMemoryProvider()
     provider.initialize("s1", hermes_home=str(tmp_path))
@@ -332,14 +333,35 @@ def test_plugin_auto_rehydrate_fails_closed_on_tampered_anchor(tmp_path, monkeyp
     checkpoint = json.loads(provider.handle_tool_call("total_recall_checkpoint", {"session_id": "s1"}))
 
     anchor_path = Path(tmp_path) / "total-recall" / "anchors" / f"{checkpoint['checkpoint']['checkpoint_id']}.json"
-    anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
-    anchor["signature"] = "bad-signature"
-    anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+    ledger = tmp_path / "total-recall" / "ledger" / "events.jsonl"
+    if damage == "anchor":
+        anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        anchor["signature"] = "bad-signature"
+        anchor_path.write_text(json.dumps(anchor), encoding="utf-8")
+        failure = "anchor_signature_mismatch"
+    elif damage == "hash":
+        ledger.write_text(ledger.read_text().replace("stored", "unverified edit"), encoding="utf-8")
+        failure = "ledger hash mismatch"
+    else:
+        with ledger.open("a") as fh:
+            fh.write("{invalid-json}\n")
+        failure = "ledger_or_state_invalid"
 
-    provider.on_session_switch("s2", parent_session_id="s1", reset=False, reason="resume")
-    auto = provider.prefetch("tamper protected memory", session_id="s2")
-    assert "status: FAIL_CLOSED" in auto
-    assert "anchor_signature_mismatch" in auto
+    restarted = module.TotalRecallMemoryProvider()
+    restarted.initialize("s1", hermes_home=str(tmp_path))
+    auto = restarted.prefetch("tamper protected memory", session_id="s1")
+    assert "status: UNVERIFIED" in auto
+    assert failure in auto
+    assert "tamper protected memory" in auto and "[source: ledger:" in auto
+
+    for name in ("verify", "trust_verify", "rehydrate"):
+        response = json.loads(restarted.handle_tool_call(f"total_recall_{name}", {"session_id": "s1"}))
+        assert response["ok"] is False, response
+        assert "context_block" not in response
+
+    restarted.sync_turn("capture continues", "recorded", session_id="s1")
+    output = tmp_path / "total-recall" / "state" / "pending_events.jsonl" if damage == "malformed" else ledger
+    assert "capture continues" in output.read_text(encoding="utf-8")
 
 
 def test_plugin_queues_writes_when_remote_lease_held_by_other_device(tmp_path, monkeypatch):

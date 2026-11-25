@@ -58,7 +58,9 @@ For Hermes operators, collapse compaction and rehydration into one visible **con
 
 ```text
 When context enters the risk zone, save/checkpoint/verify before old chat is lost.
-After compaction, reset, resume, or restart, rehydrate only from verified Total Recall.
+After compaction, reset, resume, or restart, treat only verified Total Recall as
+authority. Automatic recall may offer labeled, unverified excerpts after a failed
+check. Do not treat those excerpts as evidence of an approval or completed work.
 ```
 
 If the Hermes profile exposes both `compression.threshold` and
@@ -110,7 +112,53 @@ total-recall search "verifies memory"
 total-recall rehydrate --session-id demo --query "verification before rehydration"
 ```
 
-The rehydrate path returns cited context only after verification passes.
+The explicit CLI and Hermes tool return cited rehydration only after verification
+passes. The automatically injected Hermes fallback is a separate path.
+
+### Capture stall watch
+
+Run `python3 -B scripts/hermes_capture_watch.py` from the Total Recall checkout
+to preview alerts without writing state or notifying anyone. A detected problem
+exits with code 1. The watcher reads the default home and named profiles under
+`~/.hermes`; use `--hermes-root` for a different root. It only inspects profiles
+that select `memory.provider: total-recall`. It follows a static absolute
+`memory.total-recall.home` or uses that profile's `total-recall` directory. It
+does not load secrets or inspect Hermes process environments.
+
+To enable, add `--enable-macos` to that command as the logged-in Mac user.
+Keep the checkout and Python path stable while it is enabled. The command will
+not overwrite an existing agent. The watch requests one macOS Notification
+Center alert per profile per stall, and rearms after capture progress. Allow
+notifications for Script Editor or the sender shown by macOS and check Focus
+settings. The app does not send email, Telegram, or any network notification.
+If an alert says the check itself needs attention, run the preview and check
+`~/Library/Logs/io.total-recall.capture-watch.log`. Notification command failures
+retry on the next hourly check. Deduplication state is outside the Hermes homes
+in `~/Library/Application Support/Total Recall/capture-watch.json`.
+
+Treat this as a stall detector, not a per-turn audit or integrity check. It
+detects completed replies recorded in local SQLite, not idle profiles,
+transient or remote-only sessions, or intentionally unmonitored cron, subagent
+and tool sessions. It looks back up to 30 days and does not try to attribute an
+individual missing turn while captures are advancing. Runtime-only store paths
+and shared ledgers are not supported. The ledger has only whole-second timestamps,
+so a reply in the same second as the last capture is not counted as missing.
+Notification delivery within a day assumes the Mac is awake, the GUI user is
+logged in, and notifications are enabled.
+
+When a stall is reported, run `hermes -p <profile> memory status`. Verify the
+correct ledger before any backfill. The first post-gap reply lists an observed
+date range, not a list of recovered messages. If the ledger was malformed, inspect
+`state/pending_events.jsonl` as well; it has no automatic replay from the watch.
+
+To stop it for the current login:
+
+```bash
+launchctl bootout "gui/$(id -u)/io.total-recall.capture-watch"
+```
+
+Move the matching file out of `~/Library/LaunchAgents` to keep it off after login.
+Neither step touches Hermes or the ledger.
 
 ### 4. Run the trust gate
 

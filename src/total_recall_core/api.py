@@ -405,6 +405,10 @@ class TotalRecallConfig:
             object.__setattr__(self, "home", self.workspace_root / ".total-recall")
 
 
+class TurnAppendBlocked(ValueError):
+    """A malformed ledger prevented writing any bytes of a Hermes turn."""
+
+
 class TotalRecallCore:
     """Framework-neutral Total Recall continuity engine.
 
@@ -632,7 +636,17 @@ class TotalRecallCore:
             raise ValueError("text is required")
 
         with self._locked():
-            previous_hash = self._last_event_hash()
+            try:
+                previous_hash = self._last_event_hash()
+                if source == "hermes.sync_turn" and self.ledger_file.stat().st_size:
+                    with self.ledger_file.open("rb") as ledger:
+                        ledger.seek(-1, 2)
+                        if ledger.read(1) != b"\n":
+                            raise ValueError("ledger ends with an incomplete record")
+            except (ValueError, AttributeError, TypeError) as exc:
+                if source == "hermes.sync_turn":
+                    raise TurnAppendBlocked(str(exc)) from exc
+                raise
             base = {
                 "event_id": self._new_id("evt"),
                 "timestamp": utc_now(),

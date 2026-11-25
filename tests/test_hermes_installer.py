@@ -141,6 +141,12 @@ def test_hermes_doctor_rejects_broken_provider_and_stale_checkout(tmp_path):
         "        return available\n",
         encoding="utf-8",
     )
+    # The fake import needs its own distribution metadata too. Otherwise
+    # Hermes' real interpreter can attach its installed build's source URL
+    # to the fixture's module and report a stale checkout before we create one.
+    metadata = tmp_path / "total_recall_core-1.3.0.dist-info"
+    metadata.mkdir()
+    (metadata / "METADATA").write_text("Name: total-recall-core\nVersion: 1.3.0\n", encoding="utf-8")
     hermes_python = tmp_path / "python"
     hermes_python.write_text(
         f"#!{sys.executable}\nimport sys\nexec(sys.argv[-1])\n", encoding="utf-8",
@@ -165,8 +171,6 @@ def test_hermes_doctor_rejects_broken_provider_and_stale_checkout(tmp_path):
     checkout = tmp_path / "checkout"
     source = checkout / "src" / "total_recall_core"
     shutil.copytree(core, source)
-    metadata = tmp_path / "total_recall_core-1.3.0.dist-info"
-    metadata.mkdir()
     (metadata / "direct_url.json").write_text(json.dumps({"url": checkout.as_uri(), "dir_info": {}}))
     (source / "_secret.py").write_text("available = True\n# unbuilt change\n", encoding="utf-8")
     stale = subprocess.run(args, env=cli_env, capture_output=True, text=True, check=False)

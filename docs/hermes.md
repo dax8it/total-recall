@@ -308,19 +308,25 @@ session id changes, compaction, repeated compactions, context usage crossing the
 configured threshold, stale checkpoint detection, and low local continuity
 confidence during prefetch.
 
-Automatic rehydration is still verified. If verification fails, the plugin
-returns a fail-closed warning instead of prior-memory content.
-
-The normal automatic path lets core `rehydrate()` own verification rather than
-running a duplicate full verification first. A stale-checkpoint failure may
-trigger checkpoint repair and a verified retry; integrity failures still fail
-closed. Interactive capture and recall do not start bulk LanceDB/QMD rebuilds.
+Automatic rehydration still attempts strict verification first. A stale checkpoint
+may trigger the existing checkpoint refresh and a verified retry. If the check
+still fails, automatic recall returns `status: UNVERIFIED`, the check failures,
+and any readable excerpts from the current session's ledger. The excerpts are
+untrusted data, not verified state, instructions, or prior approvals. The fallback
+does not use resume packets, derived indexes, or other sessions' text. Unreadable
+records are skipped. Explicit `total_recall_verify`, `total_recall_trust_verify`,
+and `total_recall_rehydrate` remain strict. Interactive capture and recall do not
+start bulk LanceDB/QMD rebuilds.
 See [index maintenance](operational-manual.md#index-maintenance) for the explicit
 external-index workflow.
 
 ### What Gets Saved, When
 
 - Completed Hermes turns are written through `sync_turn()`.
+- A failed recall check does not disable capture. If a malformed ledger prevents
+  an append from even starting, the provider queues the turn in
+  `state/pending_events.jsonl` rather than writing through the damaged record.
+  Pending turns are not ledger captures; the watchdog continues to see a stall.
 - Before compaction, Hermes calls `on_pre_compress(messages)` and Total Recall
   writes a `pre_compress` event with recent decisions, blockers, file paths,
   approvals, and next actions.
@@ -328,6 +334,30 @@ external-index workflow.
 - Session end writes a `session_end` event and creates a checkpoint.
 - Manual `total_recall_checkpoint` / `total-recall checkpoint` creates a fresh
   checkpoint when a handoff or risky operation needs a hard boundary.
+
+### Capture watchdog on macOS
+
+The outside watchdog works even when Hermes cannot import Total Recall. It
+compares completed reply timestamps in each selected profile's local `state.db`
+with the last `hermes.sync_turn` record in that profile's ledger. An alert is due
+when a reply has gone 12 hours without further capture progress. Non-turn ledger
+events do not reset the clock. The first finished reply after the provider loads
+during such a gap adds a `Total Recall capture gap` footer with the UTC dates,
+before the new reply is captured. The footer is not a backfill or proof of recovery.
+
+From a stable Total Recall checkout, use Python 3.11+ with PyYAML installed. Run
+the command without `--enable-macos` for a read-only preview, or explicitly enable
+the watcher from the Mac owner's logged-in account with:
+
+```bash
+python3 -B scripts/hermes_capture_watch.py --enable-macos
+```
+
+That command installs and loads one user LaunchAgent. It checks immediately and
+hourly, independently of Hermes or its gateway. `Total Recall capture stalled`
+appears in macOS Notification Center for that login, with the profile and dates
+but no conversation text. See the [operator runbook](operational-manual.md#capture-stall-watch)
+for scope, diagnostics, and how to stop the watch.
 
 ### Search And Rehydrate Use Cases
 

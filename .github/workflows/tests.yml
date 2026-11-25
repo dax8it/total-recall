@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
       - name: Install package
         # Only the dependencies needed to import the real host contracts.
-        run: python -m pip install -e . pytest 'ruamel.yaml==0.18.16' 'python-dotenv==1.2.4' 'rich==14.3.4'
+        run: python -m pip install -e . pytest 'ruamel.yaml==0.18.16' 'python-dotenv==1.2.4' 'rich==14.3.4' 'PyYAML>=6,<7'
       - name: Run tests
         env:
           TOTAL_RECALL_TEST_HERMES_SOURCE: ${{ github.workspace }}/.test-hermes
